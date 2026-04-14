@@ -1,0 +1,20 @@
+[Unit]
+Description=llama-swap: OpenAI-compatible proxy that hot-swaps vLLM backends
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=max
+Group=max
+SupplementaryGroups=docker
+WorkingDirectory=/home/max/llm-stack
+ExecStart=/home/max/bin/llama-swap -config /home/max/llm-stack/config/llama-swap.yaml -listen 0.0.0.0:8080
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/max/llm-stack/logs/llama-swap.log
+StandardError=append:/home/max/llm-stack/logs/llama-swap.err
+
+[Install]
+WantedBy=multi-user.target

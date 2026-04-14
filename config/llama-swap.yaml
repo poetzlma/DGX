@@ -1,0 +1,314 @@
+healthCheckTimeout: 1200
+logLevel: info
+
+models:
+  # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.5-35B-A3B (vLLM, FP8)
+  #
+  # CHANGE: Removed --rope-scaling entirely.
+  # WHY:    Qwen3.5 has 262,144 native context (source: HF model card,
+  #         Qwen docs, Unsloth). The old config used Qwen3 YARN params
+  #         (factor 4.0, original_max 32768) which is wrong — Qwen3 has
+  #         32K base, Qwen3.5 has 262K base. At --max-model-len 131072,
+  #         you are well within native range. No extension needed.
+  #
+  # NOTE:   --load-format fastsafetensors is NOT enabled. It speeds cold
+  #         loading 10× on Spark UMA but the flag hard-fails startup when
+  #         the package is absent, and the cu130-nightly image doesn't
+  #         guarantee it. Warm-cache shard load is ~80 s without it,
+  #         acceptable for the ttl: 3600 swap cadence. See README §7.
+  #
+  # CHANGE: Added -e VLLM_FLASHINFER_MOE_BACKEND=latency
+  # WHY:    The throughput backend has SM120 kernel issues on SM12.1
+  #         (Spark's GB10). Community-tested fix from avarok/vllm-dgx-spark.
+  #
+  # CHANGE: Added --kv-cache-dtype fp8
+  # WHY:    Halves KV cache memory on Spark, letting you serve longer
+  #         contexts without increasing --gpu-memory-utilization.
+  #         Recommended by eugr's spark-vllm-docker recipes.
+  #
+  # CHANGE: Added --enable-prefix-caching
+  # WHY:    Reuses KV cache for common prefixes (system prompts, etc).
+  #         Reduces TTFT on repeated conversations. Recommended for
+  #         single-user Spark setups.
+  # ─────────────────────────────────────────────────────────────────────
+  # CHANGE 2026-04-14: image gemma4-cu130 → cu130-nightly; model → -FP8 prequant; drop --quantization fp8.
+  # WHY: gemma4-cu130 ships vLLM ~0.14 without Qwen3_5MoeForConditionalGeneration — Qwen3.5 arch is
+  #      unregistered so startup fails at import (observed: exit status 1). cu130-nightly ships 0.16+ which
+  #      registers the arch. Pre-quantized -FP8 weights avoid the SM 12.1-flaky online MoE fp8 quant path.
+  qwen3.5-35b-a3b:
+    cmd: >
+      docker run --rm --name vllm-qwen
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9001:9001
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      -e HF_TOKEN_FILE=/root/.cache/huggingface/token
+      -e VLLM_FLASHINFER_MOE_BACKEND=latency
+      -e VLLM_ENGINE_READY_TIMEOUT_S=1800
+      vllm/vllm-openai:cu130-nightly
+      Qwen/Qwen3.5-35B-A3B-FP8
+      --host 0.0.0.0 --port 9001
+      --served-model-name qwen3.5-35b-a3b
+      --max-model-len 131072
+      --max-num-batched-tokens 8192
+      --kv-cache-dtype fp8
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.80
+      --language-model-only
+      --reasoning-parser qwen3
+    proxy: http://127.0.0.1:9001
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Gemma 4 26B-A4B (vLLM, FP8)
+  #
+  # Native context: 256K (source: Google HF model card, LM Studio).
+  # At 131072, well within native range. Config was already correct
+  # re: no YARN. Added same Spark optimizations as above.
+  # ─────────────────────────────────────────────────────────────────────
+  gemma-4-26b-a4b:
+    cmd: >
+      docker run --rm --name vllm-gemma
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9002:9002
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      -e HF_TOKEN_FILE=/root/.cache/huggingface/token
+      -e VLLM_FLASHINFER_MOE_BACKEND=latency
+      vllm/vllm-openai:gemma4-cu130
+      google/gemma-4-26B-A4B-it
+      --host 0.0.0.0 --port 9002
+      --served-model-name gemma-4-26b-a4b
+      --quantization fp8
+      --max-model-len 131072
+      --kv-cache-dtype fp8
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.65
+    proxy: http://127.0.0.1:9002
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # MiniMax M2.7 (llama.cpp, UD-Q3_K_XL)
+  #
+  # Native context: ~196-200K (source: NVIDIA model card says 204,800
+  # ISL; vLLM deploy guide says 196K per sequence; NVIDIA blog says
+  # 200K). Your 65536 is safe.
+  #
+  # CHANGE: Added --no-mmap
+  # WHY:    mmap is pathologically slow on DGX Spark. Known issue,
+  #         confirmed by eugr (NVIDIA forums): loading goes from
+  #         ~1m44s to ~22s with --no-mmap on 6.17 kernel. Your
+  #         207 MB/s at 17% NVMe utilization is this exact bug.
+  #
+  # CHANGE: Added --cache-type-k q8_0 --cache-type-v q8_0
+  # WHY:    Halves KV cache memory at minimal quality cost, giving
+  #         headroom on the ~25 GB left after the 94 GB model weights.
+  #
+  # CHANGE: Added -fa (flash attention)
+  # WHY:    Reduces memory usage for KV cache and improves throughput.
+  #         Standard best practice for llama.cpp on Spark.
+  # ─────────────────────────────────────────────────────────────────────
+  minimax-m2.7:
+    cmd: >
+      docker run --rm --name llama-minimax
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9003:9003
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      ghcr.io/ggml-org/llama.cpp:server-cuda
+      --host 0.0.0.0 --port 9003
+      --alias minimax-m2.7
+      -m /root/.cache/huggingface/hub/models--unsloth--MiniMax-M2.7-GGUF/snapshots/17f50fc6e56901a597ac1caa82cc6387243fcff2/UD-Q3_K_XL/MiniMax-M2.7-UD-Q3_K_XL-00001-of-00004.gguf
+      -ngl 999
+      -c 65536
+      -fa on
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --jinja
+      --no-warmup
+      --no-mmap
+    proxy: http://127.0.0.1:9003
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # SuperGemma 4 26B abliterated (llama.cpp, Q8_0)
+  #
+  # Based on Gemma 4 26B-A4B, so 256K native context.
+  # 131072 is within native range.
+  #
+  # CHANGE: Added --no-mmap
+  # WHY:    Same Spark mmap bug as MiniMax above.
+  #
+  # CHANGE: Added -fa and KV cache quantization
+  # WHY:    Q8_0 of a 26B model at 131K context needs substantial
+  #         KV cache. This was likely the cause of the
+  #         "Context size has been exceeded" error — the model may
+  #         have been silently OOMing. q8_0 KV cache types halve
+  #         the memory footprint. If you still hit OOM, drop to
+  #         -c 65536.
+  #
+  # NOTE:   The --mmproj flag means this is a multimodal config.
+  #         Vision encoder adds memory overhead on top of the LLM.
+  # ─────────────────────────────────────────────────────────────────────
+  supergemma-4-26b:
+    cmd: >
+      docker run --rm --name llama-supergemma
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9004:9004
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      ghcr.io/ggml-org/llama.cpp:server-cuda
+      --host 0.0.0.0 --port 9004
+      --alias supergemma-4-26b
+      -m /root/.cache/huggingface/hub/models--Jiunsong--supergemma4-26b-abliterated-multimodal-gguf-8bit/snapshots/d178fe0a424abe8274275a0fa32ef8b3bd577d19/supergemma4-26b-abliterated-multimodal-Q8_0.gguf
+      --mmproj /root/.cache/huggingface/hub/models--Jiunsong--supergemma4-26b-abliterated-multimodal-gguf-8bit/snapshots/d178fe0a424abe8274275a0fa32ef8b3bd577d19/mmproj-supergemma4-26b-abliterated-multimodal-f16.gguf
+      -ngl 999
+      -c 131072
+      -fa on
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --jinja
+      --no-warmup
+      --no-mmap
+    proxy: http://127.0.0.1:9004
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.5-35B-A3B Claude Opus Distilled (vLLM, FP8)
+  #
+  # Architecture: qwen35moe (confirmed via mradermacher GGUF).
+  # Base model is Qwen3.5-35B-A3B -> 262K native context.
+  #
+  # CHANGE: Removed --rope-scaling entirely.
+  # WHY:    Same as qwen3.5-35b-a3b above — Qwen3.5 architecture
+  #         has 262K native. The old YARN config (32K base) was
+  #         Qwen3 params, not Qwen3.5.
+  #
+  # CAVEAT: The Jackrong model was SFT'd with 8192 context window
+  #         (source: HF model card). Positional embeddings were never
+  #         trained beyond 8K during SFT. Set to 32768 as a safe
+  #         ceiling — beyond this, quality degrades vs plain
+  #         qwen3.5-35b-a3b. Use the base model for long-context work.
+  # ─────────────────────────────────────────────────────────────────────
+  # CHANGE 2026-04-14: image → cu130-nightly (Qwen3.5 arch registered in vLLM 0.16+).
+  # Jackrong distill is BF16-only (no prequant available) so we drop --quantization fp8 and give BF16
+  # weights (~72 GB) more headroom via 0.85 gpu-memory-utilization. fp8 KV cache kept — lossless on Blackwell.
+  qwen3.5-35b-distill:
+    cmd: >
+      docker run --rm --name vllm-qwen-distill
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9005:9005
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      -e HF_TOKEN_FILE=/root/.cache/huggingface/token
+      -e VLLM_FLASHINFER_MOE_BACKEND=latency
+      -e VLLM_ENGINE_READY_TIMEOUT_S=1800
+      vllm/vllm-openai:cu130-nightly
+      Jackrong/Qwen3.5-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled
+      --host 0.0.0.0 --port 9005
+      --served-model-name qwen3.5-35b-distill
+      --max-model-len 8192
+      --max-num-batched-tokens 8192
+      --kv-cache-dtype fp8
+      --gpu-memory-utilization 0.85
+      --language-model-only
+      --reasoning-parser qwen3
+    proxy: http://127.0.0.1:9005
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.5-122B-A10B NVFP4 (vLLM)
+  #
+  # Native context: 262,144 tokens (source: HF model card, NVIDIA NIM,
+  # OpenRouter, Unsloth — all confirm 262K native).
+  #
+  # CHANGE: Removed --rope-scaling entirely.
+  # WHY:    The old config used YARN with original_max 32768 (Qwen3
+  #         params). Qwen3.5-122B has 262K NATIVE. At 65536
+  #         max-model-len you are at ~25% of the native window.
+  #         Applying YARN here was actively degrading quality —
+  #         Qwen's own docs say "if average context does not exceed
+  #         native length, we do not recommend enabling YaRN as it
+  #         may potentially degrade model performance."
+  #
+  # NOTE:   NVFP4 weights are ~75 GB (source: NVIDIA forums thread
+  #         "Qwen3.5-122B-A10B NVFP4 Quantized for DGX Spark —
+  #         234GB → 75GB"). At 0.85 gpu-memory-utilization you get
+  #         ~101 GB total, leaving ~26 GB for KV cache + overhead.
+  #         65536 context should be safe with fp8 KV cache.
+  #         Bumping to 131072 would be tight — test carefully.
+  # ─────────────────────────────────────────────────────────────────────
+  # CHANGE 2026-04-14: image → cu130-nightly (Qwen3.5 arch registered in vLLM 0.16+).
+  # Previous run was SIGKILL'd at 610s by healthCheckTimeout=600 — load alone was legitimate,
+  # healthCheckTimeout is now 1200. Arch fix is the primary change; without it NVFP4 weights
+  # weren't even being read.
+  qwen3.5-122b-nvfp4:
+    cmd: >
+      docker run --rm --name vllm-qwen-nvfp4
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9006:9006
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      -e HF_TOKEN_FILE=/root/.cache/huggingface/token
+      -e VLLM_FLASHINFER_MOE_BACKEND=latency
+      -e VLLM_ENGINE_READY_TIMEOUT_S=1800
+      vllm/vllm-openai:cu130-nightly
+      RedHatAI/Qwen3.5-122B-A10B-NVFP4
+      --host 0.0.0.0 --port 9006
+      --served-model-name qwen3.5-122b-nvfp4
+      --max-model-len 65536
+      --max-num-batched-tokens 8192
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.85
+      --moe-backend flashinfer_cutlass
+      --language-model-only
+      --reasoning-parser qwen3
+    proxy: http://127.0.0.1:9006
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Gemma 4 E4B (vLLM)
+  #
+  # Native context: 128K = 131,072 tokens (source: Google HF card,
+  # LM Studio). Config at 131072 is at the exact native limit.
+  # No YARN needed — was already correct.
+  # ─────────────────────────────────────────────────────────────────────
+  gemma-4-e4b:
+    cmd: >
+      docker run --rm --name vllm-gemma-e4b
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9007:9007
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      -e HF_TOKEN_FILE=/root/.cache/huggingface/token
+      vllm/vllm-openai:gemma4-cu130
+      google/gemma-4-E4B-it
+      --host 0.0.0.0 --port 9007
+      --served-model-name gemma-4-e4b
+      --max-model-len 131072
+      --kv-cache-dtype fp8
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.60
+    proxy: http://127.0.0.1:9007
+    checkEndpoint: /health
+    ttl: 3600
+
+groups:
+  main:
+    swap: true
+    exclusive: true
+    members:
+      - qwen3.5-35b-a3b
+      - gemma-4-26b-a4b
+      - minimax-m2.7
+      - supergemma-4-26b
+      - qwen3.5-35b-distill
+      - qwen3.5-122b-nvfp4
+      - gemma-4-e4b

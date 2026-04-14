@@ -1,0 +1,20 @@
+# Python virtualenv (machine-specific)
+venv/
+
+# Ephemeral logs and bench runs
+logs/*.log
+logs/*.err
+logs/*.json
+logs/downloads/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+__pycache__/
+*.pyc
+
+# Local overrides
+.env
+*.local
