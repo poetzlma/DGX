@@ -112,7 +112,8 @@ models:
       --alias minimax-m2.7
       -m /root/.cache/huggingface/hub/models--unsloth--MiniMax-M2.7-GGUF/snapshots/d2a05ccf69491b03db0cc40b335aec14bdaf7198/UD-IQ4_XS/MiniMax-M2.7-UD-IQ4_XS-00001-of-00004.gguf
       -ngl 999
-      -c 65536
+      -c 98304
+      --parallel 1
       -fa on
       --cache-type-k q4_0
       --cache-type-v q4_0
