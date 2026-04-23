@@ -3,7 +3,7 @@
 Single OpenAI-compatible endpoint serving models on a DGX Spark (ThinkStation PGX, 192.168.1.12). The active config defines **two groups, simultaneously available** through the same gateway:
 
 - **`main` group** (5 models, `swap: true, exclusive: true`) — heavy models hot-swapped one at a time: gemma-4-26b-a4b, minimax-m2.7, supergemma-4-26b, qwen3.5-35b-distill, qwen3.5-122b-nvfp4.
-- **`qwen36` group** (2 models, `swap: false`) — co-resident pair that stays warm together: `qwen3.6-35b-a3b` (vLLM NVFP4, reasoning) + `qwen3.6-27b` (llama.cpp dense UD-Q4_K_XL, fast responder). This replaces the older Qwen-122B + Gemma-E4B "agent mode" setup — same concurrent-two-models pattern, different models.
+- **`qwen36` group** (2 models, `swap: false`) — co-resident pair that stays warm together: `qwen3.6-35b-a3b` (vLLM NVFP4, MoE 35B/3B-active) + `qwen3.6-27b` (llama.cpp, dense UD-Q4_K_XL). Workflow split in practice: the **27B dense is used for deep/reasoning work** (param density helps quality-per-token), and the **35B-A3B MoE handles parallel work on short contexts** (3B active params → high concurrent tok/s when many sub-agents hit it at once). This replaces the older Qwen-122B + Gemma-E4B "agent mode" pair — same two-models-always-warm pattern, different split.
 
 ## Hardware
 
@@ -31,10 +31,10 @@ Single OpenAI-compatible endpoint serving models on a DGX Spark (ThinkStation PG
 
 `swap: false`, both models stay loaded simultaneously. `ttl: 3600` (each member). Activating a `main`-group model will evict this pair because `main.exclusive: true`; next request to `qwen36` brings both back up.
 
-| Role | Model | Backend | Quant | GPU memory (nominal) | Notes |
-|---|---|---|---|---|---|
-| Reasoning / agent | `qwen3.6-35b-a3b` | vLLM | NVFP4 | `--gpu-memory-utilization 0.55` (~65 GB) | MoE 35B/3B active. MTP-1 speculative + FLASHINFER. Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
-| Fast responder | `qwen3.6-27b` | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 GB weights + KV | Dense. 65k ctx, `-fa on`, `--no-mmap`. |
+| Model | Arch | Backend | Quant | GPU memory (nominal) | Primary use | Notes |
+|---|---|---|---|---|---|---|
+| `qwen3.6-27b` | Dense 27B | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 GB weights + KV | **Thinking / deep reasoning** — higher param density per token, quality-over-throughput. Lower tok/s (~11 @c=1) but ~0.3s TTFT because llama.cpp streams `<think>` as it's generated. | 65k ctx, `-fa on`, `--no-mmap`, q8 KV. |
+| `qwen3.6-35b-a3b` | MoE 35B/3B-active | vLLM | NVFP4 | `--gpu-memory-utilization 0.55` (~65 GB) | **Parallel workers on short contexts** — MoE's low active-param count gives high aggregate tok/s when many sub-agents hit it concurrently. TTFT is higher (~8s) because `--reasoning-parser qwen3` buffers the `<think>` block before emitting. | MTP-1 speculative + FLASHINFER. Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
 
 Both route through the single `http://192.168.1.12:8080/v1` endpoint. Pick by model key.
 
@@ -48,8 +48,8 @@ All entries are OpenAI-compatible, reached through the gateway at the same URL. 
 
 | Key | Group | Backend | Quant | Weights (GB) | Native ctx | Served ctx | Notes |
 |---|---|---|---|---|---|---|---|
-| `qwen3.6-35b-a3b` | qwen36 | vLLM | NVFP4 (on-disk) | ~23 | 262 k | 131 072 | MoE 35B/3B active. MTP-1 speculative + FLASHINFER. Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
-| `qwen3.6-27b` | qwen36 | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 | 262 k | 65 536 | Dense. Fast responder alongside the 35B. `-fa on`, `--no-mmap`, q8 KV. |
+| `qwen3.6-35b-a3b` | qwen36 | vLLM | NVFP4 (on-disk) | ~23 | 262 k | 131 072 | MoE 35B/3B active. Used for parallel sub-agents on short contexts. MTP-1 + FLASHINFER. Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
+| `qwen3.6-27b` | qwen36 | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 | 262 k | 65 536 | Dense. Used for thinking / deep reasoning. `-fa on`, `--no-mmap`, q8 KV. |
 | `gemma-4-26b-a4b` | main | llama.cpp | Q4_K_M (GGUF) | ~15 | 256 k | 131 072 | MoE 26B/4B active. Switched from vLLM due to FP8 + attention bugs. |
 | `qwen3.5-35b-distill` | main | vLLM | BF16 (on-disk) | ~72 | 262 k (arch) | 8 192 | Claude Opus distilled. MTP + FLASHINFER. Ctx capped at 8 k = SFT ceiling. |
 | `qwen3.5-122b-nvfp4` | main | vLLM | NVFP4 (on-disk) | ~75 | 262 k | 65 536 | Largest model via vLLM. Unstable under sustained load at 0.80 util. |
@@ -94,7 +94,7 @@ Ad-hoc bench of `qwen3.6-27b` (llama.cpp GGUF, solo — MoE not co-resident at t
 | 4 | 29.51 | 0.65 s | 0.65 s | 7.47 |
 | 10 | 25.34 | **55.55 s** | **109.90 s** | 7.47 |
 
-Throughput regresses from c=4 → c=10 because llama.cpp's slot count can't keep up. Request queueing rather than real batching dominates at c≥5. For reasoning workloads co-resident with the MoE, the qwen36 pair is designed to split concurrency between the two members (MoE = heavy concurrent agent work, 27B = quick responder), not to drive the 27B above ~4 parallel streams.
+Throughput regresses from c=4 → c=10 because llama.cpp's slot count can't keep up. Request queueing rather than real batching dominates at c≥5. This is fine for the 27B's actual role (deep/thinking work) — the pair is designed so parallel sub-agent traffic lands on the 35B MoE and deep-reasoning calls land on the 27B dense, not the other way around.
 
 ## Technical decisions
 
