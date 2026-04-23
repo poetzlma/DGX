@@ -3,52 +3,229 @@ logLevel: info
 
 models:
   # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.5-122B-A10B (llama.cpp, UD-Q4_K_XL)
+  # Qwen3.6-35B-A3B (vLLM, NVFP4)
   #
-  # Role: Reasoning / planning / orchestration for agentic workflows.
-  # 122B total params, 10B active per token (MoE).
-  # UD-Q4_K_XL uses Unsloth Dynamic non-uniform quantization —
-  # preserves quality on active MoE experts and attention layers.
+  # CHANGE 2026-04-23: Switched from FP8 to NVFP4 for co-residency with
+  #         qwen3.6-27b (both in `qwen36` group, swap: false).
+  # WHY:    Half the weights (24 GB vs 67 GB) frees ~43 GB, letting the
+  #         27B dense live alongside. Benchmarks showed NVFP4 was
+  #         ~11% slower solo but ~14% faster aggregate at 4-concurrent.
+  #         Math spot-check: indistinguishable from FP8 on compound
+  #         growth problem.
   #
-  # Memory: ~77 GB model weights.
-  # KV cache: q4_0, 32768 context × 4 parallel slots = ~8 GB.
-  # Total: ~85 GB, leaving ~26 GB headroom on 119 GB Spark.
-  #
-  # --parallel 4: real batching for concurrent sub-agent requests.
+  # NOTE:   RedHatAI NVFP4 repo ships a broken tokenizer_class
+  #         ("TokenizersBackend"); --tokenizer points at Qwen's FP8
+  #         repo (same vocab family) as workaround.
   # ─────────────────────────────────────────────────────────────────────
-  qwen3.5-122b:
+  qwen3.6-35b-a3b:
     cmd: >
-      docker run --rm --name llama-qwen-122b
+      docker run --rm --name vllm-qwen
       --runtime=nvidia --gpus all --ipc=host
       --ulimit memlock=-1 --ulimit stack=67108864
       -p 0.0.0.0:9001:9001
       -v /home/max/.cache/huggingface:/root/.cache/huggingface
-      ghcr.io/ggml-org/llama.cpp:server-cuda
+      -e HF_TOKEN_FILE=/root/.cache/huggingface/token
+      -e VLLM_ENGINE_READY_TIMEOUT_S=1800
+      vllm/vllm-openai:cu130-nightly
+      RedHatAI/Qwen3.6-35B-A3B-NVFP4
+      --tokenizer Qwen/Qwen3.6-35B-A3B-FP8
       --host 0.0.0.0 --port 9001
-      --alias qwen3.5-122b
-      -m /root/.cache/huggingface/hub/models--unsloth--Qwen3.5-122B-A10B-GGUF/snapshots/51eab4d59d53f573fb9206cb3ce613f1d0aa392b/UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf
+      --served-model-name qwen3.6-35b-a3b
+      --max-model-len 131072
+      --max-num-batched-tokens 8192
+      --kv-cache-dtype fp8
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.55
+      --moe-backend flashinfer_cutlass
+      --language-model-only
+      --reasoning-parser qwen3
+      --attention-backend FLASHINFER
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_coder
+      --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+    proxy: http://127.0.0.1:9001
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Gemma 4 26B-A4B (llama.cpp, Q4_K_M)
+  #
+  # CHANGE 2026-04-15: Switched from vLLM to llama.cpp.
+  # WHY:    Two compounding vLLM bugs make this model unusable:
+  #         1. vLLM issue #39407/#39049: --quantization fp8 produces
+  #            garbage output on ALL Gemma 4 variants.
+  #         2. vLLM issue #38887: Gemma 4's heterogeneous head
+  #            dimensions force TRITON_ATTN fallback, causing 10-15x
+  #            slowdown.
+  #
+  # NOTE:   <SNAPSHOT_HASH> — resolve after downloading GGUF:
+  #         hf download ggml-org/gemma-4-26B-A4B-it-GGUF --include "*Q4_K_M*"
+  # ─────────────────────────────────────────────────────────────────────
+  gemma-4-26b-a4b:
+    cmd: >
+      docker run --rm --name llama-gemma-26b
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9002:9002
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      ghcr.io/ggml-org/llama.cpp:server-cuda
+      --host 0.0.0.0 --port 9002
+      --alias gemma-4-26b-a4b
+      -m /root/.cache/huggingface/hub/models--ggml-org--gemma-4-26B-A4B-it-GGUF/snapshots/ae4d537a6345467d1c86bb5cc0d4505ff3ebe0f3/gemma-4-26B-A4B-it-Q4_K_M.gguf
       -ngl 999
-      -c 262144
-      --parallel 4
+      -c 131072
+      -fa on
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --jinja
+      --no-warmup
+      --no-mmap
+    proxy: http://127.0.0.1:9002
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # MiniMax M2.7 (llama.cpp, UD-IQ4_XS)
+  #
+  # CHANGE 2026-04-15: Quant switched from UD-Q3_K_XL to UD-IQ4_XS.
+  # WHY:    UD-IQ4_XS (~60 GB) reduces active weight read by ~35%,
+  #         pushing expected decode to ~40+ tok/s.
+  #
+  # CHANGE 2026-04-15: KV cache types from q8_0 to q4_0.
+  #
+  # NOTE:   <SNAPSHOT_HASH> — resolve after downloading GGUF:
+  #         hf download unsloth/MiniMax-M2.7-GGUF --include "*UD-IQ4_XS*"
+  # ─────────────────────────────────────────────────────────────────────
+  minimax-m2.7:
+    cmd: >
+      docker run --rm --name llama-minimax
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9003:9003
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      ghcr.io/ggml-org/llama.cpp:server-cuda
+      --host 0.0.0.0 --port 9003
+      --alias minimax-m2.7
+      -m /root/.cache/huggingface/hub/models--unsloth--MiniMax-M2.7-GGUF/snapshots/d2a05ccf69491b03db0cc40b335aec14bdaf7198/UD-IQ4_XS/MiniMax-M2.7-UD-IQ4_XS-00001-of-00004.gguf
+      -ngl 999
+      -c 98304
+      --parallel 1
       -fa on
       --cache-type-k q4_0
       --cache-type-v q4_0
       --jinja
       --no-warmup
       --no-mmap
-    proxy: http://127.0.0.1:9001
+    proxy: http://127.0.0.1:9003
     checkEndpoint: /health
-    ttl: 0
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # SuperGemma 4 26B abliterated (llama.cpp, Q8_0)
+  #
+  # CHANGE 2026-04-15: Context reduced from 131072 to 65536.
+  # CHANGE 2026-04-15: KV cache types from q8_0 to q4_0.
+  # ─────────────────────────────────────────────────────────────────────
+  supergemma-4-26b:
+    cmd: >
+      docker run --rm --name llama-supergemma
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9004:9004
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      ghcr.io/ggml-org/llama.cpp:server-cuda
+      --host 0.0.0.0 --port 9004
+      --alias supergemma-4-26b
+      -m /root/.cache/huggingface/hub/models--Jiunsong--supergemma4-26b-abliterated-multimodal-gguf-8bit/snapshots/d178fe0a424abe8274275a0fa32ef8b3bd577d19/supergemma4-26b-abliterated-multimodal-Q8_0.gguf
+      --mmproj /root/.cache/huggingface/hub/models--Jiunsong--supergemma4-26b-abliterated-multimodal-gguf-8bit/snapshots/d178fe0a424abe8274275a0fa32ef8b3bd577d19/mmproj-supergemma4-26b-abliterated-multimodal-f16.gguf
+      -ngl 999
+      -c 65536
+      -fa on
+      --cache-type-k q4_0
+      --cache-type-v q4_0
+      --jinja
+      --no-warmup
+      --no-mmap
+    proxy: http://127.0.0.1:9004
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.5-35B-A3B Claude Opus Distilled (vLLM, BF16)
+  #
+  # CHANGE 2026-04-15: Added MTP speculative decoding.
+  # CHANGE 2026-04-15: Added --enable-prefix-caching.
+  # CHANGE 2026-04-15: Added --attention-backend FLASHINFER.
+  # ─────────────────────────────────────────────────────────────────────
+  qwen3.5-35b-distill:
+    cmd: >
+      docker run --rm --name vllm-qwen-distill
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9005:9005
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      -e HF_TOKEN_FILE=/root/.cache/huggingface/token
+      -e VLLM_FLASHINFER_MOE_BACKEND=latency
+      -e VLLM_ENGINE_READY_TIMEOUT_S=1800
+      vllm/vllm-openai:cu130-nightly
+      Jackrong/Qwen3.5-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled
+      --host 0.0.0.0 --port 9005
+      --served-model-name qwen3.5-35b-distill
+      --max-model-len 8192
+      --max-num-batched-tokens 8192
+      --kv-cache-dtype fp8
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.85
+      --language-model-only
+      --reasoning-parser qwen3
+      --attention-backend FLASHINFER
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_coder
+      --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+    proxy: http://127.0.0.1:9005
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.5-122B-A10B NVFP4 (vLLM)
+  #
+  # CHANGE 2026-04-15: Added --kv-cache-dtype fp8.
+  # CHANGE 2026-04-15: Added --attention-backend FLASHINFER.
+  # CHANGE 2026-04-15: Removed -e VLLM_FLASHINFER_MOE_BACKEND=latency.
+  # ─────────────────────────────────────────────────────────────────────
+  qwen3.5-122b-nvfp4:
+    cmd: >
+      docker run --rm --name vllm-qwen-nvfp4
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9006:9006
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      -e HF_TOKEN_FILE=/root/.cache/huggingface/token
+      -e VLLM_ENGINE_READY_TIMEOUT_S=1800
+      vllm/vllm-openai:cu130-nightly
+      RedHatAI/Qwen3.5-122B-A10B-NVFP4
+      --host 0.0.0.0 --port 9006
+      --served-model-name qwen3.5-122b-nvfp4
+      --max-model-len 65536
+      --max-num-batched-tokens 8192
+      --kv-cache-dtype fp8
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.80
+      --moe-backend flashinfer_cutlass
+      --language-model-only
+      --reasoning-parser qwen3
+      --attention-backend FLASHINFER
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_coder
+    proxy: http://127.0.0.1:9006
+    checkEndpoint: /health
+    ttl: 3600
 
   # ─────────────────────────────────────────────────────────────────────
   # Gemma 4 E4B (llama.cpp, Q8_0)
   #
-  # Role: Worker — tool calls, extraction, classification, routing.
-  # ~8B total params, ~4.5B active. Q8_0 GGUF ~13 GB.
-  #
-  # 70ms TTFT for near-instant tool call responses.
-  # --parallel 4: handles burst tool calls without queueing.
-  # -c 8192: tool calls are short, no need for long context.
+  # CHANGE 2026-04-15: Switched from vLLM to llama.cpp.
+  # CHANGE 2026-04-15: Using Q8_0 GGUF.
   # ─────────────────────────────────────────────────────────────────────
   gemma-4-e4b:
     cmd: >
@@ -61,10 +238,8 @@ models:
       --host 0.0.0.0 --port 9007
       --alias gemma-4-e4b
       -m /root/.cache/huggingface/hub/models--ggml-org--gemma-4-E4B-it-GGUF/snapshots/2714b5519c6c3516b1000e7c5e1eba998dfe1fe8/gemma-4-E4B-it-Q8_0.gguf
-      --mmproj /root/.cache/huggingface/hub/models--ggml-org--gemma-4-E4B-it-GGUF/snapshots/2714b5519c6c3516b1000e7c5e1eba998dfe1fe8/mmproj-gemma-4-E4B-it-Q8_0.gguf
       -ngl 999
-      -c 65536
-      --parallel 4
+      -c 131072
       -fa on
       --cache-type-k q8_0
       --cache-type-v q8_0
@@ -73,12 +248,57 @@ models:
       --no-mmap
     proxy: http://127.0.0.1:9007
     checkEndpoint: /health
-    ttl: 0
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.6-27B dense (llama.cpp, UD-Q4_K_XL)
+  # ─────────────────────────────────────────────────────────────────────
+  qwen3.6-27b:
+    cmd: >
+      docker run --rm --name llama-qwen-27b
+      --runtime=nvidia --gpus all --ipc=host
+      --ulimit memlock=-1 --ulimit stack=67108864
+      -p 0.0.0.0:9008:9008
+      -v /home/max/.cache/huggingface:/root/.cache/huggingface
+      ghcr.io/ggml-org/llama.cpp:server-cuda
+      --host 0.0.0.0 --port 9008
+      --alias qwen3.6-27b
+      -m /root/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-GGUF/snapshots/82d411acf4a06cfb8d9b073a5211bf410bfc29bf/Qwen3.6-27B-UD-Q4_K_XL.gguf
+      --no-mmproj
+      -ngl 999
+      -c 65536
+      -fa on
+      --no-mmap
+      --kv-unified
+      -b 4096 -ub 2048
+      --jinja
+      --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0
+      --presence-penalty 1.5
+      --reasoning on
+      --chat-template-kwargs '{"preserve_thinking": true}'
+    proxy: http://127.0.0.1:9008
+    checkEndpoint: /health
+    ttl: 3600
 
 groups:
-  agent:
-    swap: false
-    exclusive: false
+  # The main group: heavy models, only one active at a time.
+  main:
+    swap: true
+    exclusive: true
     members:
-      - qwen3.5-122b
+      - gemma-4-26b-a4b
+      - minimax-m2.7
+      - supergemma-4-26b
+      - qwen3.5-35b-distill
+      - qwen3.5-122b-nvfp4
       - gemma-4-e4b
+
+  # Qwen 3.6 coexistence pair (NVFP4 35B + UD-Q4_K_XL 27B).
+  # Combined ~50 GB footprint; both stay resident while in use.
+  # NOTE: members here do not auto-evict `main` models and vice versa,
+  # so if memory gets tight, manually /unload via llama-swap API.
+  qwen36:
+    swap: false
+    members:
+      - qwen3.6-35b-a3b
+      - qwen3.6-27b
