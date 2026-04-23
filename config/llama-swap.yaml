@@ -18,31 +18,10 @@ models:
   #         repo (same vocab family) as workaround.
   # ─────────────────────────────────────────────────────────────────────
   qwen3.6-35b-a3b:
-    cmd: >
-      docker run --rm --name vllm-qwen
-      --runtime=nvidia --gpus all --ipc=host
-      --ulimit memlock=-1 --ulimit stack=67108864
-      -p 0.0.0.0:9001:9001
-      -v /home/max/.cache/huggingface:/root/.cache/huggingface
-      -e HF_TOKEN_FILE=/root/.cache/huggingface/token
-      -e VLLM_ENGINE_READY_TIMEOUT_S=1800
-      vllm/vllm-openai:cu130-nightly
-      RedHatAI/Qwen3.6-35B-A3B-NVFP4
-      --tokenizer Qwen/Qwen3.6-35B-A3B-FP8
-      --host 0.0.0.0 --port 9001
-      --served-model-name qwen3.6-35b-a3b
-      --max-model-len 131072
-      --max-num-batched-tokens 8192
-      --kv-cache-dtype fp8
-      --enable-prefix-caching
-      --gpu-memory-utilization 0.55
-      --moe-backend flashinfer_cutlass
-      --language-model-only
-      --reasoning-parser qwen3
-      --attention-backend FLASHINFER
-      --enable-auto-tool-choice
-      --tool-call-parser qwen3_coder
-      --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+    # NOTE 2026-04-23: launcher moved to bin/launch-vllm-qwen.sh so we can drop
+    # --rm and keep container logs after a crash. llama-swap uses shellwords
+    # (no shell), so compound commands have to live in a script.
+    cmd: /home/max/llm-stack/bin/launch-vllm-qwen.sh
     proxy: http://127.0.0.1:9001
     checkEndpoint: /health
     ttl: 3600
