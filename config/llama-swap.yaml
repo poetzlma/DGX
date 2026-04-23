@@ -245,7 +245,7 @@ models:
       -m /root/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-GGUF/snapshots/82d411acf4a06cfb8d9b073a5211bf410bfc29bf/Qwen3.6-27B-UD-Q4_K_XL.gguf
       --no-mmproj
       -ngl 999
-      -c 65536
+      -c 131072
       -fa on
       --no-mmap
       --kv-unified

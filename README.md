@@ -33,7 +33,7 @@ Single OpenAI-compatible endpoint serving models on a DGX Spark (ThinkStation PG
 
 | Model | Arch | Backend | Quant | GPU memory (nominal) | Primary use | Notes |
 |---|---|---|---|---|---|---|
-| `qwen3.6-27b` | Dense 27B | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 GB weights + KV | **Thinking / deep reasoning** — higher param density per token, quality-over-throughput. Lower tok/s (~11 @c=1) but ~0.3s TTFT because llama.cpp streams `<think>` as it's generated. | 65k ctx, `-fa on`, `--no-mmap`, q8 KV. |
+| `qwen3.6-27b` | Dense 27B | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 GB weights + KV | **Thinking / deep reasoning** — higher param density per token, quality-over-throughput. Lower tok/s (~11 @c=1) but ~0.3s TTFT because llama.cpp streams `<think>` as it's generated. | 131k ctx (native 262k), `-fa on`, `--no-mmap`, q8 KV. |
 | `qwen3.6-35b-a3b` | MoE 35B/3B-active | vLLM | NVFP4 | `--gpu-memory-utilization 0.55` (~65 GB) | **Parallel workers on short contexts** — MoE's low active-param count gives high aggregate tok/s when many sub-agents hit it concurrently. TTFT is higher (~8s) because `--reasoning-parser qwen3` buffers the `<think>` block before emitting. | MTP-1 speculative + FLASHINFER. Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
 
 Both route through the single `http://192.168.1.12:8080/v1` endpoint. Pick by model key.
@@ -49,7 +49,7 @@ All entries are OpenAI-compatible, reached through the gateway at the same URL. 
 | Key | Group | Backend | Quant | Weights (GB) | Native ctx | Served ctx | Notes |
 |---|---|---|---|---|---|---|---|
 | `qwen3.6-35b-a3b` | qwen36 | vLLM | NVFP4 (on-disk) | ~23 | 262 k | 131 072 | MoE 35B/3B active. Used for parallel sub-agents on short contexts. MTP-1 + FLASHINFER. Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
-| `qwen3.6-27b` | qwen36 | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 | 262 k | 65 536 | Dense. Used for thinking / deep reasoning. `-fa on`, `--no-mmap`, q8 KV. |
+| `qwen3.6-27b` | qwen36 | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 | 262 k | 131 072 | Dense. Used for thinking / deep reasoning. `-fa on`, `--no-mmap`, q8 KV. |
 | `gemma-4-26b-a4b` | main | llama.cpp | Q4_K_M (GGUF) | ~15 | 256 k | 131 072 | MoE 26B/4B active. Switched from vLLM due to FP8 + attention bugs. |
 | `qwen3.5-35b-distill` | main | vLLM | BF16 (on-disk) | ~72 | 262 k (arch) | 8 192 | Claude Opus distilled. MTP + FLASHINFER. Ctx capped at 8 k = SFT ceiling. |
 | `qwen3.5-122b-nvfp4` | main | vLLM | NVFP4 (on-disk) | ~75 | 262 k | 65 536 | Largest model via vLLM. Unstable under sustained load at 0.80 util. |
