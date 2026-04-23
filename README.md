@@ -1,6 +1,9 @@
 # Spark LLM Stack
 
-Single OpenAI-compatible endpoint serving models on a DGX Spark (ThinkStation PGX, 192.168.1.12). Two operating modes: **swap mode** (7 hot-swappable models, one at a time) and **agent mode** (Qwen 122B reasoning + Gemma E4B worker loaded concurrently for agentic workflows).
+Single OpenAI-compatible endpoint serving models on a DGX Spark (ThinkStation PGX, 192.168.1.12). The active config defines **two groups, simultaneously available** through the same gateway:
+
+- **`main` group** (5 models, `swap: true, exclusive: true`) — heavy models hot-swapped one at a time: gemma-4-26b-a4b, minimax-m2.7, supergemma-4-26b, qwen3.5-35b-distill, qwen3.5-122b-nvfp4.
+- **`qwen36` group** (2 models, `swap: false`) — co-resident pair that stays warm together: `qwen3.6-35b-a3b` (vLLM NVFP4, reasoning) + `qwen3.6-27b` (llama.cpp dense UD-Q4_K_XL, fast responder). This replaces the older Qwen-122B + Gemma-E4B "agent mode" setup — same concurrent-two-models pattern, different models.
 
 ## Hardware
 
@@ -20,50 +23,47 @@ Single OpenAI-compatible endpoint serving models on a DGX Spark (ThinkStation PG
 | Currently-loaded | `GET /running` |
 | Web UI | `http://192.168.1.12:8080/ui` |
 
-### Swap mode (default)
+### `main` group (swap-exclusive)
 
-Config: `config/llama-swap-swap.yaml` — `swap: true, exclusive: true`, at most one model resident. Idle timeout `ttl: 3600` (1 h). Cold-swap latency 1–10 min depending on model.
+`swap: true, exclusive: true`, at most one model resident. Idle timeout `ttl: 3600` (1 h). Cold-swap latency 1–10 min depending on model. Requesting any member evicts the others.
 
-### Agent mode
+### `qwen36` group (co-resident pair)
 
-Config: `config/llama-swap-agent.yaml` — `swap: false, exclusive: false`, both models loaded simultaneously with `ttl: 0` (never unload). Designed for Hermes-style agents with sub-agents.
+`swap: false`, both models stay loaded simultaneously. `ttl: 3600` (each member). Activating a `main`-group model will evict this pair because `main.exclusive: true`; next request to `qwen36` brings both back up.
 
-| Role | Model | Backend | Memory | Context/slot | Slots | Capabilities |
-|---|---|---|---|---|---|---|
-| Reasoning | `qwen3.5-122b` | llama.cpp UD-Q4_K_XL | 78 GB | 64K | 4 | Text, reasoning, code, tool calling |
-| Worker | `gemma-4-e4b` | llama.cpp Q8_0 + mmproj | 15 GB | 16K | 4 | Text, vision, tool calling, 70ms TTFT |
+| Role | Model | Backend | Quant | GPU memory (nominal) | Notes |
+|---|---|---|---|---|---|
+| Reasoning / agent | `qwen3.6-35b-a3b` | vLLM | NVFP4 | `--gpu-memory-utilization 0.55` (~65 GB) | MoE 35B/3B active. MTP-1 speculative + FLASHINFER. Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
+| Fast responder | `qwen3.6-27b` | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 GB weights + KV | Dense. 65k ctx, `-fa on`, `--no-mmap`. |
 
-Total: ~93 GB, 26 GB free. Both models serve concurrently via the same gateway.
+Both route through the single `http://192.168.1.12:8080/v1` endpoint. Pick by model key.
 
-### Switching modes
+### Switching between modes
 
-```sh
-# Switch to agent mode
-cp config/llama-swap-agent.yaml config/llama-swap.yaml
-kill -9 $(pgrep -f "llama-swap -config")   # systemd restarts with new config
+You don't — they co-exist in one config. Request the model you want by key; llama-swap handles group eviction. The `config/llama-swap-swap.yaml` and `config/llama-swap-agent.yaml` files are **legacy templates from the pre-qwen3.6 era** and are not used by the running service. They're kept in-tree as reference snapshots of the old swap-only / 122B+E4B setups.
 
-# Switch to swap mode
-cp config/llama-swap-swap.yaml config/llama-swap.yaml
-kill -9 $(pgrep -f "llama-swap -config")
-```
+## Models
 
-## Models (swap mode)
+All entries are OpenAI-compatible, reached through the gateway at the same URL. Pick a model by setting `"model": "<key>"` in the request body. Group membership determines whether requesting one evicts others.
 
-All entries are OpenAI-compatible, reached through the gateway at the same URL. Pick a model by setting `"model": "<key>"` in the request body.
+| Key | Group | Backend | Quant | Weights (GB) | Native ctx | Served ctx | Notes |
+|---|---|---|---|---|---|---|---|
+| `qwen3.6-35b-a3b` | qwen36 | vLLM | NVFP4 (on-disk) | ~23 | 262 k | 131 072 | MoE 35B/3B active. MTP-1 speculative + FLASHINFER. Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
+| `qwen3.6-27b` | qwen36 | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 | 262 k | 65 536 | Dense. Fast responder alongside the 35B. `-fa on`, `--no-mmap`, q8 KV. |
+| `gemma-4-26b-a4b` | main | llama.cpp | Q4_K_M (GGUF) | ~15 | 256 k | 131 072 | MoE 26B/4B active. Switched from vLLM due to FP8 + attention bugs. |
+| `qwen3.5-35b-distill` | main | vLLM | BF16 (on-disk) | ~72 | 262 k (arch) | 8 192 | Claude Opus distilled. MTP + FLASHINFER. Ctx capped at 8 k = SFT ceiling. |
+| `qwen3.5-122b-nvfp4` | main | vLLM | NVFP4 (on-disk) | ~75 | 262 k | 65 536 | Largest model via vLLM. Unstable under sustained load at 0.80 util. |
+| `minimax-m2.7` | main | llama.cpp | UD-IQ4_XS (unsloth) | ~60 | ~200 k | 65 536 | 230B/10B MoE. Changed from Q3_K_XL; KV cache q4_0. |
+| `supergemma-4-26b` | main | llama.cpp | Q8_0 (multimodal) | ~26 | 256 k | 65 536 | Gemma 4 26B abliterated + mmproj vision. Context reduced from 131K; KV q4_0. |
+| `gemma-4-e4b` | main | llama.cpp | Q8_0 (GGUF) | ~8 | 128 k | 131 072 | Gemma 4 E4B with vision (mmproj). Used as vision worker. |
 
-| Key | Backend | Quant | Weights (GB) | Native ctx | Served ctx | Notes |
-|---|---|---|---|---|---|---|
-| `qwen3.5-35b-a3b` | vLLM | FP8 (on-disk) | ~35 | 262 k | 131 072 | MoE 35B/3B active. MTP speculative decode + FLASHINFER. General-purpose reasoning. |
-| `gemma-4-26b-a4b` | llama.cpp | Q4_K_M (GGUF) | ~15 | 256 k | 131 072 | MoE 26B/4B active. Switched from vLLM due to FP8 + attention bugs. |
-| `qwen3.5-35b-distill` | vLLM | BF16 (on-disk) | ~72 | 262 k (arch) | 8 192 | Claude Opus distilled. MTP + FLASHINFER. Ctx capped at 8 k = SFT ceiling. |
-| `qwen3.5-122b-nvfp4` | vLLM | NVFP4 (on-disk) | ~75 | 262 k | 65 536 | Largest model via vLLM. Unstable under sustained load at 0.80 util. |
-| `gemma-4-e4b` | llama.cpp | Q8_0 (GGUF) | ~8 | 128 k | 131 072 | Gemma 4 E4B with vision (mmproj). Switched from vLLM due to attention bugs. |
-| `minimax-m2.7` | llama.cpp | UD-IQ4_XS (unsloth) | ~60 | ~200 k | 65 536 | 230B/10B MoE. Changed from Q3_K_XL; KV cache q4_0. |
-| `supergemma-4-26b` | llama.cpp | Q8_0 (multimodal) | ~26 | 256 k | 65 536 | Gemma 4 26B abliterated + mmproj vision. Context reduced from 131K; KV q4_0. |
+Per-model flags live in `config/llama-swap.yaml` with comments explaining each choice.
 
-Per-model flags live in `config/llama-swap-swap.yaml` with comments explaining each choice.
+### Historical benchmarks (2026-04-16, pre-qwen3.6 config)
 
-### Benchmark results (2026-04-16, swap mode)
+Kept for reference. These are from the pre-qwen3.6 lineup (before the `qwen36` co-resident pair replaced the 122B-UD-Q4 + Gemma-E4B agent stack). Model keys reflect the config of that era — `qwen3.5-35b-a3b` was later replaced by `qwen3.6-35b-a3b` (NVFP4), `qwen3.5-122b` (llama.cpp) was retired, etc.
+
+Swap mode, 2026-04-16:
 
 | Model | Cold start | Memory | tok/s (e2e) | TTFT | Decode tok/s |
 |---|---|---|---|---|---|
@@ -77,20 +77,32 @@ Per-model flags live in `config/llama-swap-swap.yaml` with comments explaining e
 
 \* TTFT includes hidden thinking time (`--reasoning-parser qwen3` or model thinking behavior).
 
-### Agent mode performance (2026-04-16)
+Old agent mode (Qwen 122B + Gemma E4B), 2026-04-16:
 
 | Model | tok/s (single) | tok/s (both active) | Concurrency scaling |
 |---|---|---|---|
 | `qwen3.5-122b` | 21.7 | 19.0 | 3 sub-agents: 19.7 agg tok/s |
 | `gemma-4-e4b` | 39.9 | 36.6 | Vision: working (70ms TTFT) |
 
+### qwen3.6 pair spot-check (2026-04-23)
+
+Ad-hoc bench of `qwen3.6-27b` (llama.cpp GGUF, solo — MoE not co-resident at the time) on `max_tokens=400` reasoning prompts:
+
+| Concurrency | Aggregate tok/s | TTFT p50 | TTFT p95 | Per-req tok/s |
+|---|---|---|---|---|
+| 1 | 11.07 | 0.32 s | 0.32 s | 11.07 |
+| 4 | 29.51 | 0.65 s | 0.65 s | 7.47 |
+| 10 | 25.34 | **55.55 s** | **109.90 s** | 7.47 |
+
+Throughput regresses from c=4 → c=10 because llama.cpp's slot count can't keep up. Request queueing rather than real batching dominates at c≥5. For reasoning workloads co-resident with the MoE, the qwen36 pair is designed to split concurrency between the two members (MoE = heavy concurrent agent work, 27B = quick responder), not to drive the 27B above ~4 parallel streams.
+
 ## Technical decisions
 
-### 1. Swap mode vs agent mode
+### 1. Co-resident pair vs swap-exclusive
 
-Running two models concurrently on Spark means splitting 119 GB between them. For anything at MiniMax (108 GB) or 122B-NVFP4 (110 GB) scale, that's untenable — swap mode gives each model the entire pool.
+Running two models concurrently on Spark means splitting 119 GB between them. For anything at MiniMax (108 GB) or 122B-NVFP4 (110 GB) scale, that's untenable — the `main` group's `exclusive: true` gives each model the entire pool.
 
-Agent mode works because the Qwen 122B UD-Q4_K_XL GGUF (77 GB) + Gemma E4B Q8_0 (13 GB) = 90 GB, leaving 26+ GB for KV caches. Both via llama.cpp (no vLLM memory pre-allocation headaches). This only works with smaller quantized GGUFs — vLLM models pre-allocate via `--gpu-memory-utilization` and can't share dynamically.
+The `qwen36` pair works because the NVFP4 35B-A3B (~23 GB weights, ~65 GB nominal reservation at util=0.55) + the 27B UD-Q4_K_XL GGUF (~18 GB weights + KV) fit together in 119 GB. Unlike the old 122B+E4B pair (both llama.cpp), the new pair is **mixed**: vLLM for the 35B (pre-allocates via `--gpu-memory-utilization`), llama.cpp for the 27B (dynamic). The vLLM side's pre-allocation sets the memory ceiling; the llama.cpp side takes whatever's left.
 
 ### 2. KV cache quantization is mandatory, not optional
 
@@ -179,9 +191,9 @@ done
 
 **`hf download --force` will revert the patch** — re-apply if weights are re-fetched.
 
-### 20. MTP speculative decoding for Qwen3.5
+### 20. MTP speculative decoding for Qwen3.5 / Qwen3.6
 
-Qwen3.5 ships native Multi-Token Prediction (MTP) weights. MTP-1 predicts 1 additional token per step with high acceptance rate. Added `--speculative-config '{"method":"mtp","num_speculative_tokens":1}'` to `qwen3.5-35b-a3b` and `qwen3.5-35b-distill`. **Requires `--attention-backend FLASHINFER`** — MTP silently disables without it. Benchmark showed 156 tok/s pure decode on the distill model (up from 29 tok/s e2e without MTP). The 122B NVFP4 cannot use MTP — the RedHatAI checkpoint stripped the MTP head during quantization.
+Both Qwen3.5 and Qwen3.6 MoE ship native Multi-Token Prediction (MTP) weights. MTP-1 predicts 1 additional token per step with high acceptance rate. Added `--speculative-config '{"method":"mtp","num_speculative_tokens":1}'` to `qwen3.6-35b-a3b` (the RedHatAI NVFP4 variant keeps the MTP head) and `qwen3.5-35b-distill`. **Requires `--attention-backend FLASHINFER`** — MTP silently disables without it. Benchmark showed 156 tok/s pure decode on the distill model (up from 29 tok/s e2e without MTP). The 122B NVFP4 cannot use MTP — the RedHatAI checkpoint for that model stripped the MTP head during quantization.
 
 ### 21. `--attention-backend FLASHINFER` for vLLM on Spark
 
@@ -204,9 +216,36 @@ For agent mode: `-c 262144 --parallel 4` = 64K per slot (reasoning), `-c 65536 -
 
 ### 24. Vision via mmproj on Gemma E4B
 
-Gemma 4 E4B supports multimodal input via the `--mmproj` flag in llama.cpp. The mmproj file (`mmproj-gemma-4-E4B-it-Q8_0.gguf`) adds ~200-500 MB overhead. Enabled in both agent and swap configs. Send images via the standard OpenAI `image_url` content type.
+Gemma 4 E4B supports multimodal input via the `--mmproj` flag in llama.cpp. The mmproj file (`mmproj-gemma-4-E4B-it-Q8_0.gguf`) adds ~200-500 MB overhead. Send images via the standard OpenAI `image_url` content type.
 
 Qwen3.5-122B does NOT support vision via llama.cpp — the CLIP graph uses unsupported operators (llama.cpp issue #21268).
+
+### 25. `qwen3.6-35b-a3b` launcher script (drop `--rm` for crash traceability)
+
+The MoE has been observed silently crashing under sustained AsyncOpenAI workload: vLLM exits with status 0, llama-swap logs `<qwen3.6-35b-a3b> process exited but not StateStopping`, and auto-restarts. With `docker run --rm`, the dead container was wiped before we could read `docker logs`, so every crash was opaque.
+
+Two issues to fix:
+
+1. Drop `--rm` on the MoE container so logs survive the crash.
+2. Clean up the named (now persistent) container before respawning, or `--name vllm-qwen` collides on the next start.
+
+llama-swap parses `cmd:` with **shellwords** (no shell invocation), so compound commands like `docker rm -f X 2>/dev/null; exec docker run …` can't live inline — they'd be passed as literal argv to docker. The fix is to move the launcher into a script file:
+
+```
+bin/launch-vllm-qwen.sh   →   docker rm -f vllm-qwen 2>/dev/null || true
+                              exec docker run --name vllm-qwen … (no --rm)
+```
+
+And point the yaml at it:
+
+```yaml
+qwen3.6-35b-a3b:
+  cmd: /home/max/llm-stack/bin/launch-vllm-qwen.sh
+```
+
+Now: `docker inspect vllm-qwen --format '{{.HostConfig.AutoRemove}}'` → `false`, and `docker logs vllm-qwen` works on the dead container after the next crash.
+
+Apply the same pattern to any other vLLM container where post-mortem logs matter.
 
 ## Operations
 
@@ -219,14 +258,14 @@ tail -f ~/llm-stack/logs/llama-swap.log
 tail -f ~/llm-stack/logs/llama-swap.err
 
 # Logs (active backend container)
-docker logs -f llama-qwen-122b           # agent mode: reasoning
-docker logs -f llama-gemma-e4b           # agent mode: worker (also swap mode)
-docker logs -f vllm-qwen                 # swap mode: Qwen 35B
-docker logs -f vllm-qwen-distill         # swap mode: Qwen distill
-docker logs -f vllm-qwen-nvfp4           # swap mode: Qwen 122B NVFP4
-docker logs -f llama-gemma-26b           # swap mode: Gemma 26B
-docker logs -f llama-minimax             # swap mode: MiniMax
-docker logs -f llama-supergemma          # swap mode: SuperGemma
+docker logs -f vllm-qwen                 # qwen36 group: qwen3.6-35b-a3b (NO --rm, survives crashes — see §25)
+docker logs -f llama-qwen-27b            # qwen36 group: qwen3.6-27b
+docker logs -f vllm-qwen-distill         # main group: qwen3.5-35b-distill
+docker logs -f vllm-qwen-nvfp4           # main group: qwen3.5-122b-nvfp4
+docker logs -f llama-gemma-26b           # main group: gemma-4-26b-a4b
+docker logs -f llama-gemma-e4b           # main group: gemma-4-e4b
+docker logs -f llama-minimax             # main group: minimax-m2.7
+docker logs -f llama-supergemma          # main group: supergemma-4-26b
 
 # Current state
 curl http://192.168.1.12:8080/running     # which model is hot
@@ -286,9 +325,9 @@ LiteLLM points at the gateway, one entry per model. Minimum fields:
 
 ```yaml
 model_list:
-  - model_name: qwen3.5-35b-a3b          # what clients call
+  - model_name: qwen3.6-35b-a3b          # what clients call
     litellm_params:
-      model: openai/qwen3.5-35b-a3b      # must match the llama-swap map key
+      model: openai/qwen3.6-35b-a3b      # must match the llama-swap map key
       api_base: http://192.168.1.12:8080/v1
       api_key: none
       timeout: 900                        # ≥ cold-load time
@@ -303,11 +342,12 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 ```
 ~/llm-stack/
 ├── config/
-│   ├── llama-swap.yaml             # active config (symlinked or copied)
-│   ├── llama-swap-swap.yaml        # swap mode: 7 models exclusive
-│   ├── llama-swap-agent.yaml       # agent mode: 122B reasoning + E4B worker
+│   ├── llama-swap.yaml             # active config: main group + qwen36 pair
+│   ├── llama-swap-swap.yaml        # legacy snapshot: pre-qwen3.6 swap-only (stale)
+│   ├── llama-swap-agent.yaml       # legacy snapshot: 122B + E4B agent pair (stale)
 │   └── llama-swap-bench.yaml       # benchmark variant
 ├── bin/
+│   ├── launch-vllm-qwen.sh         # launcher for qwen3.6-35b-a3b (no --rm, see §25)
 │   ├── bench-models.py             # quick benchmark (cold start + tok/s)
 │   ├── bench-deep.py               # deep benchmark (TTFT, decode, concurrency)
 │   └── bench-compare-deep.py       # before/after comparison report
