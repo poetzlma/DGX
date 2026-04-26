@@ -3,24 +3,14 @@ logLevel: info
 
 models:
   # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.6-35B-A3B (vLLM, NVFP4)
+  # Qwen3.6-35B-A3B MoE (vLLM, NVFP4) — DORMANT (on-demand) since 2026-04-24
   #
-  # CHANGE 2026-04-23: Switched from FP8 to NVFP4 for co-residency with
-  #         qwen3.6-27b (both in `qwen36` group, swap: false).
-  # WHY:    Half the weights (24 GB vs 67 GB) frees ~43 GB, letting the
-  #         27B dense live alongside. Benchmarks showed NVFP4 was
-  #         ~11% slower solo but ~14% faster aggregate at 4-concurrent.
-  #         Math spot-check: indistinguishable from FP8 on compound
-  #         growth problem.
-  #
-  # NOTE:   RedHatAI NVFP4 repo ships a broken tokenizer_class
-  #         ("TokenizersBackend"); --tokenizer points at Qwen's FP8
-  #         repo (same vocab family) as workaround.
+  # Solo 27B NVFP4+MTP is the default coding stack. The MoE entry is kept
+  # routable via swap-exclusive `main` group: a request to qwen3.6-35b-a3b
+  # cold-starts it and evicts whatever heavy is currently up (27B etc.).
+  # Launcher: bin/launch-vllm-qwen.sh (RedHatAI/Qwen3.6-35B-A3B-NVFP4).
   # ─────────────────────────────────────────────────────────────────────
   qwen3.6-35b-a3b:
-    # NOTE 2026-04-23: launcher moved to bin/launch-vllm-qwen.sh so we can drop
-    # --rm and keep container logs after a crash. llama-swap uses shellwords
-    # (no shell), so compound commands have to live in a script.
     cmd: /home/max/llm-stack/bin/launch-vllm-qwen.sh
     proxy: http://127.0.0.1:9001
     checkEndpoint: /health
@@ -230,37 +220,48 @@ models:
     ttl: 3600
 
   # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.6-27B dense (llama.cpp, UD-Q4_K_XL)
+  # Qwen3.6-27B dense (vLLM NVFP4 + MTP n=3) — solo coding stack.
+  #
+  # CHANGE 2026-04-24: Replaced llama.cpp GGUF with AlphaOxO NVFP4 + native
+  #         MTP on vLLM cu130-nightly. Benched:
+  #           19 tok/s c=1   (vs 11 GGUF)
+  #           154 tok/s c=10 agg (vs ~25 GGUF) → 6×
+  # WHY:    With the MoE now disabled, the 27B takes the full 119 GiB
+  #         budget and handles both "deep reasoning" and "parallel workers"
+  #         at once, without the MoE's quality-per-token tax.
+  # NOTE:   Needs num_nextn_predict_layers=1 patch on AlphaOxO's config.json.
+  #         See ~/llm-stack/README.md §MTP-patch for the one-liner.
   # ─────────────────────────────────────────────────────────────────────
   qwen3.6-27b:
-    cmd: >
-      docker run --rm --name llama-qwen-27b
-      --runtime=nvidia --gpus all --ipc=host
-      --ulimit memlock=-1 --ulimit stack=67108864
-      -p 0.0.0.0:9008:9008
-      -v /home/max/.cache/huggingface:/root/.cache/huggingface
-      ghcr.io/ggml-org/llama.cpp:server-cuda
-      --host 0.0.0.0 --port 9008
-      --alias qwen3.6-27b
-      -m /root/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-GGUF/snapshots/82d411acf4a06cfb8d9b073a5211bf410bfc29bf/Qwen3.6-27B-UD-Q4_K_XL.gguf
-      --no-mmproj
-      -ngl 999
-      -c 131072
-      -fa on
-      --no-mmap
-      --kv-unified
-      -b 4096 -ub 2048
-      --jinja
-      --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0
-      --presence-penalty 1.5
-      --reasoning on
-      --chat-template-kwargs '{"preserve_thinking": true}'
-    proxy: http://127.0.0.1:9008
+    cmd: /home/max/llm-stack/bin/launch-vllm-27b-nvfp4.sh
+    proxy: http://127.0.0.1:9010
     checkEndpoint: /health
     ttl: 3600
+    # ─── ROLLBACK (30-second revert) ────────────────────────────────────
+    # If the vLLM path misbehaves, comment the `cmd:` above and uncomment
+    # this llama.cpp GGUF block, then `sudo systemctl restart llama-swap`.
+    # cmd: >
+    #   docker run --rm --name llama-qwen-27b
+    #   --runtime=nvidia --gpus all --ipc=host
+    #   --ulimit memlock=-1 --ulimit stack=67108864
+    #   -p 0.0.0.0:9008:9008
+    #   -v /home/max/.cache/huggingface:/root/.cache/huggingface
+    #   ghcr.io/ggml-org/llama.cpp:server-cuda
+    #   --host 0.0.0.0 --port 9008
+    #   --alias qwen3.6-27b
+    #   -m /root/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-GGUF/snapshots/82d411acf4a06cfb8d9b073a5211bf410bfc29bf/Qwen3.6-27B-UD-Q4_K_XL.gguf
+    #   --no-mmproj -ngl 999 -c 131072 -fa on --no-mmap --kv-unified
+    #   -b 4096 -ub 2048 --jinja
+    #   --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0
+    #   --presence-penalty 1.5 --reasoning on
+    #   --chat-template-kwargs '{"preserve_thinking": true}'
 
 groups:
   # The main group: heavy models, only one active at a time.
+  # CHANGE 2026-04-24: qwen3.6-27b joined (solo NVFP4+MTP, was in qwen36 pair).
+  # At --gpu-memory-utilization 0.92 it consumes ~110 GB on its own — must
+  # swap-exclusive with the other heavies or any request for a main-group
+  # model would OOM. Cold-start ~2-3 min in either direction.
   main:
     swap: true
     exclusive: true
@@ -271,13 +272,8 @@ groups:
       - qwen3.5-35b-distill
       - qwen3.5-122b-nvfp4
       - gemma-4-e4b
-
-  # Qwen 3.6 coexistence pair (NVFP4 35B + UD-Q4_K_XL 27B).
-  # Combined ~50 GB footprint; both stay resident while in use.
-  # NOTE: members here do not auto-evict `main` models and vice versa,
-  # so if memory gets tight, manually /unload via llama-swap API.
-  qwen36:
-    swap: false
-    members:
-      - qwen3.6-35b-a3b
       - qwen3.6-27b
+      - qwen3.6-35b-a3b
+
+  # qwen36 coexistence group REMOVED 2026-04-24 (solo 27B on Spark).
+  # The MoE is disabled upstairs; the 27B moved into `main`.

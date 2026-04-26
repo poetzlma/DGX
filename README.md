@@ -342,12 +342,13 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 ```
 ~/llm-stack/
 ├── config/
-│   ├── llama-swap.yaml             # active config: main group + qwen36 pair
+│   ├── llama-swap.yaml             # active config: main group (solo vLLM 27B NVFP4+MTP since 2026-04-24)
 │   ├── llama-swap-swap.yaml        # legacy snapshot: pre-qwen3.6 swap-only (stale)
 │   ├── llama-swap-agent.yaml       # legacy snapshot: 122B + E4B agent pair (stale)
 │   └── llama-swap-bench.yaml       # benchmark variant
 ├── bin/
-│   ├── launch-vllm-qwen.sh         # launcher for qwen3.6-35b-a3b (no --rm, see §25)
+│   ├── launch-vllm-qwen.sh         # launcher for qwen3.6-35b-a3b MoE (DORMANT — on-demand via llama-swap)
+│   ├── launch-vllm-27b-nvfp4.sh    # launcher for qwen3.6-27b vLLM NVFP4+MTP (active)
 │   ├── bench-models.py             # quick benchmark (cold start + tok/s)
 │   ├── bench-deep.py               # deep benchmark (TTFT, decode, concurrency)
 │   └── bench-compare-deep.py       # before/after comparison report
@@ -365,6 +366,36 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 ~/.cache/huggingface/hub/            # model weights (max:max ownership required)
 ~/.cache/huggingface/token           # HF auth, chmod 600
 ```
+
+## MTP patch (AlphaOxO Qwen3.6-27B-NVFP4)
+
+The AlphaOxO NVFP4 repo ships the MTP weights (`model_mtp.safetensors`) but strips
+`num_nextn_predict_layers` from `config.json`. Without that field, vLLM silently loads
+the model with MTP disabled — you lose the 1.6–2× speculative throughput gain and
+`--speculative-config` in the launcher becomes a no-op.
+
+Re-apply after every `hf download` (or any time the HF cache is cleared):
+
+```bash
+python3 <<'PYEOF'
+import json, os
+SNAP = os.path.expanduser('~/.cache/huggingface/hub/models--AlphaOxO--Qwen3.6-27B-NVFP4/snapshots')
+snap = os.path.join(SNAP, os.listdir(SNAP)[0])
+p = os.path.join(snap, 'config.json')
+c = json.load(open(os.path.realpath(p)))
+if c.get('num_nextn_predict_layers') == 1:
+    print('already patched'); raise SystemExit
+c['num_nextn_predict_layers'] = 1
+if os.path.islink(p):
+    os.unlink(p)          # break the symlink so we don't corrupt HF blob hashes
+json.dump(c, open(p, 'w'), indent=2)
+print('patched: num_nextn_predict_layers=1')
+PYEOF
+```
+
+**Verify** by grepping vLLM startup logs for `Detected MTP model. Sharing target model
+embedding weights with the draft model.` — if present, MTP is wired. If absent,
+speculation is silently off.
 
 ## Troubleshooting
 
