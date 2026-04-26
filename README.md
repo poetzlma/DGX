@@ -1,9 +1,8 @@
 # Spark LLM Stack
 
-Single OpenAI-compatible endpoint serving models on a DGX Spark (ThinkStation PGX, 192.168.1.12). The active config defines **two groups, simultaneously available** through the same gateway:
+Single OpenAI-compatible endpoint serving models on a DGX Spark (ThinkStation PGX, 192.168.1.12). One **`main` group** with `swap: true, exclusive: true` — all heavies hot-swap one at a time, with `qwen3.6-27b` (solo vLLM NVFP4+MTP, 262 k ctx, MTP-3) as the production coding default. The `qwen3.6-35b-a3b` MoE is kept **dormant but routable** in the same group: a request cold-starts it and evicts whichever heavy is currently up.
 
-- **`main` group** (5 models, `swap: true, exclusive: true`) — heavy models hot-swapped one at a time: gemma-4-26b-a4b, minimax-m2.7, supergemma-4-26b, qwen3.5-35b-distill, qwen3.5-122b-nvfp4.
-- **`qwen36` group** (2 models, `swap: false`) — co-resident pair that stays warm together: `qwen3.6-35b-a3b` (vLLM NVFP4, MoE 35B/3B-active) + `qwen3.6-27b` (llama.cpp, dense UD-Q4_K_XL). Workflow split in practice: the **27B dense is used for deep/reasoning work** (param density helps quality-per-token), and the **35B-A3B MoE handles parallel work on short contexts** (3B active params → high concurrent tok/s when many sub-agents hit it at once). This replaces the older Qwen-122B + Gemma-E4B "agent mode" pair — same two-models-always-warm pattern, different split.
+**Architecture history.** Until 2026-04-24 we ran a `qwen36` co-resident pair (27B-GGUF llama.cpp + 35B-A3B MoE vLLM, both warm). Solo 27B-NVFP4 with MTP-3 at c=10 (~149 tok/s aggregate, see §27) matches the pair's parallel-worker throughput while preserving the dense 27B's quality-per-token — so the MoE moved to on-demand and the `qwen36` group was retired.
 
 ## Hardware
 
@@ -25,22 +24,11 @@ Single OpenAI-compatible endpoint serving models on a DGX Spark (ThinkStation PG
 
 ### `main` group (swap-exclusive)
 
-`swap: true, exclusive: true`, at most one model resident. Idle timeout `ttl: 3600` (1 h). Cold-swap latency 1–10 min depending on model. Requesting any member evicts the others.
+`swap: true, exclusive: true`, at most one model resident. Idle timeout `ttl: 3600` (1 h). Cold-swap latency 1–10 min depending on model. Requesting any member evicts whatever was up. Members listed in §Models below.
 
-### `qwen36` group (co-resident pair)
+### Switching models
 
-`swap: false`, both models stay loaded simultaneously. `ttl: 3600` (each member). Activating a `main`-group model will evict this pair because `main.exclusive: true`; next request to `qwen36` brings both back up.
-
-| Model | Arch | Backend | Quant | GPU memory (nominal) | Primary use | Notes |
-|---|---|---|---|---|---|---|
-| `qwen3.6-27b` | Dense 27B | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 GB weights + KV | **Thinking / deep reasoning** — higher param density per token, quality-over-throughput. Lower tok/s (~11 @c=1) but ~0.3s TTFT because llama.cpp streams `<think>` as it's generated. | 131k ctx (native 262k), `-fa on`, `--no-mmap`, q8 KV. |
-| `qwen3.6-35b-a3b` | MoE 35B/3B-active | vLLM | NVFP4 | `--gpu-memory-utilization 0.55` (~65 GB) | **Parallel workers on short contexts** — MoE's low active-param count gives high aggregate tok/s when many sub-agents hit it concurrently. TTFT is higher (~8s) because `--reasoning-parser qwen3` buffers the `<think>` block before emitting. | MTP-1 speculative + FLASHINFER. Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
-
-Both route through the single `http://192.168.1.12:8080/v1` endpoint. Pick by model key.
-
-### Switching between modes
-
-You don't — they co-exist in one config. Request the model you want by key; llama-swap handles group eviction. The `config/llama-swap-swap.yaml` and `config/llama-swap-agent.yaml` files are **legacy templates from the pre-qwen3.6 era** and are not used by the running service. They're kept in-tree as reference snapshots of the old swap-only / 122B+E4B setups.
+Just pick by model key — llama-swap handles eviction. The `config/llama-swap-swap.yaml` and `config/llama-swap-agent.yaml` files are **legacy templates from the pre-qwen3.6 era** and are not used by the running service; kept in-tree as reference snapshots of the old swap-only / 122B+E4B setups.
 
 ## Models
 
@@ -48,8 +36,8 @@ All entries are OpenAI-compatible, reached through the gateway at the same URL. 
 
 | Key | Group | Backend | Quant | Weights (GB) | Native ctx | Served ctx | Notes |
 |---|---|---|---|---|---|---|---|
-| `qwen3.6-35b-a3b` | qwen36 | vLLM | NVFP4 (on-disk) | ~23 | 262 k | 131 072 | MoE 35B/3B active. Used for parallel sub-agents on short contexts. MTP-1 + FLASHINFER. Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
-| `qwen3.6-27b` | qwen36 | llama.cpp | UD-Q4_K_XL (GGUF) | ~18 | 262 k | 131 072 | Dense. Used for thinking / deep reasoning. `-fa on`, `--no-mmap`, q8 KV. |
+| `qwen3.6-27b` | main | vLLM | NVFP4 (AlphaOxO) | ~14 | 262 k | 262 144 | **Production coding default since 2026-04-24.** Dense 27B, MTP-3 speculative + FLASHINFER, KV fp8, util 0.85, 10 concurrent slots. Launcher at `bin/launch-vllm-27b-nvfp4.sh` (see §26). MTP requires the AlphaOxO config patch (see §MTP-patch). |
+| `qwen3.6-35b-a3b` | main | vLLM | NVFP4 (RedHatAI) | ~23 | 262 k | 131 072 | **Dormant — routable on demand** (see §28). MoE 35B/3B-active, MTP-1 + FLASHINFER, util 0.55. A request cold-starts it and evicts the 27B (~5 min). Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
 | `gemma-4-26b-a4b` | main | llama.cpp | Q4_K_M (GGUF) | ~15 | 256 k | 131 072 | MoE 26B/4B active. Switched from vLLM due to FP8 + attention bugs. |
 | `qwen3.5-35b-distill` | main | vLLM | BF16 (on-disk) | ~72 | 262 k (arch) | 8 192 | Claude Opus distilled. MTP + FLASHINFER. Ctx capped at 8 k = SFT ceiling. |
 | `qwen3.5-122b-nvfp4` | main | vLLM | NVFP4 (on-disk) | ~75 | 262 k | 65 536 | Largest model via vLLM. Unstable under sustained load at 0.80 util. |
@@ -94,15 +82,33 @@ Ad-hoc bench of `qwen3.6-27b` (llama.cpp GGUF, solo — MoE not co-resident at t
 | 4 | 29.51 | 0.65 s | 0.65 s | 7.47 |
 | 10 | 25.34 | **55.55 s** | **109.90 s** | 7.47 |
 
-Throughput regresses from c=4 → c=10 because llama.cpp's slot count can't keep up. Request queueing rather than real batching dominates at c≥5. This is fine for the 27B's actual role (deep/thinking work) — the pair is designed so parallel sub-agent traffic lands on the 35B MoE and deep-reasoning calls land on the 27B dense, not the other way around.
+Throughput regresses from c=4 → c=10 because llama.cpp's slot count can't keep up. Request queueing rather than real batching dominates at c≥5. This was fine for the 27B's pair-era role (deep/thinking only) but motivated the 04-24 switch to vLLM NVFP4+MTP for proper batching.
+
+### Solo 27B-NVFP4+MTP production benchmark (2026-04-24)
+
+Replaced the qwen3.6-27b GGUF spot-check above. Same prompt profile, server-side measurement via gateway, sweeping `num_speculative_tokens` (n) from 1 to 3:
+
+| n | c=1 decode | c=10 peak agg | c=10 sustained | MTP accept (n=3) |
+|---|---|---|---|---|
+| 1 | ~13 tok/s | 120 tok/s | — | 1/1 (94 %) |
+| 2 | ~16 tok/s | 136 tok/s | — | mean 1.74/2 (87 %, 75 %) |
+| **3** | **~19 tok/s** | **149 tok/s** | 94–149 tok/s | mean 3.0/4 (85 %, 63 %, 51 %) |
+
+n=3 ships in production (§26). Through the llama-swap gateway adds ~3 % vs direct-to-:9008 (149 vs 154); proxy overhead is negligible.
+
+Net vs the GGUF-pair-era spot-check at c=10: 25 → 149 tok/s aggregate (~6×) with the same hardware, at higher quality-per-token.
 
 ## Technical decisions
 
-### 1. Co-resident pair vs swap-exclusive
+### 1. Solo 27B vs. the retired qwen36 co-resident pair
 
-Running two models concurrently on Spark means splitting 119 GB between them. For anything at MiniMax (108 GB) or 122B-NVFP4 (110 GB) scale, that's untenable — the `main` group's `exclusive: true` gives each model the entire pool.
+The 27B and 35B-A3B used to run as a co-resident pair (qwen36 group, `swap: false`) — both warm at once, each at reduced `--gpu-memory-utilization` so they fit together in the 119 GB unified budget. The split was 27B-dense for deep reasoning + 35B-A3B-MoE for parallel sub-agent fanout.
 
-The `qwen36` pair works because the NVFP4 35B-A3B (~23 GB weights, ~65 GB nominal reservation at util=0.55) + the 27B UD-Q4_K_XL GGUF (~18 GB weights + KV) fit together in 119 GB. Unlike the old 122B+E4B pair (both llama.cpp), the new pair is **mixed**: vLLM for the 35B (pre-allocates via `--gpu-memory-utilization`), llama.cpp for the 27B (dynamic). The vLLM side's pre-allocation sets the memory ceiling; the llama.cpp side takes whatever's left.
+In the 2026-04-24 sweep, solo 27B-NVFP4 with MTP-3 at c=10 hit ~149 tok/s aggregate, matching what the MoE used to deliver on parallel workers — at higher quality-per-token. Removing the MoE freed the full 119 GB so the 27B can run `--gpu-memory-utilization 0.85`, full 262 k ctx, and 10 concurrent slots without thrashing the page cache. Net: same fanout throughput, better single-stream quality, simpler memory model.
+
+The MoE entry stays in `main` as **dormant routable** (§28) — a request cold-starts it and evicts the 27B. Reactivation cost: ~2–3 min cold start, no config edits needed.
+
+Why not multi-model co-resident at all anymore: at MiniMax (108 GB) / 122B-NVFP4 (110 GB) scale you can't co-locate anything, and 27B-NVFP4 alone now gives the throughput we needed the pair for. `main`'s `exclusive: true` keeps the memory model uniform across the whole stack.
 
 ### 2. KV cache quantization is mandatory, not optional
 
@@ -245,7 +251,57 @@ qwen3.6-35b-a3b:
 
 Now: `docker inspect vllm-qwen --format '{{.HostConfig.AutoRemove}}'` → `false`, and `docker logs vllm-qwen` works on the dead container after the next crash.
 
-Apply the same pattern to any other vLLM container where post-mortem logs matter.
+Apply the same pattern to any other vLLM container where post-mortem logs matter. The 27B production launcher (`bin/launch-vllm-27b-nvfp4.sh`, see §26) follows the same convention with container name `vllm-qwen-27b`.
+
+### 26. Solo `qwen3.6-27b` NVFP4+MTP production launcher (2026-04-24)
+
+Replaces the prior llama.cpp-GGUF 27B and the qwen36 co-resident pair. Single launcher script `bin/launch-vllm-27b-nvfp4.sh`, container name `vllm-qwen-27b`, port 9008. Key choices:
+
+- **Repo `AlphaOxO/Qwen3.6-27B-NVFP4`** — one of only two Qwen3.6-27B NVFP4 quants that preserve MTP weights (other: `ig1/Qwen3.6-27B-NVFP4`). Verify post-download: `ls ~/.cache/huggingface/hub/models--AlphaOxO--Qwen3.6-27B-NVFP4/snapshots/*/model_mtp.safetensors`.
+- **MTP `num_speculative_tokens=3`** — 2026-04-24 sweep winner. n=3 > n=2 > n=1 on both c=1 and c=10 (149 > 136 > 120 peak tok/s aggregate). vLLM's "n>1 may lower acceptance" warning is true per-position but not net.
+- **`--gpu-memory-utilization 0.85`** — solo means full 119 GB available. Pushed past 0.85 once; 0.92 thrashed page cache (~3 GB free) and lost ~30 % throughput. 0.85 leaves ~18 GB OS headroom.
+- **`--max-model-len 262144`** — bumped from 131 072 on 2026-04-26 after a 123 k+8 k=131 073 opencode request was rejected at the old ceiling. KV budget supports it at util 0.85.
+- **`--kv-cache-dtype fp8`**, **`--enable-prefix-caching`**, **`--max-num-seqs 10`**, **`--attention-backend FLASHINFER`** (mandatory for MTP, see §20).
+- **No `--reasoning-parser qwen3`** — raw `<think>` is streamed to the client (opencode parses it natively). Gives ~495 ms TTFT vs ~3 s buffered.
+- **No `--rm`** on the container — same crash-traceability rationale as §25.
+
+Requires the **MTP patch** (see §MTP-patch below) — without it MTP silently no-ops and you lose 1.6–2× decode throughput.
+
+Measured throughput (server-side via gateway, 2026-04-24):
+
+| Concurrency | Peak gen throughput | MTP accept (mean / per-position) |
+|---|---|---|
+| c=1 | ~19 tok/s decode | 3.39/4 (94 / 80 / 63 %) |
+| c=10 peak | **149 tok/s** | 3.0/4 (85 / 63 / 51 %) |
+| c=10 sustained | 94–149 tok/s | — |
+
+Cold start ~6 min (torch.compile with MTP + 262 k ctx, plus FlashInfer warmup on first inference).
+
+### 27. llama-swap `-watch-config` hot-reload (2026-04-26)
+
+llama-swap runs with `-watch-config` via the drop-in at `/etc/systemd/system/llama-swap.service.d/watch-config.conf` (mirrored in repo at `systemd/llama-swap.service.d/watch-config.conf`). YAML edits to `config/llama-swap.yaml` apply within ~1 s **without restarting the proxy** and **without touching running model containers** — no cold-start tax on config changes.
+
+Before this drop-in, every yaml edit needed `pkill -9 llama-swap`. Fresh llama-swap had no state, so the first request to a model re-ran its launcher, which begins with `docker rm -f <container>` to clean prior runs → killed the still-healthy container → ~6 min cold start. Hot-reload eliminates that tax.
+
+Drop-in contents:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/home/max/bin/llama-swap -config /home/max/llm-stack/config/llama-swap.yaml -watch-config -listen 0.0.0.0:8080
+```
+
+The empty `ExecStart=` line is required to override the unit's original ExecStart before setting the new one (standard systemd drop-in pattern). Apply: `sudo install -m 0644 systemd/llama-swap.service.d/watch-config.conf /etc/systemd/system/llama-swap.service.d/watch-config.conf && sudo systemctl daemon-reload && sudo systemctl restart llama-swap` (one disruption, then permanent).
+
+Fallback for changes that aren't yaml-only (binary upgrade, unit edits, stuck process): `pkill -9 llama-swap`. SIGTERM (plain `pkill`) is a clean exit so systemd does NOT respawn (`Restart=on-failure`); only SIGKILL or `sudo systemctl restart` works.
+
+### 28. MoE `qwen3.6-35b-a3b` kept dormant-but-routable (2026-04-26)
+
+The MoE entry stays in `main` group (swap-exclusive with the 27B and the other heavies). On disk: `RedHatAI/Qwen3.6-35B-A3B-NVFP4` weights (24 GB) + `Qwen/Qwen3.6-35B-A3B-FP8` for the tokenizer source. Launcher `bin/launch-vllm-qwen.sh` unchanged from the qwen36-pair era.
+
+Reactivation cost: a request to `qwen3.6-35b-a3b` triggers `docker rm -f vllm-qwen-27b` (in the 27B's launcher cleanup chain — actually llama-swap stops the previous member because of `exclusive: true`), then cold-starts the MoE — ~2–3 min. Going back to 27B costs ~6 min (torch.compile + MTP + 262 k).
+
+If the MoE is no longer needed at all: comment its block in `config/llama-swap.yaml` and remove from `main.members`. Weights stay in HF cache for future re-activation. Save → hot-reload (§27) does the rest.
 
 ## Operations
 
@@ -258,14 +314,14 @@ tail -f ~/llm-stack/logs/llama-swap.log
 tail -f ~/llm-stack/logs/llama-swap.err
 
 # Logs (active backend container)
-docker logs -f vllm-qwen                 # qwen36 group: qwen3.6-35b-a3b (NO --rm, survives crashes — see §25)
-docker logs -f llama-qwen-27b            # qwen36 group: qwen3.6-27b
-docker logs -f vllm-qwen-distill         # main group: qwen3.5-35b-distill
-docker logs -f vllm-qwen-nvfp4           # main group: qwen3.5-122b-nvfp4
-docker logs -f llama-gemma-26b           # main group: gemma-4-26b-a4b
-docker logs -f llama-gemma-e4b           # main group: gemma-4-e4b
-docker logs -f llama-minimax             # main group: minimax-m2.7
-docker logs -f llama-supergemma          # main group: supergemma-4-26b
+docker logs -f vllm-qwen-27b             # qwen3.6-27b (production coding default, NO --rm — see §25/§26)
+docker logs -f vllm-qwen                 # qwen3.6-35b-a3b (DORMANT MoE, NO --rm — see §25)
+docker logs -f vllm-qwen-distill         # qwen3.5-35b-distill
+docker logs -f vllm-qwen-nvfp4           # qwen3.5-122b-nvfp4
+docker logs -f llama-gemma-26b           # gemma-4-26b-a4b
+docker logs -f llama-gemma-e4b           # gemma-4-e4b
+docker logs -f llama-minimax             # minimax-m2.7
+docker logs -f llama-supergemma          # supergemma-4-26b
 
 # Current state
 curl http://192.168.1.12:8080/running     # which model is hot
@@ -274,8 +330,6 @@ docker ps --filter name=llama- --filter name=vllm-
 
 # Force an unload without stopping the service
 curl -X POST http://192.168.1.12:8080/unload
-
-# Switch modes (see "Switching modes" above)
 ```
 
 Cold-swap behaviour (swap mode): the first call after an idle timeout or after hitting a different model triggers a container spin-up. Expect 1–10 min. LiteLLM or any wrapping client should set a per-request timeout ≥ 900 s.
@@ -316,7 +370,7 @@ Results saved to timestamped `logs/bench-deep-YYYYMMDD-HHMM.json` with symlink a
    - GGUF: use llama.cpp pattern (see `gemma-4-26b-a4b`).
 4. **Append the new key** to the relevant group members list.
 5. **Validate**: `python3 -c "import yaml; yaml.safe_load(open('config/llama-swap.yaml'))"`.
-6. **Restart**: `kill -9 $(pgrep -f "llama-swap -config")` (systemd restarts automatically).
+6. **Save** — that's it. llama-swap runs with `-watch-config` (see §27) and reloads within ~1 s without process restart, preserving running model containers. Verify via `curl -s http://localhost:8080/v1/models`. Fallback for binary/unit changes: `pkill -9 llama-swap` (SIGKILL → systemd respawn; SIGTERM does not).
 7. **Smoke test** by sending a 5-token completion — first request is the cold load.
 
 ## LiteLLM integration
@@ -352,6 +406,10 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 │   ├── bench-models.py             # quick benchmark (cold start + tok/s)
 │   ├── bench-deep.py               # deep benchmark (TTFT, decode, concurrency)
 │   └── bench-compare-deep.py       # before/after comparison report
+├── systemd/
+│   ├── llama-swap.service          # main unit (ExecStartPre/Post cleanup hooks)
+│   └── llama-swap.service.d/
+│       └── watch-config.conf       # drop-in: enables -watch-config (§27)
 ├── venv/                           # python + huggingface_hub + hf_transfer
 ├── logs/
 │   ├── llama-swap.log              # gateway stdout
@@ -361,10 +419,11 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 │   └── bench-deep-*.json           # timestamped deep benchmark runs
 └── README.md
 
-~/bin/llama-swap                     # gateway binary (v201)
-/etc/systemd/system/llama-swap.service   # with ExecStartPre cleanup hook
-~/.cache/huggingface/hub/            # model weights (max:max ownership required)
-~/.cache/huggingface/token           # HF auth, chmod 600
+~/bin/llama-swap                                            # gateway binary (v201)
+/etc/systemd/system/llama-swap.service                      # main unit
+/etc/systemd/system/llama-swap.service.d/watch-config.conf  # drop-in (§27)
+~/.cache/huggingface/hub/                                   # model weights (max:max ownership required)
+~/.cache/huggingface/token                                  # HF auth, chmod 600
 ```
 
 ## MTP patch (AlphaOxO Qwen3.6-27B-NVFP4)
