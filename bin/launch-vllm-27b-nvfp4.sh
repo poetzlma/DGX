@@ -30,7 +30,7 @@ exec docker run --name vllm-qwen-27b \
   vllm/vllm-openai:cu130-nightly \
   AlphaOxO/Qwen3.6-27B-NVFP4 \
   --host 0.0.0.0 --port 9008 \
-  --served-model-name qwen3.6-27b \
+  --served-model-name qwen3.6-27b qwen3.6-35b-a3b \
   --max-model-len 262144 \
   --max-num-seqs 10 \
   --max-num-batched-tokens 8192 \

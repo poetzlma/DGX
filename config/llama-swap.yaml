@@ -3,18 +3,20 @@ logLevel: info
 
 models:
   # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.6-35B-A3B MoE (vLLM, NVFP4) — DORMANT (on-demand) since 2026-04-24
+  # Qwen3.6-35B-A3B MoE — DISABLED 2026-04-27.
   #
-  # Solo 27B NVFP4+MTP is the default coding stack. The MoE entry is kept
-  # routable via swap-exclusive `main` group: a request to qwen3.6-35b-a3b
-  # cold-starts it and evicts whatever heavy is currently up (27B etc.).
-  # Launcher: bin/launch-vllm-qwen.sh (RedHatAI/Qwen3.6-35B-A3B-NVFP4).
+  # Legacy opencode sessions still send model="qwen3.6-35b-a3b" by default
+  # and were repeatedly cold-swapping the 27B out. The name is now an
+  # ALIAS of qwen3.6-27b (see that entry below) so old clients land on
+  # the 27B transparently. To re-enable the real MoE, restore this block,
+  # remove the alias on qwen3.6-27b, and add qwen3.6-35b-a3b back to the
+  # `main` group members. Launcher kept: bin/launch-vllm-qwen.sh.
   # ─────────────────────────────────────────────────────────────────────
-  qwen3.6-35b-a3b:
-    cmd: /home/max/llm-stack/bin/launch-vllm-qwen.sh
-    proxy: http://127.0.0.1:9001
-    checkEndpoint: /health
-    ttl: 3600
+  # qwen3.6-35b-a3b:
+  #   cmd: /home/max/llm-stack/bin/launch-vllm-qwen.sh
+  #   proxy: http://127.0.0.1:9001
+  #   checkEndpoint: /health
+  #   ttl: 3600
 
   # ─────────────────────────────────────────────────────────────────────
   # Gemma 4 26B-A4B (llama.cpp, Q4_K_M)
@@ -119,76 +121,14 @@ models:
     checkEndpoint: /health
     ttl: 3600
 
-  # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.5-35B-A3B Claude Opus Distilled (vLLM, BF16)
-  #
-  # CHANGE 2026-04-15: Added MTP speculative decoding.
-  # CHANGE 2026-04-15: Added --enable-prefix-caching.
-  # CHANGE 2026-04-15: Added --attention-backend FLASHINFER.
-  # ─────────────────────────────────────────────────────────────────────
-  qwen3.5-35b-distill:
-    cmd: >
-      docker run --rm --name vllm-qwen-distill
-      --runtime=nvidia --gpus all --ipc=host
-      --ulimit memlock=-1 --ulimit stack=67108864
-      -p 0.0.0.0:9005:9005
-      -v /home/max/.cache/huggingface:/root/.cache/huggingface
-      -e HF_TOKEN_FILE=/root/.cache/huggingface/token
-      -e VLLM_FLASHINFER_MOE_BACKEND=latency
-      -e VLLM_ENGINE_READY_TIMEOUT_S=1800
-      vllm/vllm-openai:cu130-nightly
-      Jackrong/Qwen3.5-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled
-      --host 0.0.0.0 --port 9005
-      --served-model-name qwen3.5-35b-distill
-      --max-model-len 8192
-      --max-num-batched-tokens 8192
-      --kv-cache-dtype fp8
-      --enable-prefix-caching
-      --gpu-memory-utilization 0.85
-      --language-model-only
-      --reasoning-parser qwen3
-      --attention-backend FLASHINFER
-      --enable-auto-tool-choice
-      --tool-call-parser qwen3_coder
-      --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
-    proxy: http://127.0.0.1:9005
-    checkEndpoint: /health
-    ttl: 3600
+  # qwen3.5-35b-distill — REMOVED 2026-04-28. HF cache deleted to make room
+  # for DeepSeek-V4 deployment. To restore: re-download
+  # Jackrong/Qwen3.5-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled and revert
+  # this commit. (3.5 generation, superseded by 3.6 stack anyway.)
 
-  # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.5-122B-A10B NVFP4 (vLLM)
-  #
-  # CHANGE 2026-04-15: Added --kv-cache-dtype fp8.
-  # CHANGE 2026-04-15: Added --attention-backend FLASHINFER.
-  # CHANGE 2026-04-15: Removed -e VLLM_FLASHINFER_MOE_BACKEND=latency.
-  # ─────────────────────────────────────────────────────────────────────
-  qwen3.5-122b-nvfp4:
-    cmd: >
-      docker run --rm --name vllm-qwen-nvfp4
-      --runtime=nvidia --gpus all --ipc=host
-      --ulimit memlock=-1 --ulimit stack=67108864
-      -p 0.0.0.0:9006:9006
-      -v /home/max/.cache/huggingface:/root/.cache/huggingface
-      -e HF_TOKEN_FILE=/root/.cache/huggingface/token
-      -e VLLM_ENGINE_READY_TIMEOUT_S=1800
-      vllm/vllm-openai:cu130-nightly
-      RedHatAI/Qwen3.5-122B-A10B-NVFP4
-      --host 0.0.0.0 --port 9006
-      --served-model-name qwen3.5-122b-nvfp4
-      --max-model-len 65536
-      --max-num-batched-tokens 8192
-      --kv-cache-dtype fp8
-      --enable-prefix-caching
-      --gpu-memory-utilization 0.80
-      --moe-backend flashinfer_cutlass
-      --language-model-only
-      --reasoning-parser qwen3
-      --attention-backend FLASHINFER
-      --enable-auto-tool-choice
-      --tool-call-parser qwen3_coder
-    proxy: http://127.0.0.1:9006
-    checkEndpoint: /health
-    ttl: 3600
+  # qwen3.5-122b-nvfp4 — REMOVED 2026-04-28. HF cache deleted to make room
+  # for DeepSeek-V4 deployment. To restore: re-download
+  # RedHatAI/Qwen3.5-122B-A10B-NVFP4 and revert this commit.
 
   # ─────────────────────────────────────────────────────────────────────
   # Gemma 4 E4B (llama.cpp, Q8_0)
@@ -237,6 +177,8 @@ models:
     proxy: http://127.0.0.1:9010
     checkEndpoint: /health
     ttl: 3600
+    aliases:
+      - qwen3.6-35b-a3b   # legacy opencode sessions land here (added 2026-04-27)
     # ─── ROLLBACK (30-second revert) ────────────────────────────────────
     # If the vLLM path misbehaves, comment the `cmd:` above and uncomment
     # this llama.cpp GGUF block, then `sudo systemctl restart llama-swap`.
@@ -256,6 +198,39 @@ models:
     #   --presence-penalty 1.5 --reasoning on
     #   --chat-template-kwargs '{"preserve_thinking": true}'
 
+  # ─────────────────────────────────────────────────────────────────────
+  # DeepSeek V4 Flash IQ2_XXS — patched llama.cpp fork
+  # (phuongncn/llama.cpp-gx10-dgx-sparks-deepseekv4) added 2026-04-28.
+  #
+  # WHY:    Upstream llama.cpp can't serve DeepSeek V4 above ~8k ctx — the
+  #         compressor's metadata pool (~5 MB) and tensor-slot table (2k)
+  #         overflow on the 41 compressed layers, which create ~350k tensor
+  #         objects per token. The fork bumps pool→170 MB and slots→450k.
+  # NOTE:   Repo benchmark: 8.48 PP / 6.65 gen tok/s. parallel=1 REQUIRED
+  #         (multi-seq trips an assert in the compressor). 124 GB resident
+  #         at 128k ctx — must remain swap-exclusive with `main` group.
+  #         Native binary, not docker — needs the patched build.
+  # ─────────────────────────────────────────────────────────────────────
+  deepseek-v4-flash:
+    cmd: >
+      /home/max/llama.cpp-gx10-dsv4/build/bin/llama-server
+      --host 127.0.0.1 --port 9011
+      --alias deepseek-v4-flash
+      -m /home/max/models/deepseek-v4-flash/DeepSeek-V4-Flash-IQ2XXS.gguf
+      --ctx-size 65536
+      --n-gpu-layers 99
+      -b 4096 -ub 512
+      -ctk f32 -ctv f32
+      --parallel 1
+      --threads 4 --threads-batch 20
+      -fa on
+      --no-mmap
+      --reasoning-budget -1
+      --jinja
+    proxy: http://127.0.0.1:9011
+    checkEndpoint: /health
+    ttl: 3600
+
 groups:
   # The main group: heavy models, only one active at a time.
   # CHANGE 2026-04-24: qwen3.6-27b joined (solo NVFP4+MTP, was in qwen36 pair).
@@ -269,11 +244,11 @@ groups:
       - gemma-4-26b-a4b
       - minimax-m2.7
       - supergemma-4-26b
-      - qwen3.5-35b-distill
-      - qwen3.5-122b-nvfp4
       - gemma-4-e4b
       - qwen3.6-27b
-      - qwen3.6-35b-a3b
+      - deepseek-v4-flash
+      # qwen3.6-35b-a3b removed 2026-04-27 (now alias of qwen3.6-27b)
+      # qwen3.5-35b-distill, qwen3.5-122b-nvfp4 removed 2026-04-28 (3.5 gen)
 
   # qwen36 coexistence group REMOVED 2026-04-24 (solo 27B on Spark).
   # The MoE is disabled upstairs; the 27B moved into `main`.
