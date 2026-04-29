@@ -44,6 +44,7 @@ All entries are OpenAI-compatible, reached through the gateway at the same URL. 
 | `minimax-m2.7` | main | llama.cpp | UD-IQ4_XS (unsloth) | ~60 | ~200 k | 65 536 | 230B/10B MoE. Changed from Q3_K_XL; KV cache q4_0. |
 | `supergemma-4-26b` | main | llama.cpp | Q8_0 (multimodal) | ~26 | 256 k | 65 536 | Gemma 4 26B abliterated + mmproj vision. Context reduced from 131K; KV q4_0. |
 | `gemma-4-e4b` | main | llama.cpp | Q8_0 (GGUF) | ~8 | 128 k | 131 072 | Gemma 4 E4B with vision (mmproj). Used as vision worker. |
+| `nemotron-3-nano-omni` | main | vLLM | NVFP4 (NVIDIA) | ~21 | 262 k | 131 072 | **Multimodal omni** (text + image + audio + video) — Mamba2-Transformer hybrid MoE 30B/3B-active. Reasoning model. Custom image `cu130-nightly-omni` (av/soundfile baked in). util 0.65, max-num-seqs 8, c=8 throughput peak ~383 tok/s. Launcher `bin/launch-vllm-nemotron-omni.sh` (see §29). |
 
 Per-model flags live in `config/llama-swap.yaml` with comments explaining each choice.
 
@@ -303,6 +304,55 @@ Reactivation cost: a request to `qwen3.6-35b-a3b` triggers `docker rm -f vllm-qw
 
 If the MoE is no longer needed at all: comment its block in `config/llama-swap.yaml` and remove from `main.members`. Weights stay in HF cache for future re-activation. Save → hot-reload (§27) does the rest.
 
+### 29. `nemotron-3-nano-omni` multimodal slot (2026-04-29)
+
+Added as the omni multimodal lane (text + image + audio + video). NVIDIA's Mamba2-Transformer hybrid MoE 30B/3B-active with CRADIO-v4-H vision and Parakeet audio encoders. Sits in `main` swap-exclusive group alongside the 27B; treat as orthogonal — qwen3.6-27b stays the coding default, nemotron-omni handles multimodal. Launcher `bin/launch-vllm-nemotron-omni.sh`, container `vllm-nemotron-omni`, port 9012.
+
+**Custom image required.** vLLM's audio path needs `av` (PyAV) and `soundfile` (and `librosa`) at process import time. The base `cu130-nightly` image ships without them. Hot-installing into a running container leaves vLLM with a cached `PlaceholderModule` and audio requests fail with `AssertionError: PlaceholderModule should not be used when the original module can be imported`. Build a derived image once:
+
+```bash
+# in a running container started from cu130-nightly:
+docker exec vllm-nemotron-omni pip install av soundfile librosa
+docker commit vllm-nemotron-omni vllm/vllm-openai:cu130-nightly-omni
+```
+
+Launcher pins the new tag. Without this, image works but audio/video fail.
+
+**`--max-num-batched-tokens 8192` is required.** Same Mamba block-size assertion as Qwen3.5 (§14): vLLM resolves Mamba `block_size = 2128` on this model, default `--max-num-batched-tokens=2048` fires `AssertionError: In Mamba cache align mode, block_size (2128) must be <= max_num_batched_tokens (2048)`.
+
+**Sized down from the qwen 0.85 envelope.** 2026-04-29 sweeps showed:
+
+- **Concurrency peak at c=8**: 383 tok/s aggregate. Sharp cliff at c=9 (-30 % throughput, +60 % latency). Bound by Mamba SSM state + MoE router contention, not KV. Set `--max-num-seqs 8`.
+- **Memory math**: model + scaffolding ~25 GB (NVFP4 weights + vision/audio encoders in BF16 + CUDA graphs + activations). KV in-flight at c=8 with 100 k context ≈ 12 GB. Multimodal scratch peaks +1.8 GB (1080p 23 s video) and +1.2 GB (5 min audio). Prefix cache wants ~30 GB to be load-bearing on shared system prompts. Total ≈ 70 GB → **`--gpu-memory-utilization 0.65`** (~77 GB allocated, frees ~25 GB to OS vs the 27B's 0.85 envelope).
+- **Headroom check**: at 0.65, baseline 91 GB → peak with 1080p video 94.6 GB. ~25 GB free. 1 hr audio extrapolated peak ~106 GB, still under 119 GB.
+
+**Multimodal scratch curves** (Δ peak host mem above warm baseline, 0.65 util):
+
+| modality | sample | prompt_tokens | TTFT | decode | Δmem |
+|---|---|---|---|---|---|
+| image | 640×1280 PNG | 827 | 4.7 s | 55 t/s | +10 MB |
+| image | 1920×1080 JPEG | 2068 | 5.3 s | 48 t/s | +91 MB |
+| audio | 1.5 s mp3 | 242 | 4.7 s | 55 t/s | +0 MB |
+| audio | 23 s wav | 312 | 7.0 s | 55 t/s | +21 MB |
+| audio | 5 min wav | 3771 | 20.0 s | 19 t/s | **+1.2 GB** |
+| video | 518×294 15.8 s | 2507 | 8.7 s | 44 t/s | +323 MB |
+| video | 1920×1080 23 s | 3630 | 11.5 s | 33 t/s | **+1.8 GB** |
+
+Image scratch is cheap (linear in pixels). Audio and 1080p video are the heavy cases — run a real test before committing to 1 hr audio or 2 min 1080p.
+
+**Reasoning parser TTFT**. `--reasoning-parser nemotron_v3` is set per the model card. The parser buffers the entire `<think>…</think>` block before emitting any `delta.content` chunk to the stream, so on a medium-output reasoning prompt TTFT measures ~18 s even though the model is generating fine. Drop the flag if interactive UX matters more than parsed `message.reasoning_content` (qwen3.6-27b deliberately omits it for the same reason — see §26).
+
+**Other notable flags** (see launcher comments for the full set):
+- `--kv-cache-dtype fp8` per model card.
+- `--tool-call-parser qwen3_coder` per model card.
+- `--allowed-local-media-path /home/max` enables `file://` URLs in chat content blocks for local testing.
+- `--max-model-len 131072` (model native is 262 k; conservative — multimodal KV grows fast at long ctx).
+- `--video-pruning-rate 0.5` and `--media-io-kwargs '{"video":{"fps":2,"num_frames":256}}'` per model card.
+- No `--attention-backend FLASHINFER`. Mamba2 hybrid path may not be covered; let vLLM pick the default.
+- No `--rm` on the container (same crash-traceability rationale as §25).
+
+**Cold start ~150 s** in steady state (warm HF cache, post-image-pull). First-ever load on a fresh image was ~10 min including the docker pull and CUDA graph capture.
+
 ## Operations
 
 ```sh
@@ -322,6 +372,7 @@ docker logs -f llama-gemma-26b           # gemma-4-26b-a4b
 docker logs -f llama-gemma-e4b           # gemma-4-e4b
 docker logs -f llama-minimax             # minimax-m2.7
 docker logs -f llama-supergemma          # supergemma-4-26b
+docker logs -f vllm-nemotron-omni        # nemotron-3-nano-omni (NO --rm — see §25/§29)
 
 # Current state
 curl http://192.168.1.12:8080/running     # which model is hot
@@ -401,11 +452,16 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 │   ├── llama-swap-agent.yaml       # legacy snapshot: 122B + E4B agent pair (stale)
 │   └── llama-swap-bench.yaml       # benchmark variant
 ├── bin/
-│   ├── launch-vllm-qwen.sh         # launcher for qwen3.6-35b-a3b MoE (DORMANT — on-demand via llama-swap)
-│   ├── launch-vllm-27b-nvfp4.sh    # launcher for qwen3.6-27b vLLM NVFP4+MTP (active)
-│   ├── bench-models.py             # quick benchmark (cold start + tok/s)
-│   ├── bench-deep.py               # deep benchmark (TTFT, decode, concurrency)
-│   └── bench-compare-deep.py       # before/after comparison report
+│   ├── launch-vllm-qwen.sh             # launcher for qwen3.6-35b-a3b MoE (DORMANT — on-demand via llama-swap)
+│   ├── launch-vllm-27b-nvfp4.sh        # launcher for qwen3.6-27b vLLM NVFP4+MTP (active)
+│   ├── launch-vllm-nemotron-omni.sh    # launcher for nemotron-3-nano-omni multimodal (active, see §29)
+│   ├── bench-models.py                 # quick benchmark (cold start + tok/s)
+│   ├── bench-deep.py                   # deep benchmark (TTFT, decode, concurrency)
+│   ├── bench-compare-deep.py           # before/after comparison report
+│   ├── bench-concurrency-sweep.py      # ad-hoc concurrency sweep on a warm model
+│   ├── bench-context-sweep.py          # context-length sweep (TTFT, prefill, decode by ctx)
+│   ├── bench-multimodal-smoke.py       # multimodal smoke (single image + single audio)
+│   └── bench-multimodal-large.py       # multimodal scaling (image / audio / video at multiple sizes)
 ├── systemd/
 │   ├── llama-swap.service          # main unit (ExecStartPre/Post cleanup hooks)
 │   └── llama-swap.service.d/
@@ -468,7 +524,8 @@ speculation is silently off.
 | Cold load 5× slower than expected | Default mmap path on Spark | ensure `--no-mmap` (llama.cpp) or `--load-format fastsafetensors` (vLLM) |
 | 502 on first call, fine after | Model still loading | wait; watch `docker logs` for startup complete |
 | Qwen3.5 exits `status 1` within ~25 s | Image vLLM too old for Qwen3.5 arch | switch to `vllm/vllm-openai:cu130-nightly` |
-| `AssertionError: In Mamba cache align mode` | Qwen3.5 + prefix caching needs larger batch | `--max-num-batched-tokens 8192` |
+| `AssertionError: In Mamba cache align mode` | Qwen3.5 / Nemotron-Omni + prefix caching needs larger batch | `--max-num-batched-tokens 8192` |
+| `PlaceholderModule should not be used` (audio path) | vLLM cached the missing-module placeholder before `av`/`soundfile` were installed | Rebuild the omni image with the deps baked in (see §29) — hot-install + restart isn't enough; you need a fresh image |
 | `TimeoutError: VLLM_ENGINE_READY_TIMEOUT_S` | 600 s default too short for large models | `-e VLLM_ENGINE_READY_TIMEOUT_S=1800` |
 | `ValueError: Tokenizer class TokenizersBackend` | Repo exported on transformers v5 | patch cached `tokenizer_config.json` to `"Qwen2TokenizerFast"` (see §19) |
 | `OSError: Can't load image processor` | vLLM treats Qwen3.5 as multimodal; repo missing preprocessor | `--language-model-only` (see §16) |

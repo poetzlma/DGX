@@ -199,6 +199,23 @@ models:
     #   --chat-template-kwargs '{"preserve_thinking": true}'
 
   # ─────────────────────────────────────────────────────────────────────
+  # Nemotron-3-Nano-Omni-30B-A3B Reasoning NVFP4 (vLLM) — added 2026-04-29.
+  #
+  # NVIDIA's Mamba2-Transformer hybrid MoE with vision + audio encoders.
+  # Multimodal: text / image / audio / video. NVFP4 weights ~20.9 GB.
+  # WHY:    Test slot for multimodal omni — different lane from the solo 27B
+  #         coding workhorse. Heavy resource (full GPU mem util), so it lives
+  #         in the `main` swap-exclusive group with the others.
+  # NOTE:   Launcher: bin/launch-vllm-nemotron-omni.sh.
+  #         max-model-len 131072 (model supports 262144 — raise if needed).
+  # ─────────────────────────────────────────────────────────────────────
+  nemotron-3-nano-omni:
+    cmd: /home/max/llm-stack/bin/launch-vllm-nemotron-omni.sh
+    proxy: http://127.0.0.1:9012
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
   # DeepSeek V4 Flash IQ2_XXS — patched llama.cpp fork
   # (phuongncn/llama.cpp-gx10-dgx-sparks-deepseekv4) added 2026-04-28.
   #
@@ -246,6 +263,7 @@ groups:
       - supergemma-4-26b
       - gemma-4-e4b
       - qwen3.6-27b
+      - nemotron-3-nano-omni
       - deepseek-v4-flash
       # qwen3.6-35b-a3b removed 2026-04-27 (now alias of qwen3.6-27b)
       # qwen3.5-35b-distill, qwen3.5-122b-nvfp4 removed 2026-04-28 (3.5 gen)
