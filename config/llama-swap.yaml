@@ -160,43 +160,51 @@ models:
     ttl: 3600
 
   # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.6-27B dense (vLLM NVFP4 + MTP n=3) — solo coding stack.
+  # Qwen3.6-27B dense (vLLM AEON-7 NVFP4 + DFlash k=15) — solo coding stack.
   #
-  # CHANGE 2026-04-24: Replaced llama.cpp GGUF with AlphaOxO NVFP4 + native
-  #         MTP on vLLM cu130-nightly. Benched:
-  #           19 tok/s c=1   (vs 11 GGUF)
-  #           154 tok/s c=10 agg (vs ~25 GGUF) → 6×
-  # WHY:    With the MoE now disabled, the 27B takes the full 119 GiB
-  #         budget and handles both "deep reasoning" and "parallel workers"
-  #         at once, without the MoE's quality-per-token tax.
-  # NOTE:   Needs num_nextn_predict_layers=1 patch on AlphaOxO's config.json.
-  #         See ~/llm-stack/README.md §MTP-patch for the one-liner.
+  # CHANGE 2026-04-30: Promoted DFlash over MTP after head-to-head bench.
+  #         Previous AlphaOxO NVFP4 + MTP n=3 path moved to qwen3.6-27b-mtp
+  #         (dormant, addressable for rollback). Bench, same SHORT_MSGS sweep:
+  #           c=1:  41.0 tok/s  (vs MTP 20.3, +102 %)
+  #           c=5:  139.0       (vs 92.0,    +51 %)
+  #           c=10: 207.1 agg   (vs 169.1,   +22 %)
+  #           c=1 burst peak (engine log): 79.5 vs 22.0 → 3.6× decode rate
+  #         TTFT lower across the board. KV budget shrinks vs MTP
+  #         (205 k vs 552 k tokens at max-model-len 200 k vs 262 k) — fine for
+  #         current workload but tighter ceiling on long-prefill concurrency.
+  # WHY:    Drafter + DFlash spec method outperforms in-target MTP head on
+  #         GB10's unified-memory bandwidth (decode-bound regime).
+  # NOTE:   Cold start ~10 min (FlashInfer NVFP4 GEMM autotuner + CUDA-graph).
   # ─────────────────────────────────────────────────────────────────────
   qwen3.6-27b:
-    cmd: /home/max/llm-stack/bin/launch-vllm-27b-nvfp4.sh
-    proxy: http://127.0.0.1:9010
+    cmd: /home/max/llm-stack/bin/launch-vllm-27b-dflash.sh
+    proxy: http://127.0.0.1:9013
     checkEndpoint: /health
     ttl: 3600
     aliases:
-      - qwen3.6-35b-a3b   # legacy opencode sessions land here (added 2026-04-27)
-    # ─── ROLLBACK (30-second revert) ────────────────────────────────────
-    # If the vLLM path misbehaves, comment the `cmd:` above and uncomment
-    # this llama.cpp GGUF block, then `sudo systemctl restart llama-swap`.
-    # cmd: >
-    #   docker run --rm --name llama-qwen-27b
-    #   --runtime=nvidia --gpus all --ipc=host
-    #   --ulimit memlock=-1 --ulimit stack=67108864
-    #   -p 0.0.0.0:9008:9008
-    #   -v /home/max/.cache/huggingface:/root/.cache/huggingface
-    #   ghcr.io/ggml-org/llama.cpp:server-cuda
-    #   --host 0.0.0.0 --port 9008
-    #   --alias qwen3.6-27b
-    #   -m /root/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-GGUF/snapshots/82d411acf4a06cfb8d9b073a5211bf410bfc29bf/Qwen3.6-27B-UD-Q4_K_XL.gguf
-    #   --no-mmproj -ngl 999 -c 131072 -fa on --no-mmap --kv-unified
-    #   -b 4096 -ub 2048 --jinja
-    #   --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0
-    #   --presence-penalty 1.5 --reasoning on
-    #   --chat-template-kwargs '{"preserve_thinking": true}'
+      - qwen3.6-35b-a3b      # legacy opencode sessions land here (added 2026-04-27)
+      - qwen3.6-27b-dflash   # explicit DFlash name still valid (added 2026-04-30)
+    # ─── ROLLBACK (30-second revert to MTP) ──────────────────────────────
+    # If DFlash misbehaves, swap the cmd line above for:
+    #   cmd: /home/max/llm-stack/bin/launch-vllm-27b-nvfp4.sh
+    #   proxy: http://127.0.0.1:9008
+    # llama-swap -watch-config picks up yaml edits without restart.
+    # The MTP launcher is also kept addressable as `qwen3.6-27b-mtp` below.
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.6-27B dense + MTP — DORMANT rollback slot (kept 2026-04-30).
+  #
+  # Was production 2026-04-24 → 2026-04-30. Demoted in favor of DFlash above.
+  # Addressable by explicit name `qwen3.6-27b-mtp` for A/B or rollback.
+  # Same launcher, port 9008, container vllm-qwen-27b — but
+  # --served-model-name is now `qwen3.6-27b-mtp` only (no longer aliases the
+  # default name) so requests to qwen3.6-27b never land here unintentionally.
+  # ─────────────────────────────────────────────────────────────────────
+  qwen3.6-27b-mtp:
+    cmd: /home/max/llm-stack/bin/launch-vllm-27b-nvfp4.sh
+    proxy: http://127.0.0.1:9008
+    checkEndpoint: /health
+    ttl: 3600
 
   # ─────────────────────────────────────────────────────────────────────
   # Nemotron-3-Nano-Omni-30B-A3B Reasoning NVFP4 (vLLM) — added 2026-04-29.
@@ -263,6 +271,7 @@ groups:
       - supergemma-4-26b
       - gemma-4-e4b
       - qwen3.6-27b
+      - qwen3.6-27b-mtp         # dormant rollback slot 2026-04-30
       - nemotron-3-nano-omni
       - deepseek-v4-flash
       # qwen3.6-35b-a3b removed 2026-04-27 (now alias of qwen3.6-27b)

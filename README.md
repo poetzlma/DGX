@@ -1,8 +1,11 @@
 # Spark LLM Stack
 
-Single OpenAI-compatible endpoint serving models on a DGX Spark (ThinkStation PGX, 192.168.1.12). One **`main` group** with `swap: true, exclusive: true` — all heavies hot-swap one at a time, with `qwen3.6-27b` (solo vLLM NVFP4+MTP, 262 k ctx, MTP-3) as the production coding default. The `qwen3.6-35b-a3b` MoE is kept **dormant but routable** in the same group: a request cold-starts it and evicts whichever heavy is currently up.
+Single OpenAI-compatible endpoint serving models on a DGX Spark (ThinkStation PGX, 192.168.1.12). One **`main` group** with `swap: true, exclusive: true` — all heavies hot-swap one at a time, with `qwen3.6-27b` (solo vLLM AEON-7 NVFP4 + native Qwen3.6-DFlash drafter, k=15, 200 k ctx) as the production coding default since 2026-04-30. The MTP-3 path it replaced is kept dormant as `qwen3.6-27b-mtp` for one-line rollback (see §26b). The `qwen3.6-35b-a3b` MoE is kept **dormant but routable** in the same group: a request cold-starts it and evicts whichever heavy is currently up.
 
-**Architecture history.** Until 2026-04-24 we ran a `qwen36` co-resident pair (27B-GGUF llama.cpp + 35B-A3B MoE vLLM, both warm). Solo 27B-NVFP4 with MTP-3 at c=10 (~149 tok/s aggregate, see §27) matches the pair's parallel-worker throughput while preserving the dense 27B's quality-per-token — so the MoE moved to on-demand and the `qwen36` group was retired.
+**Architecture history.**
+- Until 2026-04-24: `qwen36` co-resident pair (27B-GGUF llama.cpp + 35B-A3B MoE vLLM, both warm).
+- 2026-04-24 → 2026-04-30: solo 27B NVFP4 + MTP-3 (AlphaOxO), c=10 ~149 tok/s aggregate.
+- 2026-04-30 onward: solo 27B NVFP4 + DFlash k=15 (AEON-7 image + z-lab native drafter). Head-to-head bench: **c=1 41 vs 20, c=10 207 vs 169 tok/s aggregate vs the prior MTP path** (see §26). DFlash wins because GB10 unified-memory bandwidth bottlenecks decode and the block-diffusion drafter accepts more tokens per memory round than MTP's in-target head. Deep writeup at [`docs/qwen3.6-27b-dflash.md`](docs/qwen3.6-27b-dflash.md).
 
 ## Hardware
 
@@ -36,8 +39,9 @@ All entries are OpenAI-compatible, reached through the gateway at the same URL. 
 
 | Key | Group | Backend | Quant | Weights (GB) | Native ctx | Served ctx | Notes |
 |---|---|---|---|---|---|---|---|
-| `qwen3.6-27b` | main | vLLM | NVFP4 (AlphaOxO) | ~14 | 262 k | 262 144 | **Production coding default since 2026-04-24.** Dense 27B, MTP-3 speculative + FLASHINFER, KV fp8, util 0.85, 10 concurrent slots. Launcher at `bin/launch-vllm-27b-nvfp4.sh` (see §26). MTP requires the AlphaOxO config patch (see §MTP-patch). |
-| `qwen3.6-35b-a3b` | main | vLLM | NVFP4 (RedHatAI) | ~23 | 262 k | 131 072 | **Dormant — routable on demand** (see §28). MoE 35B/3B-active, MTP-1 + FLASHINFER, util 0.55. A request cold-starts it and evicts the 27B (~5 min). Launcher at `bin/launch-vllm-qwen.sh` (see §25). |
+| `qwen3.6-27b` | main | vLLM | NVFP4 (AEON-7) | ~26 | 262 k | 200 000 | **Production coding default since 2026-04-30.** Dense 27B + DFlash k=15 speculative + flash_attn, util 0.85, 16 concurrent slots, AEON-7 patched image `vllm-aeon-ultimate-dflash:qwen36-v3`. Drafter `z-lab/Qwen3.6-27B-DFlash` v2. Launcher at `bin/launch-vllm-27b-dflash.sh` (see §26). |
+| `qwen3.6-27b-mtp` | main | vLLM | NVFP4 (AlphaOxO) | ~14 | 262 k | 262 144 | **Dormant rollback slot** (was prod 2026-04-24 → 2026-04-30). Dense 27B + MTP-3 + FLASHINFER, KV fp8, util 0.85, 10 concurrent slots, stock `vllm/vllm-openai:cu130-nightly`. Launcher at `bin/launch-vllm-27b-nvfp4.sh` (see §26b). MTP requires the AlphaOxO config patch (see §MTP-patch). |
+| `qwen3.6-35b-a3b` | main | vLLM | NVFP4 (RedHatAI) | ~23 | 262 k | 131 072 | **Dormant — routable on demand** (see §28). MoE 35B/3B-active, MTP-1 + FLASHINFER, util 0.55. A request cold-starts it and evicts whichever heavy is up (~5 min). Launcher at `bin/launch-vllm-qwen.sh` (see §25). NOTE: also aliased onto `qwen3.6-27b` (DFlash) at the gateway for legacy opencode sessions — explicit `qwen3.6-35b-a3b` requests still cold-start the real MoE. |
 | `gemma-4-26b-a4b` | main | llama.cpp | Q4_K_M (GGUF) | ~15 | 256 k | 131 072 | MoE 26B/4B active. Switched from vLLM due to FP8 + attention bugs. |
 | `qwen3.5-35b-distill` | main | vLLM | BF16 (on-disk) | ~72 | 262 k (arch) | 8 192 | Claude Opus distilled. MTP + FLASHINFER. Ctx capped at 8 k = SFT ceiling. |
 | `qwen3.5-122b-nvfp4` | main | vLLM | NVFP4 (on-disk) | ~75 | 262 k | 65 536 | Largest model via vLLM. Unstable under sustained load at 0.80 util. |
@@ -85,9 +89,9 @@ Ad-hoc bench of `qwen3.6-27b` (llama.cpp GGUF, solo — MoE not co-resident at t
 
 Throughput regresses from c=4 → c=10 because llama.cpp's slot count can't keep up. Request queueing rather than real batching dominates at c≥5. This was fine for the 27B's pair-era role (deep/thinking only) but motivated the 04-24 switch to vLLM NVFP4+MTP for proper batching.
 
-### Solo 27B-NVFP4+MTP production benchmark (2026-04-24)
+### Solo 27B-NVFP4+MTP benchmark (2026-04-24, prior production)
 
-Replaced the qwen3.6-27b GGUF spot-check above. Same prompt profile, server-side measurement via gateway, sweeping `num_speculative_tokens` (n) from 1 to 3:
+Same prompt profile, server-side measurement via gateway, sweeping `num_speculative_tokens` (n) from 1 to 3:
 
 | n | c=1 decode | c=10 peak agg | c=10 sustained | MTP accept (n=3) |
 |---|---|---|---|---|
@@ -95,9 +99,29 @@ Replaced the qwen3.6-27b GGUF spot-check above. Same prompt profile, server-side
 | 2 | ~16 tok/s | 136 tok/s | — | mean 1.74/2 (87 %, 75 %) |
 | **3** | **~19 tok/s** | **149 tok/s** | 94–149 tok/s | mean 3.0/4 (85 %, 63 %, 51 %) |
 
-n=3 ships in production (§26). Through the llama-swap gateway adds ~3 % vs direct-to-:9008 (149 vs 154); proxy overhead is negligible.
+n=3 was production from 2026-04-24 → 2026-04-30. Through the llama-swap gateway adds ~3 % vs direct-to-:9008 (149 vs 154); proxy overhead is negligible.
 
 Net vs the GGUF-pair-era spot-check at c=10: 25 → 149 tok/s aggregate (~6×) with the same hardware, at higher quality-per-token.
+
+### Solo 27B-NVFP4+DFlash benchmark (2026-04-30, current production)
+
+Same `bin/bench-concurrency-sweep.py` SHORT_MSGS profile, 512 max_tokens, gateway-measured. DFlash k=15 vs the prior MTP n=3, head-to-head, sequential cold-runs evicted via llama-swap:
+
+| c | DFlash agg tok/s | MTP agg tok/s | Δ | DFlash TTFT | MTP TTFT |
+|---|---|---|---|---|---|
+| 1 | **41.0** | 20.3 | **+102 %** (2.0×) | 394 ms | 446 ms |
+| 5 | **139.0** | 92.0 | **+51 %** | 1428 ms | 2070 ms |
+| 10 | **207.1** | 169.1 | **+22 %** | 703 ms | 978 ms |
+
+vLLM engine-internal burst peaks (`loggers.py`, instantaneous Avg generation throughput across the running batch):
+
+| c | DFlash burst | MTP burst | ratio |
+|---|---|---|---|
+| 1 | 79.5 tok/s | 22.0 | 3.6× |
+| 5 | 175.8 | 106.0 | 1.66× |
+| 10 | 264.6 | 182.4 | 1.45× |
+
+DFlash wins everywhere; the gap narrows as concurrency rises because batch effects start dominating speculative-decode gains. AEON-7's published numbers reproduced (their 38.1 / 68.4 c=1 vs our 41.0 / 79.5). See [`docs/qwen3.6-27b-dflash.md`](docs/qwen3.6-27b-dflash.md) for the full per-burst table, gotchas, and rollback recipe.
 
 ## Technical decisions
 
@@ -254,29 +278,38 @@ Now: `docker inspect vllm-qwen --format '{{.HostConfig.AutoRemove}}'` → `false
 
 Apply the same pattern to any other vLLM container where post-mortem logs matter. The 27B production launcher (`bin/launch-vllm-27b-nvfp4.sh`, see §26) follows the same convention with container name `vllm-qwen-27b`.
 
-### 26. Solo `qwen3.6-27b` NVFP4+MTP production launcher (2026-04-24)
+### 26. Solo `qwen3.6-27b` NVFP4+DFlash production launcher (2026-04-30)
 
-Replaces the prior llama.cpp-GGUF 27B and the qwen36 co-resident pair. Single launcher script `bin/launch-vllm-27b-nvfp4.sh`, container name `vllm-qwen-27b`, port 9008. Key choices:
+Replaces the prior NVFP4+MTP launcher (relegated to dormant rollback slot in §26b). Single launcher script `bin/launch-vllm-27b-dflash.sh`, container name `vllm-qwen-27b-dflash`, port 9013. Key choices:
 
-- **Repo `AlphaOxO/Qwen3.6-27B-NVFP4`** — one of only two Qwen3.6-27B NVFP4 quants that preserve MTP weights (other: `ig1/Qwen3.6-27B-NVFP4`). Verify post-download: `ls ~/.cache/huggingface/hub/models--AlphaOxO--Qwen3.6-27B-NVFP4/snapshots/*/model_mtp.safetensors`.
-- **MTP `num_speculative_tokens=3`** — 2026-04-24 sweep winner. n=3 > n=2 > n=1 on both c=1 and c=10 (149 > 136 > 120 peak tok/s aggregate). vLLM's "n>1 may lower acceptance" warning is true per-position but not net.
-- **`--gpu-memory-utilization 0.85`** — solo means full 119 GB available. Pushed past 0.85 once; 0.92 thrashed page cache (~3 GB free) and lost ~30 % throughput. 0.85 leaves ~18 GB OS headroom.
-- **`--max-model-len 262144`** — bumped from 131 072 on 2026-04-26 after a 123 k+8 k=131 073 opencode request was rejected at the old ceiling. KV budget supports it at util 0.85.
-- **`--kv-cache-dtype fp8`**, **`--enable-prefix-caching`**, **`--max-num-seqs 10`**, **`--attention-backend FLASHINFER`** (mandatory for MTP, see §20).
-- **No `--reasoning-parser qwen3`** — raw `<think>` is streamed to the client (opencode parses it natively). Gives ~495 ms TTFT vs ~3 s buffered.
+- **Target repo `AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-NVFP4`** — AEON-7's lossless abliterated NVFP4 build (~26 GB on disk). Multimodal-capable (vision encoders preserved BF16) but launched here with `--language-model-only` to mirror the text-only coding workload.
+- **Drafter `z-lab/Qwen3.6-27B-DFlash` v2** (~3.3 GB) — refreshed 2026-04-27 push. The native Qwen3.6 DFlash drafter; was the gating condition for retrying DFlash on this stack after the 2026-04-23 cross-gen Qwen3.5-DFlash failure.
+- **Image `ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v3`** — vLLM 0.20.1.dev0+g88d34c640 with 5 patches (#40092 SWA backend, #40454 mamba-cache spec-decode align, #40191 ENABLE_NVFP4_SM100=0 guard, #40662 unified spec-decode acceptance metrics, #38479 TurboQuant K8V4 baked in) + FlashInfer 0.6.9rc1 (first SM121 NVFP4 GEMM path). Stock `vllm/vllm-openai:cu130-nightly` does NOT support DFlash.
+- **DFlash `num_speculative_tokens=15`** — AEON-7's recommended k for this dense 27B. Acceptance high enough that the verifier-side overhead is well below the speedup. (Cross-gen pairings capped at k=3; the native v2 drafter is what made k=15 viable.)
+- **`--gpu-memory-utilization 0.85`** — same envelope as the prior MTP launcher; do not push above 0.88 on Spark per AEON-7's docs (unified memory thrashes).
+- **`--max-model-len 200000`** — AEON-7 recommends 200 k vs the model's 262 k native; KV budget at full 262 k tightens concurrency below useful levels with DFlash's drafter-side allocations. KV cache size reported by vLLM at boot: 205,632 tokens (vs MTP launcher's 552,000) → max concurrency 2.69× at 200 k ctx. Fine for current workload, tighter than MTP if traffic ever pushes >2 concurrent users at near-200 k input.
+- **`--max-num-seqs 16`**, **`--max-num-batched-tokens 32768`**, **`--enable-chunked-prefill --enable-prefix-caching`**, **`--kv-cache-dtype auto`** (NVFP4 path lets vLLM pick), **`--attention-backend flash_attn`** (AEON-7 recipe; not FLASHINFER).
+- **GB10 env vars (mandatory)**: `TORCH_CUDA_ARCH_LIST=12.1a`, `ENABLE_NVFP4_SM100=0`, `VLLM_USE_FLASHINFER_SAMPLER=1`, `VLLM_USE_FLASHINFER_MOE_FP4=0` (model is dense — disable FP4 MoE auto-probe to avoid SM121 PTX rejection log spam), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. Without `ENABLE_NVFP4_SM100=0` the C-stable libtorch ABI fails to import (SM100-only mxfp4_experts_quant kernels don't exist on SM121).
+- **`--served-model-name qwen3.6-27b qwen3.6-35b-a3b qwen3.6-27b-dflash`** — accepts the default name, the legacy MoE alias from old opencode sessions, and the explicit DFlash name. Gateway routes all three to this launcher (the MoE alias is also held at the llama-swap entry level; explicit `qwen3.6-35b-a3b` requests still cold-start the real MoE — see §28).
+- **No `--reasoning-parser qwen3`** — raw `<think>` is streamed to the client (opencode parses it natively). Same TTFT rationale as §26b. Differs from AEON-7's docker-compose, which keeps the parser on; we drop it deliberately.
 - **No `--rm`** on the container — same crash-traceability rationale as §25.
 
-Requires the **MTP patch** (see §MTP-patch below) — without it MTP silently no-ops and you lose 1.6–2× decode throughput.
+Cold start ~10 min (FlashInfer NVFP4 GEMM autotuner + CUDA-graph capture across 51 sizes; both cache to `/root/.cache/vllm/...` inside the container, which is *not* bind-mounted to host so caches are rebuilt on every container start). Boot summary verified at 2026-04-30 18:22 UTC: `Application startup complete.` after 10 min from trigger. **Real-traffic users hitting `qwen3.6-27b` immediately after a swap-eviction wait the full 10 min** — this is the operational difference vs MTP's ~6 min cold start.
 
-Measured throughput (server-side via gateway, 2026-04-24):
+Bench results in [§Solo 27B-NVFP4+DFlash benchmark](#solo-27b-nvfp4dflash-benchmark-2026-04-30-current-production) above; deep writeup in [`docs/qwen3.6-27b-dflash.md`](docs/qwen3.6-27b-dflash.md).
 
-| Concurrency | Peak gen throughput | MTP accept (mean / per-position) |
-|---|---|---|
-| c=1 | ~19 tok/s decode | 3.39/4 (94 / 80 / 63 %) |
-| c=10 peak | **149 tok/s** | 3.0/4 (85 / 63 / 51 %) |
-| c=10 sustained | 94–149 tok/s | — |
+### 26b. Dormant `qwen3.6-27b-mtp` rollback launcher (was prod 2026-04-24 → 2026-04-30)
 
-Cold start ~6 min (torch.compile with MTP + 262 k ctx, plus FlashInfer warmup on first inference).
+Kept on disk and addressable by explicit name `qwen3.6-27b-mtp` for one-line rollback. Launcher script `bin/launch-vllm-27b-nvfp4.sh`, container name `vllm-qwen-27b`, port 9008. Joins `main` swap-exclusive group; will not load unless explicitly requested. To restore as default, swap the `qwen3.6-27b` block's `cmd:` line in `config/llama-swap.yaml` back to this launcher and `proxy:` to 9008 (`-watch-config` picks it up — no restart). Backups for safety: `config/llama-swap.yaml.bak.20260430-pre-dflash`, `bin/launch-vllm-27b-nvfp4.sh.bak.20260430-pre-dflash`.
+
+Original config (preserved in the launcher file, demoted comment block updated 2026-04-30):
+
+- **Repo `AlphaOxO/Qwen3.6-27B-NVFP4`** — one of only two Qwen3.6-27B NVFP4 quants that preserve MTP weights (other: `ig1/Qwen3.6-27B-NVFP4`). Verify post-download: `ls ~/.cache/huggingface/hub/models--AlphaOxO--Qwen3.6-27B-NVFP4/snapshots/*/model_mtp.safetensors`.
+- **MTP `num_speculative_tokens=3`**, **`--gpu-memory-utilization 0.85`**, **`--max-model-len 262144`**, **`--kv-cache-dtype fp8`**, **`--enable-prefix-caching`**, **`--max-num-seqs 10`**, **`--attention-backend FLASHINFER`** (mandatory for MTP, see §20).
+- **`--served-model-name qwen3.6-27b-mtp`** only — does NOT alias the default `qwen3.6-27b` anymore. This is the deliberate change made on 2026-04-30 to ensure requests to the default name never accidentally land here.
+- **No `--reasoning-parser qwen3`**, **no `--rm`** — same rationales as §26.
+
+Requires the **MTP patch** (see §MTP-patch below) — without it MTP silently no-ops and you lose 1.6–2× decode throughput. Cold start ~6 min.
 
 ### 27. llama-swap `-watch-config` hot-reload (2026-04-26)
 
@@ -364,7 +397,8 @@ tail -f ~/llm-stack/logs/llama-swap.log
 tail -f ~/llm-stack/logs/llama-swap.err
 
 # Logs (active backend container)
-docker logs -f vllm-qwen-27b             # qwen3.6-27b (production coding default, NO --rm — see §25/§26)
+docker logs -f vllm-qwen-27b-dflash      # qwen3.6-27b (production coding default since 2026-04-30, NO --rm — see §25/§26)
+docker logs -f vllm-qwen-27b             # qwen3.6-27b-mtp (DORMANT rollback slot, NO --rm — see §25/§26b)
 docker logs -f vllm-qwen                 # qwen3.6-35b-a3b (DORMANT MoE, NO --rm — see §25)
 docker logs -f vllm-qwen-distill         # qwen3.5-35b-distill
 docker logs -f vllm-qwen-nvfp4           # qwen3.5-122b-nvfp4
@@ -453,7 +487,8 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 │   └── llama-swap-bench.yaml       # benchmark variant
 ├── bin/
 │   ├── launch-vllm-qwen.sh             # launcher for qwen3.6-35b-a3b MoE (DORMANT — on-demand via llama-swap)
-│   ├── launch-vllm-27b-nvfp4.sh        # launcher for qwen3.6-27b vLLM NVFP4+MTP (active)
+│   ├── launch-vllm-27b-dflash.sh       # launcher for qwen3.6-27b NVFP4+DFlash (ACTIVE production default since 2026-04-30, see §26)
+│   ├── launch-vllm-27b-nvfp4.sh        # launcher for qwen3.6-27b-mtp NVFP4+MTP (DORMANT rollback slot, see §26b)
 │   ├── launch-vllm-nemotron-omni.sh    # launcher for nemotron-3-nano-omni multimodal (active, see §29)
 │   ├── bench-models.py                 # quick benchmark (cold start + tok/s)
 │   ├── bench-deep.py                   # deep benchmark (TTFT, decode, concurrency)
@@ -483,6 +518,10 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 ```
 
 ## MTP patch (AlphaOxO Qwen3.6-27B-NVFP4)
+
+> **As of 2026-04-30 this only applies to the dormant `qwen3.6-27b-mtp` rollback slot (§26b).**
+> The active production default `qwen3.6-27b` runs DFlash on AEON-7's NVFP4 weights and
+> does not need this patch. Re-apply only if you reactivate the MTP launcher.
 
 The AlphaOxO NVFP4 repo ships the MTP weights (`model_mtp.safetensors`) but strips
 `num_nextn_predict_layers` from `config.json`. Without that field, vLLM silently loads

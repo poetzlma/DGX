@@ -1,8 +1,10 @@
 #!/bin/bash
-# Production launcher — Qwen3.6-27B-NVFP4 (solo, 2026-04-24).
+# Dormant rollback launcher — Qwen3.6-27B-NVFP4 + MTP n=3 (was prod 2026-04-24 → 2026-04-30).
 #
-# Replaces the previous MoE+GGUF co-resident pair. MoE is disabled in
-# llama-swap.yaml (kept commented for reactivation on other hardware).
+# DEMOTED 2026-04-30: DFlash + AEON-7 NVFP4 won a head-to-head bench
+# (c=1 41 vs 20 tok/s, c=10 207 vs 169 agg). Kept addressable as
+# `qwen3.6-27b-mtp` for easy rollback. To restore as default, swap
+# the cmd path in llama-swap.yaml's qwen3.6-27b entry.
 #
 # Decisions:
 #   - Solo → full 119 GiB budget, --gpu-memory-utilization 0.85 (~101 GB, ~18 GB OS headroom).
@@ -30,7 +32,7 @@ exec docker run --name vllm-qwen-27b \
   vllm/vllm-openai:cu130-nightly \
   AlphaOxO/Qwen3.6-27B-NVFP4 \
   --host 0.0.0.0 --port 9008 \
-  --served-model-name qwen3.6-27b qwen3.6-35b-a3b \
+  --served-model-name qwen3.6-27b-mtp \
   --max-model-len 262144 \
   --max-num-seqs 10 \
   --max-num-batched-tokens 8192 \
