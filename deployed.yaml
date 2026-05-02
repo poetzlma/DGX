@@ -1,0 +1,74 @@
+# Deployed LLM stack manifest — source of truth for downstream proxies (LiteLLM, etc.)
+#
+# Updated: 2026-05-02
+# Gateway: http://192.168.1.12:8080/v1   (llama-swap, OpenAI-compatible)
+#
+# All models share the gateway URL — clients route by `model` field.
+# Per-model ports (9008, 9011, 9012, 9013) are internal — only up while loaded.
+#
+# Cold-start budget: vLLM models 2–10 min on first request after swap.
+# Set request_timeout >= 600s on any client to avoid timing out a cold load.
+#
+# `model_list` block below is drop-in for LiteLLM proxy config.
+
+gateway:
+  url: http://192.168.1.12:8080/v1
+  api_key: not-needed   # LAN-only, no auth
+  swap_mode: exclusive  # one model resident at a time
+  request_timeout_min_s: 600
+
+deployed:
+  - name: qwen3.6-27b
+    role: production coding
+    method: NVFP4 + DFlash k=15 spec decode
+    aliases: [qwen3.6-35b-a3b, qwen3.6-27b-dflash]
+    port_internal: 9013
+
+  - name: qwen3.6-27b-mtp
+    role: dormant rollback (MTP n=3)
+    method: NVFP4 + MTP
+    port_internal: 9008
+
+  - name: nemotron-3-nano-omni
+    role: multimodal omni (text/image/audio/video)
+    method: NVFP4
+    port_internal: 9012
+
+  - name: deepseek-v4-flash
+    role: long-context specialty (parallel=1)
+    method: IQ2_XXS, patched llama.cpp fork
+    port_internal: 9011
+
+# ─── LiteLLM model_list (drop into proxy config) ───────────────────────────
+model_list:
+  - model_name: qwen3.6-27b
+    litellm_params:
+      model: openai/qwen3.6-27b
+      api_base: http://192.168.1.12:8080/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-27b-mtp
+    litellm_params:
+      model: openai/qwen3.6-27b-mtp
+      api_base: http://192.168.1.12:8080/v1
+      api_key: not-needed
+
+  - model_name: nemotron-3-nano-omni
+    litellm_params:
+      model: openai/nemotron-3-nano-omni
+      api_base: http://192.168.1.12:8080/v1
+      api_key: not-needed
+
+  - model_name: deepseek-v4-flash
+    litellm_params:
+      model: openai/deepseek-v4-flash
+      api_base: http://192.168.1.12:8080/v1
+      api_key: not-needed
+
+litellm_settings:
+  request_timeout: 900   # cold-start headroom; do not lower below 600
+
+# ─── Removed models (do NOT route to these) ────────────────────────────────
+# 2026-05-02: gemma-4-26b-a4b, minimax-m2.7, supergemma-4-26b, gemma-4-e4b
+# 2026-04-28: qwen3.5-35b-distill, qwen3.5-122b-nvfp4
+# 2026-04-27: qwen3.6-35b-a3b (now an alias of qwen3.6-27b)
