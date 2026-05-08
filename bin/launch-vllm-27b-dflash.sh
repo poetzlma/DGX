@@ -33,7 +33,7 @@ exec docker run --name vllm-qwen-27b-dflash \
   ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v3 \
   bash -c '
     exec vllm serve AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-NVFP4 \
-      --served-model-name qwen3.6-27b qwen3.6-35b-a3b qwen3.6-27b-dflash \
+      --served-model-name qwen3.6-27b-aeon-dflash qwen3.6-27b-dflash \
       --host 0.0.0.0 --port 9013 \
       --tensor-parallel-size 1 \
       --dtype auto \
@@ -52,5 +52,5 @@ exec docker run --name vllm-qwen-27b-dflash \
       --attention-backend flash_attn \
       --language-model-only \
       --generation-config vllm \
-      --speculative-config "{\"method\":\"dflash\",\"model\":\"z-lab/Qwen3.6-27B-DFlash\",\"num_speculative_tokens\":15}"
+      --speculative-config "{\"method\":\"dflash\",\"model\":\"z-lab/Qwen3.6-27B-DFlash\",\"num_speculative_tokens\":4}"
   '
