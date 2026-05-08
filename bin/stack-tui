@@ -1,0 +1,1246 @@
+#!/home/max/llm-stack/venv/bin/python3
+"""Live cockpit TUI for the llama-swap engine stack.
+
+Tokyo Night Storm palette. Octant-precision bars. Pill-style state badges.
+Heavy horizontal "prefill" phase + full-block "decode" phase + ascii arrow
+"in-flight" tip in the Gantt. Cold-start stage progress with elapsed/ETA.
+
+Data sources:
+- vLLM /metrics (KV usage, accept rate, request counts, histograms)
+- vLLM stdout (per-request lifecycle if --enable-log-requests is on,
+  plus cold-start phase detection)
+- nvidia-smi (GPU temp + util + power; memory.* is N/A on GB10)
+- /proc/meminfo (system unified memory; GB10 shares CPU+GPU mem)
+
+Usage:
+    stack-tui                    # auto-discover, 5-min view
+    stack-tui --view 1m          # 1-min view (finer grain)
+    stack-tui --view 30m         # 30-min view (session review)
+    stack-tui --port 9016        # specific engine
+    stack-tui --refresh 0.5      # half-second refresh
+
+Press Ctrl-C to quit (alt-screen restored).
+"""
+import argparse
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import OrderedDict, defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.theme import Theme
+from rich import box
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Tokyo Night Storm palette (semantic roles)
+# ────────────────────────────────────────────────────────────────────────
+
+TN_THEME = Theme({
+    # surfaces
+    "tn.border":   "#3b4261",
+    "tn.border.hi": "#545c7e",
+    # text
+    "tn.fg":       "#c0caf5",
+    "tn.fg.dim":   "#a9b1d6",
+    "tn.fg.muted": "#565f89",
+    # semantic accents
+    "tn.accent":   "#7aa2f7",  # blue   - primary highlight
+    "tn.info":     "#7dcfff",  # cyan   - in-flight
+    "tn.success":  "#9ece6a",  # green  - stop / healthy
+    "tn.warning":  "#e0af68",  # yellow - length / warming up
+    "tn.danger":   "#f7768e",  # red    - error / abort
+    "tn.magenta":  "#bb9af7",
+    "tn.orange":   "#ff9e64",  # orange - truncation / repetition
+    "tn.teal":     "#73daca",  # teal   - prefill phase
+    # pill backgrounds (text drawn black, bg drawn in accent)
+    "tn.pill.success":  "#0a0a14 on #9ece6a",
+    "tn.pill.warning":  "#0a0a14 on #e0af68",
+    "tn.pill.danger":   "#c0caf5 on #f7768e",
+    "tn.pill.info":     "#0a0a14 on #7dcfff",
+    "tn.pill.accent":   "#0a0a14 on #7aa2f7",
+    "tn.pill.muted":    "#c0caf5 on #3b4261",
+})
+
+
+# ────────────────────────────────────────────────────────────────────────
+# engine discovery
+# ────────────────────────────────────────────────────────────────────────
+
+def discover_engines() -> list[dict]:
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "--format",
+             "{{.Names}}\t{{.Status}}\t{{.Ports}}"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+    engines = []
+    for line in out.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        name, status, ports = parts[0], parts[1], parts[2]
+        if not name.startswith("vllm-"):
+            continue
+        m = re.search(r"0\.0\.0\.0:(\d+)->", ports)
+        if not m:
+            continue
+        engines.append({"name": name, "port": int(m.group(1)),
+                        "status": status})
+    return engines
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Prometheus parsing (subset for TUI gauges)
+# ────────────────────────────────────────────────────────────────────────
+
+_METRIC_RE = re.compile(
+    r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([0-9eE.+-]+)\s*$'
+)
+_LABEL_RE = re.compile(
+    r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"'
+)
+
+
+def parse_metrics(text: str) -> dict:
+    out = defaultdict(list)
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        m = _METRIC_RE.match(line)
+        if not m:
+            continue
+        name, labels_raw, val_raw = m.group(1), m.group(2) or "", m.group(3)
+        try:
+            val = float(val_raw)
+        except ValueError:
+            continue
+        labels = dict(_LABEL_RE.findall(labels_raw))
+        out[name].append((labels, val))
+    return out
+
+
+def fetch_metrics(port: int, timeout: float = 2.0) -> Optional[dict]:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics",
+                                    timeout=timeout) as r:
+            return parse_metrics(r.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+
+
+def first_value(metrics: dict, name: str, **filt) -> Optional[float]:
+    for labels, val in metrics.get(name, []):
+        if all(labels.get(k) == v for k, v in filt.items()):
+            return val
+    return None
+
+
+def sum_values(metrics: dict, name: str, **filt) -> float:
+    s = 0.0
+    for labels, val in metrics.get(name, []):
+        if all(labels.get(k) == v for k, v in filt.items()):
+            s += val
+    return s
+
+
+def gauge_snapshot(metrics: dict) -> dict:
+    return {
+        "running": first_value(metrics, "vllm:num_requests_running") or 0,
+        "waiting": first_value(metrics, "vllm:num_requests_waiting") or 0,
+        "kv": (first_value(metrics, "vllm:kv_cache_usage_perc") or 0) * 100,
+        "awake": first_value(metrics, "vllm:engine_sleep_state",
+                             sleep_state="awake") or 0,
+        "spec_drafted": sum_values(
+            metrics, "vllm:spec_decode_num_draft_tokens_total"),
+        "spec_accepted": sum_values(
+            metrics, "vllm:spec_decode_num_accepted_tokens_total"),
+        "preempt": sum_values(metrics, "vllm:num_preemptions_total"),
+        "succ_stop": sum_values(metrics, "vllm:request_success_total",
+                                finished_reason="stop"),
+        "succ_length": sum_values(metrics, "vllm:request_success_total",
+                                  finished_reason="length"),
+        "succ_abort": sum_values(metrics, "vllm:request_success_total",
+                                 finished_reason="abort"),
+        "succ_error": sum_values(metrics, "vllm:request_success_total",
+                                 finished_reason="error"),
+        "gen_total": sum_values(metrics, "vllm:generation_tokens_total"),
+        "prompt_total": sum_values(metrics, "vllm:prompt_tokens_total"),
+        # histogram counts/sums for lifecycle event detection
+        "ttft_count": sum_values(metrics,
+                                 "vllm:time_to_first_token_seconds_count"),
+        "ttft_sum": sum_values(metrics,
+                               "vllm:time_to_first_token_seconds_sum"),
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────
+# system data (nvidia-smi, /proc/meminfo)
+# ────────────────────────────────────────────────────────────────────────
+
+def read_nvidia_stats() -> dict:
+    out = {"util": None, "temp": None, "power": None, "clock": None}
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu,"
+             "power.draw,clocks.current.graphics",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2,
+        )
+        line = (r.stdout or "").strip().splitlines()
+        if line:
+            parts = [p.strip() for p in line[0].split(",")]
+            try:
+                out["util"] = float(parts[0]) if parts[0] != "[N/A]" else None
+                out["temp"] = float(parts[1]) if parts[1] != "[N/A]" else None
+                out["power"] = float(parts[2]) if parts[2] != "[N/A]" else None
+                out["clock"] = float(parts[3]) if parts[3] != "[N/A]" else None
+            except (ValueError, IndexError):
+                pass
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return out
+
+
+def read_meminfo() -> dict:
+    out = {"total_gb": None, "available_gb": None, "used_gb": None}
+    try:
+        with open("/proc/meminfo") as f:
+            kv = {}
+            for line in f:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    kv[k.strip()] = v.strip()
+        total_kb = int(kv.get("MemTotal", "0").split()[0])
+        avail_kb = int(kv.get("MemAvailable", "0").split()[0])
+        out["total_gb"] = total_kb / 1024 / 1024
+        out["available_gb"] = avail_kb / 1024 / 1024
+        out["used_gb"] = out["total_gb"] - out["available_gb"]
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+# ────────────────────────────────────────────────────────────────────────
+# cold-start stage tracking
+# ────────────────────────────────────────────────────────────────────────
+
+COLD_STAGES = [
+    "container starting",
+    "loading weights",
+    "compiling graphs",
+    "capturing cudagraphs",
+    "starting server",
+    "ready",
+]
+COLD_STAGE_TYPICAL_S = {
+    "container starting":     15.0,
+    "loading weights":       180.0,
+    "compiling graphs":       90.0,
+    "capturing cudagraphs":  240.0,
+    "starting server":        10.0,
+}
+
+_RX_STAGE_PATTERNS = [
+    (re.compile(r"Loading safetensors checkpoint shards:\s+(?P<pct>\d+)%"
+                r"[^|]*\|\s*(?P<idx>\d+)/(?P<tot>\d+)"),
+     "loading weights",
+     lambda m: f"shards {m.group('idx')}/{m.group('tot')} ({m.group('pct')}%)"),
+    (re.compile(r"Loading weights took"),
+     "compiling graphs", lambda m: "weights loaded"),
+    (re.compile(r"Dynamo bytecode transform time"),
+     "compiling graphs", lambda m: "dynamo"),
+    (re.compile(r"Compiling a graph for compile range \((?P<r>[^)]+)\)"),
+     "compiling graphs", lambda m: f"compile range {m.group('r')}"),
+    (re.compile(r"torch\.compile took"),
+     "capturing cudagraphs", lambda m: "starting capture"),
+    (re.compile(r"Capturing cudagraph for batch_size=(?P<bs>\d+)"),
+     "capturing cudagraphs", lambda m: f"batch_size={m.group('bs')}"),
+    (re.compile(r"Capturing CUDA graph shapes:\s+(?P<pct>\d+)%"),
+     "capturing cudagraphs", lambda m: f"{m.group('pct')}%"),
+    (re.compile(r"Started server process|Application startup complete"),
+     "ready", lambda m: ""),
+    (re.compile(r"Engine core initialization failed|Engine core failed to start"),
+     "CRASHED", lambda m: ""),
+]
+
+
+# ────────────────────────────────────────────────────────────────────────
+# per-request state + log tailer
+# ────────────────────────────────────────────────────────────────────────
+
+VIEW_PRESETS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800}
+
+
+@dataclass
+class RequestState:
+    request_id: str
+    start_ts: float
+    prompt_tokens: Optional[int] = None
+    prefill_done_ts: Optional[float] = None
+    end_ts: Optional[float] = None
+    gen_tokens: Optional[int] = None
+    finish_reason: Optional[str] = None
+    # accumulated share of gen_total deltas while this request was decoding
+    gen_accum: float = 0.0
+
+
+_RX_RECV_PATTERNS = [
+    re.compile(r"Received request (?P<id>[\w\-]+).*?prompt[_ ]tokens?[= ]+(?P<pt>\d+)"),
+    re.compile(r"Received request (?P<id>[\w\-]+).*?num_prompt_tokens[= ]+(?P<pt>\d+)"),
+    re.compile(r"Received request (?P<id>[\w\-]+)"),
+]
+_RX_FIRST = re.compile(
+    r"(?:First token for|first token request|FirstToken) (?:request )?(?P<id>[\w\-]+)"
+)
+_RX_FINISH_PATTERNS = [
+    re.compile(
+        r"Finished request (?P<id>[\w\-]+).*?finish(?:ed)?_reason[= ]+(?P<fr>\w+)"
+        r".*?(?:gen(?:erated|eration)?_tokens|completion_tokens)[= ]+(?P<gt>\d+)"
+    ),
+    re.compile(
+        r"Finished request (?P<id>[\w\-]+).*?(?:gen(?:erated|eration)?_tokens|completion_tokens)[= ]+(?P<gt>\d+)"
+        r".*?finish(?:ed)?_reason[= ]+(?P<fr>\w+)"
+    ),
+    re.compile(r"Finished request (?P<id>[\w\-]+).*?finish(?:ed)?_reason[= ]+(?P<fr>\w+)"),
+    re.compile(r"Finished request (?P<id>[\w\-]+)"),
+]
+
+
+class LogTailer(threading.Thread):
+    def __init__(self, container: str, requests: "OrderedDict[str, RequestState]",
+                 lock: threading.Lock):
+        super().__init__(daemon=True)
+        self.container = container
+        self.requests = requests
+        self.lock = lock
+        self.proc: Optional[subprocess.Popen] = None
+        self.stop_flag = threading.Event()
+        self.lines_seen = 0
+        self.lines_matched = 0
+        self.stage = "container starting"
+        self.stage_detail = ""
+        self.stage_start_ts = time.time()
+
+    def run(self):
+        while not self.stop_flag.is_set():
+            try:
+                self.proc = subprocess.Popen(
+                    ["docker", "logs", "-f", "--tail", "50", self.container],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                )
+                assert self.proc.stdout is not None
+                for line in self.proc.stdout:
+                    if self.stop_flag.is_set():
+                        break
+                    self.lines_seen += 1
+                    if self._handle(line):
+                        self.lines_matched += 1
+            except Exception:
+                pass
+            if self.stop_flag.is_set():
+                break
+            self.stage = "container starting"
+            self.stage_detail = ""
+            self.stage_start_ts = time.time()
+            time.sleep(2.0)
+
+    def _handle(self, line: str) -> bool:
+        now = time.time()
+        for rx, stage, fn in _RX_STAGE_PATTERNS:
+            m = rx.search(line)
+            if m:
+                if stage != self.stage:
+                    self.stage = stage
+                    self.stage_start_ts = now
+                self.stage_detail = fn(m)
+                break
+        for rx in _RX_RECV_PATTERNS:
+            m = rx.search(line)
+            if m:
+                rid = m.group("id")
+                pt = None
+                try:
+                    pt = int(m.group("pt"))
+                except (IndexError, ValueError):
+                    pass
+                with self.lock:
+                    if rid not in self.requests:
+                        self.requests[rid] = RequestState(
+                            request_id=rid, start_ts=now, prompt_tokens=pt,
+                        )
+                    elif pt is not None and self.requests[rid].prompt_tokens is None:
+                        self.requests[rid].prompt_tokens = pt
+                return True
+        m = _RX_FIRST.search(line)
+        if m:
+            rid = m.group("id")
+            with self.lock:
+                r = self.requests.get(rid)
+                if r and r.prefill_done_ts is None:
+                    r.prefill_done_ts = now
+            return True
+        for rx in _RX_FINISH_PATTERNS:
+            m = rx.search(line)
+            if m:
+                rid = m.group("id")
+                fr = m.groupdict().get("fr")
+                gt = None
+                try:
+                    gt = int(m.group("gt"))
+                except (IndexError, ValueError):
+                    pass
+                with self.lock:
+                    r = self.requests.get(rid)
+                    if r is None:
+                        r = RequestState(request_id=rid, start_ts=now - 1.0)
+                        self.requests[rid] = r
+                    if r.end_ts is None:
+                        r.end_ts = now
+                        r.finish_reason = fr
+                        r.gen_tokens = gt
+                return True
+        return False
+
+    def stop(self):
+        self.stop_flag.set()
+        if self.proc:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+
+def stage_progress(tailer: LogTailer) -> dict:
+    elapsed = time.time() - tailer.stage_start_ts
+    typical = COLD_STAGE_TYPICAL_S.get(tailer.stage, 0.0)
+    remaining = max(0.0, typical - elapsed) if typical else 0.0
+    try:
+        idx = COLD_STAGES.index(tailer.stage)
+    except ValueError:
+        idx = -1
+    return {
+        "stage": tailer.stage,
+        "detail": tailer.stage_detail,
+        "idx": idx,
+        "n_progress_stages": len(COLD_STAGES) - 1,
+        "elapsed": elapsed,
+        "typical": typical,
+        "remaining": remaining,
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────
+# bar / formatting helpers
+# ────────────────────────────────────────────────────────────────────────
+
+# octants: 8 sub-cell levels for smooth bars
+_OCTANTS = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
+
+
+def smooth_bar(pct: float, width: int = 12, fill_color: str = "tn.info",
+               track_color: str = "tn.fg.muted") -> str:
+    """Return rich-markup smooth bar with octant precision and dim track."""
+    pct = max(0.0, min(100.0, pct))
+    eighths = int(round(pct / 100.0 * width * 8))
+    full = eighths // 8
+    rem = eighths % 8
+    full = min(full, width)
+    fill_chars = "█" * full
+    if rem > 0 and full < width:
+        fill_chars += _OCTANTS[rem]
+        full += 1
+    track = "─" * (width - full)
+    return f"[{fill_color}]{fill_chars}[/][{track_color}]{track}[/]"
+
+
+def fmt_size(n: Optional[int]) -> str:
+    if n is None:
+        return "-"
+    if n >= 1000:
+        return f"{n // 1000}k"
+    return str(n)
+
+
+def fmt_id(rid: str) -> str:
+    if rid.startswith("chatcmpl-"):
+        rid = rid[len("chatcmpl-"):]
+    return rid[:6]
+
+
+def fmt_dur(s: float) -> str:
+    if s < 1:
+        return f"{s*1000:.0f}ms"
+    if s < 60:
+        return f"{s:.1f}s"
+    return f"{s/60:.1f}m"
+
+
+def fmt_seconds(s: float) -> str:
+    s = max(0, int(s))
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m{s % 60:02d}s"
+
+
+def thresh_color(pct: float, green_below: float, yellow_below: float) -> str:
+    """For metrics where higher = worse (temp, KV, MEM)."""
+    if pct < green_below:
+        return "tn.success"
+    if pct < yellow_below:
+        return "tn.warning"
+    return "tn.danger"
+
+
+def thresh_color_inv(pct: float, red_below: float, yellow_below: float) -> str:
+    """For metrics where higher = better (acceptance)."""
+    if pct < red_below:
+        return "tn.danger"
+    if pct < yellow_below:
+        return "tn.warning"
+    return "tn.success"
+
+
+def pill(label: str, style: str) -> str:
+    """Reverse-video pill badge: ` LABEL ` with bg color."""
+    return f"[{style}] {label} [/]"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Cockpit instrument row
+# ────────────────────────────────────────────────────────────────────────
+
+def make_instruments_row(snap: dict, gpu: dict, mem: dict,
+                         tps: float) -> Panel:
+    BAR_W = 12  # smooth-bar width in cells
+
+    # GPU
+    temp = gpu.get("temp")
+    util = gpu.get("util") or 0.0
+    pwr = gpu.get("power") or 0.0
+    if temp is None:
+        gpu_part = "[tn.fg.muted]GPU --[/]"
+    else:
+        c = thresh_color(temp, 60, 80)
+        gpu_part = (f"[tn.fg.dim]GPU[/]  [{c}]{temp:>3.0f}C[/]  "
+                    f"{smooth_bar(util, BAR_W, fill_color=c)}  "
+                    f"[tn.fg.dim]{util:>3.0f}%[/]")
+
+    # MEM
+    if mem.get("total_gb") and mem.get("used_gb") is not None:
+        used_pct = mem["used_gb"] / mem["total_gb"] * 100
+        c = thresh_color(used_pct, 70, 90)
+        mem_part = (f"[tn.fg.dim]MEM[/]  [{c}]{mem['used_gb']:>3.0f}G[/]"
+                    f"[tn.fg.muted]/{mem['total_gb']:.0f}G[/]  "
+                    f"{smooth_bar(used_pct, BAR_W, fill_color=c)}")
+    else:
+        mem_part = "[tn.fg.muted]MEM --[/]"
+
+    # KV
+    kv_pct = snap.get("kv") or 0.0
+    c = thresh_color(kv_pct, 70, 90)
+    kv_part = (f"[tn.fg.dim]KV[/]   [{c}]{kv_pct:>4.1f}%[/]  "
+               f"{smooth_bar(kv_pct, BAR_W, fill_color=c)}")
+
+    # ACC (spec acceptance, higher is better)
+    acc_pct = 0.0
+    if snap.get("spec_drafted"):
+        acc_pct = snap["spec_accepted"] / snap["spec_drafted"] * 100
+    c = thresh_color_inv(acc_pct, 50, 70)
+    acc_part = (f"[tn.fg.dim]ACC[/]  [{c}]{acc_pct:>3.0f}%[/]   "
+                f"{smooth_bar(acc_pct, BAR_W, fill_color=c)}")
+
+    # TPS (decode tok/s, normalized to 30 t/s for bar)
+    tps_norm = min(100.0, (tps / 30.0) * 100)
+    tps_color = ("tn.success" if tps > 10
+                 else "tn.warning" if tps > 5 else "tn.fg.muted")
+    tps_part = (f"[tn.fg.dim]TPS[/]  [{tps_color}]{tps:>4.1f}[/]   "
+                f"{smooth_bar(tps_norm, BAR_W, fill_color=tps_color)}  "
+                f"[tn.fg.dim]{pwr:>3.0f}W[/]")
+
+    sep = "    "  # whitespace separators, no |
+    line1 = f" {gpu_part}{sep}{mem_part}{sep}{kv_part}"
+    line2 = f" {acc_part}{sep}{tps_part}"
+    return Panel(f"{line1}\n{line2}", title="cockpit",
+                 title_align="left", border_style="tn.border",
+                 box=box.ROUNDED, padding=(0, 1))
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Gantt rendering
+# ────────────────────────────────────────────────────────────────────────
+
+# Distinct phase glyphs: thin heavy-horizontal for prefill (low body) +
+# full block for decode (full body). Visual weight encodes the phase.
+PHASE_PREFILL = "━"      # heavy horizontal rule, U+2501 (box drawing, ASCII-rendered)
+PHASE_DECODE = "█"       # full block
+TIP_INFLIGHT = ">"       # ascii arrow
+GAP_CHAR = " "
+
+FINISH_LABEL = {
+    "stop": "completed", "length": "length", "abort": "aborted",
+    "error": "errored", "repetition": "repeat",
+}
+FINISH_COLOR = {
+    "stop": "tn.success", "length": "tn.warning",
+    "abort": "tn.danger", "error": "tn.danger",
+    "repetition": "tn.orange",
+}
+FINISH_PILL = {
+    "stop": "tn.pill.success", "length": "tn.pill.warning",
+    "abort": "tn.pill.danger", "error": "tn.pill.danger",
+    "repetition": "tn.pill.muted",
+}
+# Inner timeline width (between brackets). Total visible column = BAR_WIDTH + 2.
+BAR_WIDTH = 28
+# Inner width of the in/out token bars. Total column width = IO_BAR_WIDTH + 2.
+IO_BAR_WIDTH = 6
+# Absolute scales for the in/out bars. Anchoring to fixed budgets gives an
+# honest "how full is the context" / "how big is the reply" reading,
+# instead of session-max relative scaling that distorts magnitudes.
+IN_SCALE_MAX = 200_000   # matches --max-model-len
+OUT_SCALE_MAX = 8_192    # typical max output for thinking-mode coding traffic
+
+
+def render_bar_text(req: RequestState, view_start: float,
+                    view_end: float, width: int = BAR_WIDTH) -> Text:
+    """Bracket-framed timeline: [   ━━━██████>      ]
+    The inside is `width` cells; brackets add 2 visible cells around it.
+    Gaps inside the brackets are spaces so phase chars stand alone.
+    """
+    span = view_end - view_start
+    if span <= 0:
+        # all-empty bracket frame
+        t = Text()
+        t.append("[", style="tn.fg.muted")
+        t.append(" " * width)
+        t.append("]", style="tn.fg.muted")
+        return t
+
+    def to_col(ts: float) -> int:
+        return max(0, min(width - 1,
+                          int(((ts - view_start) / span) * width)))
+
+    start_col = to_col(req.start_ts)
+    end_ts = req.end_ts if req.end_ts is not None else view_end
+    end_col = to_col(end_ts)
+    if end_col < start_col:
+        end_col = start_col
+
+    in_flight = req.end_ts is None
+    finish_color = FINISH_COLOR.get(req.finish_reason or "", "tn.fg.dim")
+    body_color = "tn.info" if in_flight else finish_color
+    prefill_color = "tn.teal" if in_flight else finish_color
+
+    # build the inside of the brackets
+    inner = Text()
+    inner.append(" " * start_col)  # leading gap
+
+    if req.prefill_done_ts is not None:
+        prefill_col = to_col(req.prefill_done_ts)
+        prefill_end = min(prefill_col, end_col)
+        prefill_len = max(0, prefill_end - start_col + 1)
+        if in_flight:
+            decode_len = max(0, end_col - prefill_end - 1)
+            tip_used = 1
+        else:
+            decode_len = max(0, end_col - prefill_end)
+            tip_used = 0
+        inner.append(PHASE_PREFILL * prefill_len, style=prefill_color)
+        inner.append(PHASE_DECODE * decode_len, style=body_color)
+        if in_flight:
+            inner.append(TIP_INFLIGHT, style="bold tn.info")
+        consumed = start_col + prefill_len + decode_len + tip_used
+        inner.append(" " * max(0, width - consumed))
+    else:
+        body_len = max(0, end_col - start_col + 1)
+        if in_flight and body_len > 0:
+            inner.append(PHASE_PREFILL * (body_len - 1), style=prefill_color)
+            inner.append(TIP_INFLIGHT, style="bold tn.info")
+        else:
+            inner.append(PHASE_PREFILL * body_len, style=prefill_color)
+        consumed = start_col + body_len
+        inner.append(" " * max(0, width - consumed))
+
+    # exact width
+    if len(inner.plain) > width:
+        inner.truncate(width)
+    elif len(inner.plain) < width:
+        inner.append(" " * (width - len(inner.plain)))
+
+    out = Text()
+    out.append("[", style="tn.fg.muted")
+    out.append_text(inner)
+    out.append("]", style="tn.fg.muted")
+    return out
+
+
+# octant chars for sub-cell precision on the in/out mini-bars
+_OCTANTS = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
+
+
+def _scaled_bar(value: int, scale_max: int, width: int,
+                style: str) -> Text:
+    """Horizontal bar of `width` cells, length proportional to value/scale_max.
+    Uses octant chars on the trailing edge for sub-cell precision.
+    Any value > 0 renders at least a single octant tick so small reqs
+    are still visible at narrow widths."""
+    out = Text()
+    if value <= 0 or scale_max <= 0:
+        out.append(" " * width)
+        return out
+    cells_f = (value / scale_max) * width
+    full = int(cells_f)
+    frac = cells_f - full
+    full = min(full, width)
+    out.append("█" * full, style=style)
+    if full < width:
+        if frac > 0:
+            idx = int(round(frac * 8))
+            if idx >= 8:
+                out.append("█", style=style)
+                full += 1
+            elif idx > 0:
+                out.append(_OCTANTS[idx], style=style)
+                full += 1
+        # guarantee at least 1 octant tick for tiny non-zero values
+        if full == 0 and value > 0:
+            out.append(_OCTANTS[1], style=style)
+            full = 1
+    out.append(" " * max(0, width - full))
+    return out
+
+
+def io_bar(value: Optional[int], scale_max: int, style: str,
+           inner_w: int = IO_BAR_WIDTH) -> Text:
+    """A bracketed in/out bar (column = inner_w + 2)."""
+    inner = _scaled_bar(value or 0, scale_max, inner_w, style)
+    out = Text("[", style="tn.fg.muted")
+    out.append_text(inner)
+    out.append("]", style="tn.fg.muted")
+    return out
+
+
+def render_inflight_info(r: "RequestState", view_start: float, now: float,
+                         total_w: int) -> Text:
+    """Compose the dynamic info cell for an inflight request:
+    'in <prompt> [─────live-timeline─────] <gen-live>' """
+    in_str = fmt_size(r.prompt_tokens) if r.prompt_tokens else "-"
+    live_gen = int(r.gen_accum) if r.gen_accum > 0 else 0
+    out_str = fmt_size(live_gen) if live_gen > 0 else "-"
+
+    in_lbl = f"in {in_str:>4} "      # 8 chars
+    out_lbl = f" {out_str:>4}"        # 5 chars
+    bar_w = max(10, total_w - len(in_lbl) - len(out_lbl) - 2)  # -2 for [ ]
+
+    out = Text()
+    out.append(in_lbl, style="tn.fg.muted")
+    out.append_text(render_bar_text(r, view_start, now, width=bar_w))
+    out.append(out_lbl, style="tn.fg.dim")
+    return out
+
+
+def render_completed_info(r: "RequestState", total_w: int) -> Text:
+    """Compose the dynamic info cell for a completed request:
+    'in <prompt> [in-bar]   out <gen> [out-bar]' """
+    in_str = fmt_size(r.prompt_tokens) if r.prompt_tokens else "-"
+    out_str = fmt_size(r.gen_tokens) if r.gen_tokens else "-"
+
+    in_lbl = f"in {in_str:>4} "        # 8 chars
+    out_lbl = f"   out {out_str:>4} "  # 12 chars
+    fixed = len(in_lbl) + len(out_lbl) + 4  # 4 = two pairs of [ ]
+    bar_total = max(8, total_w - fixed)
+    bar1_w = bar_total // 2
+    bar2_w = bar_total - bar1_w
+
+    out = Text()
+    out.append(in_lbl, style="tn.fg.muted")
+    out.append_text(io_bar(r.prompt_tokens, IN_SCALE_MAX, "tn.info",
+                           inner_w=bar1_w))
+    out.append(out_lbl, style="tn.fg.muted")
+    out.append_text(io_bar(r.gen_tokens, OUT_SCALE_MAX, "tn.success",
+                           inner_w=bar2_w))
+    return out
+
+
+def make_gantt_table(requests: "OrderedDict[str, RequestState]",
+                     view_duration: float,
+                     terminal_width: int = 120) -> Table:
+    now = time.time()
+    view_start = now - view_duration
+
+    inflight = [r for r in requests.values() if r.end_ts is None]
+    completed = [r for r in requests.values()
+                 if r.end_ts is not None and r.end_ts >= view_start]
+
+    # Fixed-width columns: id(6) + start(8) + ttft(6) + tps(5) + dur(7)
+    # + status(12) + 6 column-paddings(2*7=12) + 2 panel borders + slack
+    # = ~62. Give the rest of the terminal to the dynamic info column.
+    fixed_cols_w = 6 + 8 + 6 + 5 + 7 + 12 + 14
+    info_w = max(40, terminal_width - fixed_cols_w)
+
+    table = Table.grid(expand=False, padding=(0, 1))
+    table.add_column("id", no_wrap=True, width=6)
+    table.add_column("start", width=8)
+    table.add_column("info", width=info_w, no_wrap=True)
+    table.add_column("ttft", justify="right", width=6)
+    table.add_column("tps", justify="right", width=5)
+    table.add_column("dur", justify="right", width=7)
+    table.add_column("status", width=12)
+
+    # column header row
+    table.add_row(
+        Text("id", style="tn.fg.muted"),
+        Text("start", style="tn.fg.muted"),
+        Text(" in / timeline / out".ljust(info_w), style="tn.fg.muted"),
+        Text("ttft", style="tn.fg.muted"),
+        Text("tps", style="tn.fg.muted"),
+        Text("dur", style="tn.fg.muted"),
+        Text("status", style="tn.fg.muted"),
+    )
+    table.add_row(
+        Text("─" * 6, style="tn.border"),
+        Text("─" * 8, style="tn.border"),
+        Text("─" * info_w, style="tn.border"),
+        Text("─" * 6, style="tn.border"),
+        Text("─" * 5, style="tn.border"),
+        Text("─" * 7, style="tn.border"),
+        Text("─" * 12, style="tn.border"),
+    )
+
+    if inflight:
+        for r in sorted(inflight, key=lambda x: x.start_ts):
+            elapsed = now - r.start_ts
+            if r.prefill_done_ts is not None:
+                ttft_str = fmt_dur(r.prefill_done_ts - r.start_ts)
+            else:
+                ttft_str = "-"
+            table.add_row(
+                Text(fmt_id(r.request_id), style="bold tn.info"),
+                Text(datetime.fromtimestamp(r.start_ts).strftime("%H:%M:%S"),
+                     style="tn.fg.dim"),
+                render_inflight_info(r, view_start, now, info_w),
+                Text(ttft_str, style="tn.fg.dim"),
+                Text("-", style="tn.fg.muted"),
+                Text(fmt_dur(elapsed), style="tn.fg"),
+                Text.from_markup(pill("running", "tn.pill.info")),
+            )
+        # subtle divider before completed section
+        table.add_row(
+            Text(""), Text(""),
+            Text("·" * info_w, style="tn.fg.muted"),
+            Text(""), Text(""), Text(""), Text(""),
+        )
+
+    if not completed and not inflight:
+        table.add_row(
+            Text("(idle - no requests in view window)",
+                 style="tn.fg.muted italic"),
+            "", "", "", "", "", "",
+        )
+        return table
+
+    completed_sorted = sorted(completed, key=lambda x: x.start_ts,
+                              reverse=True)[:30]
+    for r in completed_sorted:
+        dur = (r.end_ts - r.start_ts) if r.end_ts else 0.0
+        label = FINISH_LABEL.get(r.finish_reason or "", "?")
+        pill_style = FINISH_PILL.get(r.finish_reason or "", "tn.pill.muted")
+
+        # decode tps = gen_tokens / decode_duration
+        tps_str = "-"
+        if r.gen_tokens and r.gen_tokens > 0:
+            if r.prefill_done_ts and r.end_ts:
+                decode_dur = max(0.001, r.end_ts - r.prefill_done_ts)
+            else:
+                decode_dur = max(0.001, dur)
+            tps_val = r.gen_tokens / decode_dur
+            tps_str = f"{tps_val:.1f}"
+
+        trunc = (r.gen_tokens is not None and r.gen_tokens < 5
+                 and (r.prompt_tokens or 0) > 100
+                 and r.finish_reason == "stop")
+        heavy = (r.gen_tokens or 0) > 2000
+        if trunc:
+            finish_text = Text.from_markup(pill("truncated", "tn.pill.danger"))
+        elif heavy:
+            finish_text = Text.from_markup(
+                pill(f"{label} (heavy)", "tn.pill.warning"))
+        else:
+            finish_text = Text.from_markup(pill(label, pill_style))
+
+        if r.prefill_done_ts is not None:
+            ttft_str = fmt_dur(r.prefill_done_ts - r.start_ts)
+        else:
+            ttft_str = "-"
+
+        table.add_row(
+            Text(fmt_id(r.request_id), style="tn.fg.dim"),
+            Text(datetime.fromtimestamp(r.start_ts).strftime("%H:%M:%S"),
+                 style="tn.fg.muted"),
+            render_completed_info(r, info_w),
+            Text(ttft_str, style="tn.fg.dim"),
+            Text(tps_str, style="tn.fg.dim"),
+            Text(fmt_dur(dur), style="tn.fg.dim"),
+            finish_text,
+        )
+
+    return table
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Header (with explicit cold-start stage progress)
+# ────────────────────────────────────────────────────────────────────────
+
+def make_state_pill(metrics_ok: bool, snap: dict, sp: dict) -> str:
+    """Return a markup string with the engine state as a pill badge."""
+    if sp["stage"] == "CRASHED":
+        return pill("CRASHED", "tn.pill.danger")
+    if not metrics_ok:
+        return pill("WARMING UP", "tn.pill.warning")
+    running = int(snap["running"])
+    waiting = int(snap["waiting"])
+    if running > 0:
+        return pill(f"SERVING {running}", "tn.pill.success")
+    if waiting > 0:
+        return pill(f"QUEUE {waiting}", "tn.pill.warning")
+    return pill("READY", "tn.pill.success")
+
+
+def make_progress_line(metrics_ok: bool, sp: dict) -> str:
+    """Cold-start stage progress line. Empty markup if engine is up."""
+    if metrics_ok and sp["stage"] in ("ready", "container starting"):
+        return ""
+    if sp["stage"] == "CRASHED":
+        return "[tn.danger]engine init failed - check `docker logs`[/]"
+
+    idx = sp["idx"]
+    n = sp["n_progress_stages"]
+    stage_name = sp["stage"]
+    detail = sp["detail"]
+    elapsed = sp["elapsed"]
+    typical = sp["typical"]
+    remaining = sp["remaining"]
+
+    label_parts = []
+    if idx >= 0:
+        label_parts.append(f"[tn.fg.dim]stage[/] [tn.accent]{idx + 1}/{n}[/]")
+    label_parts.append(f"[tn.fg]{stage_name}[/]")
+    if detail:
+        label_parts.append(f"[tn.fg.dim]{detail}[/]")
+    label = "  ".join(label_parts)
+
+    pct = min(100.0, (elapsed / typical) * 100.0) if typical > 0 else 0.0
+    progress = smooth_bar(pct, width=18, fill_color="tn.warning",
+                          track_color="tn.fg.muted")
+
+    eta = (f"~{fmt_seconds(remaining)} left" if remaining > 0
+           else f"{fmt_seconds(elapsed)} elapsed")
+    return f"{label}    {progress}    [tn.fg.dim]{eta}[/]"
+
+
+def make_header(engine: dict, snap: dict, uptime_s: float, view_label: str,
+                tailer_status: str, metrics_ok: bool, sp: dict) -> Panel:
+    state = make_state_pill(metrics_ok, snap, sp)
+    progress = make_progress_line(metrics_ok, sp)
+
+    succ_total = (snap["succ_stop"] + snap["succ_length"] +
+                  snap["succ_abort"] + snap["succ_error"])
+    flags = []
+    if snap["succ_abort"]:
+        flags.append(f"[tn.danger]aborts={int(snap['succ_abort'])}[/]")
+    if snap["succ_error"]:
+        flags.append(f"[tn.danger]errs={int(snap['succ_error'])}[/]")
+    if snap["succ_length"]:
+        flags.append(f"[tn.warning]len={int(snap['succ_length'])}[/]")
+    if snap["preempt"]:
+        flags.append(f"[tn.danger]preempt={int(snap['preempt'])}[/]")
+    flag_str = "  " + "  ".join(flags) if flags else ""
+
+    line1 = (
+        f"{state}  [bold tn.fg]{engine['name']}[/]  "
+        f"[tn.fg.muted]:{engine['port']}[/]  "
+        f"[tn.fg.dim]reqs={int(succ_total)}[/]  "
+        f"[tn.fg.dim]up {fmt_dur(uptime_s)}[/]{flag_str}"
+    )
+    body = line1
+    if progress:
+        body += f"\n{progress}"
+    body += f"\n[tn.fg.muted]view={view_label}    {tailer_status}[/]"
+
+    return Panel(body, title="vLLM engine", title_align="left",
+                 border_style="tn.border", box=box.ROUNDED)
+
+
+def make_footer(view_label: str, n_inflight: int, n_completed: int,
+                trunc_count: int, lines_seen: int) -> Text:
+    t = Text()
+    t.append(" ", style="tn.fg.muted")
+    t.append(f"view {view_label}  ", style="tn.fg.muted")
+    t.append("│  ", style="tn.fg.muted")
+    t.append(f"in-flight {n_inflight}  ", style="tn.info")
+    t.append("│  ", style="tn.fg.muted")
+    t.append(f"completed {n_completed}  ", style="tn.success")
+    if trunc_count:
+        t.append("│  ", style="tn.fg.muted")
+        t.append(f"trunc {trunc_count}  ", style="bold tn.danger")
+    t.append("│  ", style="tn.fg.muted")
+    t.append(f"log {lines_seen} lines  ", style="tn.fg.muted")
+    t.append("│  ", style="tn.fg.muted")
+    t.append("Ctrl-C to quit", style="tn.fg.muted italic")
+    return t
+
+
+# ────────────────────────────────────────────────────────────────────────
+# main
+# ────────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="Live cockpit TUI for the llama-swap engine stack."
+    )
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--container", default=None)
+    p.add_argument("--view", default="5m", choices=list(VIEW_PRESETS.keys()))
+    p.add_argument("--refresh", type=float, default=1.0)
+    args = p.parse_args()
+
+    if args.port and args.container:
+        engine = {"name": args.container, "port": args.port}
+    else:
+        engines = discover_engines()
+        if not engines:
+            print("ERROR: no running vllm-* container found", file=sys.stderr)
+            return 2
+        if args.port:
+            engine = next((e for e in engines if e["port"] == args.port),
+                          engines[0])
+        else:
+            engine = engines[0]
+        if args.container:
+            engine["name"] = args.container
+
+    view_duration = VIEW_PRESETS[args.view]
+
+    requests: "OrderedDict[str, RequestState]" = OrderedDict()
+    lock = threading.Lock()
+    tailer = LogTailer(engine["name"], requests, lock)
+    tailer.start()
+
+    console = Console(theme=TN_THEME)
+
+    prev_gen_total = 0.0
+    prev_tick_ts = time.time()
+    tps_window: deque = deque(maxlen=5)
+    start_ts = time.time()
+    # vLLM 0.20.1 does not log per-request prompt_tokens / first_token /
+    # finish_reason. We derive ALL of those from /metrics histogram deltas
+    # and attribute them oldest-first to in-flight requests (FIFO).
+    prev_succ: dict = {}
+    prev_ttft_count = 0.0
+    prev_ttft_sum = 0.0
+    prev_prompt_total = 0.0
+    # accumulator for prompt tokens between first-token events:
+    # prompt_tokens_total can increment in earlier ticks (chunked prefill)
+    # before ttft fires, so we accumulate and divide at first-token time
+    prompt_accum = 0.0
+
+    def render() -> Layout:
+        nonlocal prev_gen_total, prev_tick_ts, prev_succ
+        nonlocal prev_ttft_count, prev_ttft_sum, prev_prompt_total, prompt_accum
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=5),
+            Layout(name="instruments", size=4),
+            Layout(name="body"),
+            Layout(name="footer", size=1),
+        )
+
+        m = fetch_metrics(engine["port"])
+        metrics_ok = m is not None
+        snap = (gauge_snapshot(m) if m else
+                {"running": 0, "waiting": 0, "kv": 0, "awake": 1,
+                 "spec_drafted": 0, "spec_accepted": 0, "preempt": 0,
+                 "succ_stop": 0, "succ_length": 0, "succ_abort": 0,
+                 "succ_error": 0, "gen_total": 0, "prompt_total": 0})
+
+        now = time.time()
+        dt = max(0.001, now - prev_tick_ts)
+        d_gen = max(0.0, snap["gen_total"] - prev_gen_total) if prev_gen_total > 0 else 0.0
+        if prev_gen_total > 0:
+            tps_window.append(d_gen / dt)
+
+        # Lifecycle attribution from /metrics deltas (vLLM 0.20.1 doesn't
+        # log per-request prompt_tokens/first_token/finish events).
+        REASONS = ("stop", "length", "abort", "error")
+        if not prev_succ:
+            # first tick: baseline; do not attribute pre-existing counts
+            prev_succ = {r: snap[f"succ_{r}"] for r in REASONS}
+            prev_ttft_count = snap["ttft_count"]
+            prev_ttft_sum = snap["ttft_sum"]
+            prev_prompt_total = snap["prompt_total"]
+            prompt_accum = 0.0
+        else:
+            # accumulate prompt tokens since last first-token event (chunked
+            # prefill spans multiple ticks for big prompts)
+            d_prompt = max(0.0, snap["prompt_total"] - prev_prompt_total)
+            prompt_accum += d_prompt
+
+            # FIRST-TOKEN attribution (set prefill_done_ts and prompt_tokens)
+            d_ttft_count = int(snap["ttft_count"] - prev_ttft_count)
+            d_ttft_sum = max(0.0, snap["ttft_sum"] - prev_ttft_sum)
+            if d_ttft_count > 0:
+                avg_ttft = d_ttft_sum / d_ttft_count
+                avg_prompt = (prompt_accum / d_ttft_count) if d_ttft_count else 0
+                with lock:
+                    candidates = sorted(
+                        (r for r in requests.values()
+                         if r.end_ts is None and r.prefill_done_ts is None),
+                        key=lambda x: x.start_ts,
+                    )
+                    for r in candidates[:d_ttft_count]:
+                        # place prefill_done at start_ts + avg_ttft so the
+                        # bar shows prefill phase of correct length
+                        r.prefill_done_ts = r.start_ts + avg_ttft
+                        if r.prompt_tokens is None and avg_prompt > 0:
+                            r.prompt_tokens = int(avg_prompt)
+                prompt_accum = 0.0
+
+            # GEN-TOKEN accumulation: distribute this tick's gen_total delta
+            # evenly across currently-decoding requests. d_gen is per-tick
+            # (~1s of decode), but a request runs over many ticks; without
+            # accumulating, completion would only see the last tick's slice
+            # (~10-20 tokens) instead of the full output.
+            if d_gen > 0:
+                with lock:
+                    decoding = [
+                        r for r in requests.values()
+                        if r.prefill_done_ts is not None and r.end_ts is None
+                    ]
+                    if decoding:
+                        share = d_gen / len(decoding)
+                        for r in decoding:
+                            r.gen_accum += share
+
+            # COMPLETION attribution (set end_ts, finish_reason, gen_tokens)
+            deltas = {r: int(snap[f"succ_{r}"] - prev_succ.get(r, 0))
+                      for r in REASONS}
+            total_new = sum(d for d in deltas.values() if d > 0)
+            if total_new > 0:
+                with lock:
+                    pending = sorted(
+                        (r for r in requests.values() if r.end_ts is None),
+                        key=lambda x: x.start_ts,
+                    )
+                    for reason, d in deltas.items():
+                        if d <= 0:
+                            continue
+                        for _ in range(d):
+                            if not pending:
+                                break
+                            req = pending.pop(0)
+                            req.end_ts = now
+                            req.finish_reason = reason
+                            if req.gen_tokens is None:
+                                # use this request's accumulated share
+                                if req.gen_accum > 0:
+                                    req.gen_tokens = int(req.gen_accum)
+                                elif d_gen > 0 and total_new > 0:
+                                    # fallback: request started+finished
+                                    # within a single tick, never decoded
+                                    # under concurrency
+                                    req.gen_tokens = int(d_gen / total_new)
+                            # also fill prompt_tokens if still missing
+                            # (request started+completed within one tick)
+                            if req.prompt_tokens is None and prompt_accum > 0 and total_new > 0:
+                                req.prompt_tokens = int(prompt_accum / total_new)
+
+            prev_succ = {r: snap[f"succ_{r}"] for r in REASONS}
+            prev_ttft_count = snap["ttft_count"]
+            prev_ttft_sum = snap["ttft_sum"]
+            prev_prompt_total = snap["prompt_total"]
+
+        prev_gen_total = snap["gen_total"]
+        prev_tick_ts = now
+        smoothed_tps = sum(tps_window) / max(1, len(tps_window))
+
+        gpu = read_nvidia_stats()
+        mem = read_meminfo()
+        sp = stage_progress(tailer)
+
+        if tailer.lines_matched > 0:
+            ts_status = (f"log {tailer.lines_matched}/"
+                         f"{tailer.lines_seen} matched")
+        elif tailer.lines_seen == 0:
+            ts_status = "log: starting..."
+        else:
+            ts_status = (f"log 0/{tailer.lines_seen} matched - "
+                         "is --enable-log-requests on?")
+
+        layout["header"].update(make_header(
+            engine, snap, now - start_ts, args.view, ts_status,
+            metrics_ok, sp,
+        ))
+        layout["instruments"].update(
+            make_instruments_row(snap, gpu, mem, smoothed_tps)
+        )
+
+        with lock:
+            cutoff = now - view_duration * 2
+            stale = [k for k, v in requests.items()
+                     if v.end_ts is not None and v.end_ts < cutoff]
+            for k in stale:
+                del requests[k]
+
+            n_inflight = sum(1 for r in requests.values() if r.end_ts is None)
+            view_start = now - view_duration
+            n_completed = sum(1 for r in requests.values()
+                              if r.end_ts is not None and r.end_ts >= view_start)
+            trunc_count = sum(
+                1 for r in requests.values()
+                if r.end_ts is not None and r.gen_tokens is not None
+                and r.gen_tokens < 5 and (r.prompt_tokens or 0) > 100
+                and r.finish_reason == "stop"
+            )
+            term_w = console.size.width
+            gantt = make_gantt_table(requests, view_duration,
+                                     terminal_width=term_w)
+
+        layout["body"].update(Panel(gantt, title="request timeline",
+                                    title_align="left",
+                                    border_style="tn.border",
+                                    box=box.ROUNDED))
+        layout["footer"].update(make_footer(args.view, n_inflight, n_completed,
+                                            trunc_count, tailer.lines_seen))
+        return layout
+
+    try:
+        with Live(render(), console=console,
+                  refresh_per_second=4, screen=True) as live:
+            while True:
+                time.sleep(args.refresh)
+                live.update(render())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        tailer.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,584 @@
+#!/home/max/llm-stack/venv/bin/python3
+"""Lightweight status / monitoring for the llama-swap engine stack.
+
+Usage:
+    stack-status                    # one-shot snapshot to stdout (+ /tmp/stack-status.txt)
+    stack-status --watch            # poll every 5s, print delta rows (Ctrl-C to stop)
+    stack-status --watch 10         # poll every 10s
+    stack-status --port 9013        # scrape a specific engine port
+    stack-status --window 20        # rolling window size for --watch (default 20)
+    stack-status --snapshot PATH    # write snapshot to PATH instead of /tmp/stack-status.txt
+
+Sources:
+    - vLLM /metrics (Prometheus) — histograms, counters, gauges
+    - docker logs --since=… on the engine container — periodic Engine/SpecDecoding lines
+    - docker ps for engine auto-discovery (port + container name)
+
+For the truncation bug we are chasing: --watch shows per-tick deltas.
+A row like "+1 stop  gen=2  ttft=2.1s" is exactly the truncation pattern
+(finish_reason=stop with near-zero generation tokens after a real prompt).
+"""
+import argparse
+import math
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Optional
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def hms() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def fmt_int(n) -> str:
+    if n is None:
+        return "—"
+    return f"{int(n):,}"
+
+
+def fmt_float(x, nd=2, suffix="") -> str:
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return "—"
+    return f"{x:.{nd}f}{suffix}"
+
+
+def fmt_pct(num, den, nd=1) -> str:
+    if not den:
+        return "—"
+    return f"{100.0 * num / den:.{nd}f}%"
+
+
+# ────────────────────────────────────────────────────────────────────
+# engine discovery
+# ────────────────────────────────────────────────────────────────────
+
+def discover_engines() -> list[dict]:
+    """Find running vllm-* containers and the host port they publish."""
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "--format",
+             "{{.Names}}\t{{.Status}}\t{{.Ports}}"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+    engines = []
+    for line in out.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        name, status, ports = parts[0], parts[1], parts[2]
+        if not name.startswith("vllm-"):
+            continue
+        # ports looks like "0.0.0.0:9015->9015/tcp"
+        m = re.search(r"0\.0\.0\.0:(\d+)->", ports)
+        if not m:
+            continue
+        engines.append({
+            "name": name,
+            "port": int(m.group(1)),
+            "status": status,
+        })
+    return engines
+
+
+# ────────────────────────────────────────────────────────────────────
+# Prometheus parsing
+# ────────────────────────────────────────────────────────────────────
+
+# vllm:metric_name{label1="v1",label2="v2"} 12.3
+_METRIC_RE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([0-9eE.+-]+)\s*$')
+_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
+
+
+def parse_metrics(text: str) -> dict:
+    """Return {name: [(labels_dict, value), ...]} for all vllm: metrics."""
+    out = defaultdict(list)
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        m = _METRIC_RE.match(line)
+        if not m:
+            continue
+        name, labels_raw, val_raw = m.group(1), m.group(2) or "", m.group(3)
+        try:
+            val = float(val_raw)
+        except ValueError:
+            continue
+        labels = dict(_LABEL_RE.findall(labels_raw))
+        out[name].append((labels, val))
+    return out
+
+
+def fetch_metrics(port: int, timeout: float = 3.0) -> Optional[dict]:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics",
+                                    timeout=timeout) as r:
+            return parse_metrics(r.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+
+
+def first_value(metrics: dict, name: str, **filt) -> Optional[float]:
+    """First value for a metric whose labels match all of filt."""
+    for labels, val in metrics.get(name, []):
+        if all(labels.get(k) == v for k, v in filt.items()):
+            return val
+    return None
+
+
+def sum_values(metrics: dict, name: str, **filt) -> float:
+    s = 0.0
+    for labels, val in metrics.get(name, []):
+        if all(labels.get(k) == v for k, v in filt.items()):
+            s += val
+    return s
+
+
+def histogram_pcts(metrics: dict, base: str, percentiles=(0.5, 0.95, 0.99)) -> dict:
+    """Estimate percentiles + return count/sum for a Prometheus histogram.
+
+    Uses bucket upper bounds — standard prometheus_quantile-style coarse estimate.
+    """
+    buckets = []
+    for labels, val in metrics.get(f"{base}_bucket", []):
+        le = labels.get("le")
+        if le is None:
+            continue
+        try:
+            le_f = float("inf") if le == "+Inf" else float(le)
+        except ValueError:
+            continue
+        buckets.append((le_f, val))
+    buckets.sort(key=lambda x: x[0])
+
+    count = 0.0
+    for labels, val in metrics.get(f"{base}_count", []):
+        count += val
+    total_sum = 0.0
+    for labels, val in metrics.get(f"{base}_sum", []):
+        total_sum += val
+
+    pcts = {}
+    if not count or not buckets:
+        for p in percentiles:
+            pcts[p] = None
+    else:
+        for p in percentiles:
+            target = p * count
+            chosen = None
+            for le_f, cum in buckets:
+                if cum >= target:
+                    chosen = le_f
+                    break
+            pcts[p] = chosen
+    return {
+        "count": count,
+        "sum": total_sum,
+        "avg": (total_sum / count) if count else None,
+        "pcts": pcts,
+    }
+
+
+# ────────────────────────────────────────────────────────────────────
+# stdout log tail (Engine / SpecDecoding lines)
+# ────────────────────────────────────────────────────────────────────
+
+_ENGINE_RE = re.compile(
+    r"INFO (\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*Engine.*Avg prompt throughput: ([\d.]+).*"
+    r"Avg generation throughput: ([\d.]+).*Running: (\d+).*Waiting: (\d+).*"
+    r"GPU KV cache usage: ([\d.]+)%.*Prefix cache hit rate: ([\d.]+)%"
+)
+_SPEC_RE = re.compile(
+    r"INFO (\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*SpecDecoding metrics:.*"
+    r"Mean acceptance length: ([\d.]+).*Per-position acceptance rate: ([\d., ]+?), "
+    r"Avg Draft acceptance rate: ([\d.]+)%"
+)
+
+
+def tail_engine_log(container: str, since_seconds: int = 90) -> list[dict]:
+    """Return parsed Engine + SpecDecoding rows from `docker logs --since`."""
+    try:
+        out = subprocess.run(
+            ["docker", "logs", f"--since={since_seconds}s", container],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+    text = (out.stdout or "") + (out.stderr or "")
+    rows: dict[str, dict] = {}
+    for line in text.splitlines():
+        m = _ENGINE_RE.search(line)
+        if m:
+            ts = m.group(1)
+            row = rows.setdefault(ts, {"ts": ts})
+            row.update({
+                "prompt_tps": float(m.group(2)),
+                "gen_tps": float(m.group(3)),
+                "running": int(m.group(4)),
+                "waiting": int(m.group(5)),
+                "kv": float(m.group(6)),
+                "pfx_hit": float(m.group(7)),
+            })
+            continue
+        m = _SPEC_RE.search(line)
+        if m:
+            ts = m.group(1)
+            row = rows.setdefault(ts, {"ts": ts})
+            row.update({
+                "mean_len": float(m.group(2)),
+                "per_pos": [float(x.strip()) for x in m.group(3).split(",")],
+                "spec_accept": float(m.group(4)),
+            })
+    # sort by ts ascending
+    return [rows[k] for k in sorted(rows.keys())]
+
+
+# ────────────────────────────────────────────────────────────────────
+# snapshot (counters + histograms collapsed into a flat dict)
+# ────────────────────────────────────────────────────────────────────
+
+def snapshot(metrics: dict) -> dict:
+    """Collapse a /metrics scrape into the numbers we care about."""
+    s = {
+        "ts": time.time(),
+        # gauges
+        "running": first_value(metrics, "vllm:num_requests_running"),
+        "waiting": first_value(metrics, "vllm:num_requests_waiting"),
+        "kv_cache_usage": first_value(metrics, "vllm:kv_cache_usage_perc"),
+        "awake": first_value(metrics, "vllm:engine_sleep_state",
+                             sleep_state="awake"),
+        # counters (cumulative)
+        "prompt_tokens_total": sum_values(metrics, "vllm:prompt_tokens_total"),
+        "gen_tokens_total": sum_values(metrics, "vllm:generation_tokens_total"),
+        "prefix_q": sum_values(metrics, "vllm:prefix_cache_queries_total"),
+        "prefix_h": sum_values(metrics, "vllm:prefix_cache_hits_total"),
+        "preempt": sum_values(metrics, "vllm:num_preemptions_total"),
+        # finish reasons
+        "succ_stop": sum_values(metrics, "vllm:request_success_total",
+                                finished_reason="stop"),
+        "succ_length": sum_values(metrics, "vllm:request_success_total",
+                                  finished_reason="length"),
+        "succ_abort": sum_values(metrics, "vllm:request_success_total",
+                                 finished_reason="abort"),
+        "succ_error": sum_values(metrics, "vllm:request_success_total",
+                                 finished_reason="error"),
+        "succ_repetition": sum_values(metrics, "vllm:request_success_total",
+                                      finished_reason="repetition"),
+        # spec
+        "spec_drafts": sum_values(metrics, "vllm:spec_decode_num_drafts_total"),
+        "spec_draft_tokens":
+            sum_values(metrics, "vllm:spec_decode_num_draft_tokens_total"),
+        "spec_accepted":
+            sum_values(metrics, "vllm:spec_decode_num_accepted_tokens_total"),
+        "spec_pos0": sum_values(metrics,
+                                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                                position="0"),
+        "spec_pos1": sum_values(metrics,
+                                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                                position="1"),
+        "spec_pos2": sum_values(metrics,
+                                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                                position="2"),
+    }
+    s["succ_total"] = (s["succ_stop"] + s["succ_length"] + s["succ_abort"]
+                       + s["succ_error"] + s["succ_repetition"])
+    # histograms
+    s["ttft"] = histogram_pcts(metrics, "vllm:time_to_first_token_seconds")
+    s["e2e"] = histogram_pcts(metrics, "vllm:e2e_request_latency_seconds")
+    s["itl"] = histogram_pcts(metrics, "vllm:inter_token_latency_seconds")
+    s["req_prompt"] = histogram_pcts(metrics, "vllm:request_prompt_tokens")
+    s["req_gen"] = histogram_pcts(metrics, "vllm:request_generation_tokens")
+    return s
+
+
+# ────────────────────────────────────────────────────────────────────
+# rendering: one-shot snapshot
+# ────────────────────────────────────────────────────────────────────
+
+def render_oneshot(engine: dict, snap: dict, log_rows: list[dict]) -> str:
+    out = []
+    out.append(f"=== llama-swap stack — {now_utc()} ===")
+
+    awake = "awake" if (snap.get("awake") or 0) >= 0.5 else "asleep"
+    out.append(
+        f"Engine: {engine['name']}  port={engine['port']}  {awake}  "
+        f"running={int(snap['running'] or 0)}  waiting={int(snap['waiting'] or 0)}  "
+        f"kv={fmt_float((snap.get('kv_cache_usage') or 0) * 100, 1, '%')}"
+    )
+    out.append("")
+
+    # cumulative
+    out.append("== cumulative since engine boot ==")
+    out.append(
+        f"  requests:        {fmt_int(snap['succ_total'])} total  "
+        f"(stop={fmt_int(snap['succ_stop'])}, "
+        f"length={fmt_int(snap['succ_length'])}, "
+        f"abort={fmt_int(snap['succ_abort'])}, "
+        f"error={fmt_int(snap['succ_error'])}, "
+        f"repetition={fmt_int(snap['succ_repetition'])})"
+    )
+    out.append(
+        f"  prompt_tokens:   {fmt_int(snap['prompt_tokens_total'])}  "
+        f"(prefix_hit_rate={fmt_pct(snap['prefix_h'], snap['prefix_q'])})"
+    )
+    out.append(f"  gen_tokens:      {fmt_int(snap['gen_tokens_total'])}")
+
+    if snap["spec_drafts"]:
+        out.append(
+            f"  spec acceptance: "
+            f"avg={fmt_pct(snap['spec_accepted'], snap['spec_draft_tokens'])}  "
+            f"per_pos="
+            f"{fmt_pct(snap['spec_pos0'], snap['spec_drafts'], 1)} / "
+            f"{fmt_pct(snap['spec_pos1'], snap['spec_drafts'], 1)} / "
+            f"{fmt_pct(snap['spec_pos2'], snap['spec_drafts'], 1)}  "
+            f"drafts={fmt_int(snap['spec_drafts'])}"
+        )
+    if snap["preempt"]:
+        out.append(f"  preemptions:     {fmt_int(snap['preempt'])}  ⚠")
+
+    out.append("")
+    out.append("== histograms (since boot) ==")
+    out.append(
+        f"  {'metric':<24} {'count':>6} {'avg':>8} {'p50':>8} {'p95':>8}"
+    )
+    for name, key, suffix, nd in [
+        ("ttft_seconds", "ttft", "s", 2),
+        ("e2e_latency_seconds", "e2e", "s", 2),
+        ("inter_token_latency", "itl", "s", 4),
+        ("prompt_tokens", "req_prompt", "", 0),
+        ("gen_tokens", "req_gen", "", 0),
+    ]:
+        h = snap[key]
+        out.append(
+            f"  {name:<24} {fmt_int(h['count']):>6} "
+            f"{fmt_float(h['avg'], nd, suffix):>8} "
+            f"{fmt_float(h['pcts'].get(0.5), nd, suffix):>8} "
+            f"{fmt_float(h['pcts'].get(0.95), nd, suffix):>8}"
+        )
+
+    # log tail
+    out.append("")
+    out.append("== last 90s aggregate (vLLM stdout) ==")
+    if not log_rows:
+        out.append("  (no engine activity in window)")
+    else:
+        for r in log_rows[-12:]:
+            line = (
+                f"  {r['ts']}  "
+                f"prompt_tps={fmt_float(r.get('prompt_tps'), 1):>5}  "
+                f"gen_tps={fmt_float(r.get('gen_tps'), 1):>5}  "
+                f"run={r.get('running', '—')} wait={r.get('waiting', '—')}  "
+                f"kv={fmt_float(r.get('kv'), 1, '%')}  "
+                f"pfx={fmt_float(r.get('pfx_hit'), 1, '%')}"
+            )
+            if "spec_accept" in r:
+                line += (
+                    f"  spec={fmt_float(r['spec_accept'], 1, '%')} "
+                    f"(len={fmt_float(r.get('mean_len'), 2)})"
+                )
+            out.append(line)
+
+    # anomaly summary
+    out.append("")
+    out.append("== flags ==")
+    flags = []
+    if snap["succ_abort"]:
+        flags.append(f"⚠ {int(snap['succ_abort'])} aborts")
+    if snap["succ_error"]:
+        flags.append(f"⚠ {int(snap['succ_error'])} errors")
+    if snap["succ_repetition"]:
+        flags.append(f"⚠ {int(snap['succ_repetition'])} repetition cutoffs")
+    if snap["preempt"]:
+        flags.append(f"⚠ {int(snap['preempt'])} preemptions")
+    if snap["spec_drafts"]:
+        rate = snap["spec_accepted"] / max(snap["spec_draft_tokens"], 1)
+        if rate < 0.5:
+            flags.append(f"⚠ spec acceptance {rate*100:.0f}% < 50% (drafter mismatch?)")
+    if not flags:
+        flags.append("✓  no aborts / errors / preemptions")
+    for f in flags:
+        out.append(f"  {f}")
+
+    return "\n".join(out) + "\n"
+
+
+# ────────────────────────────────────────────────────────────────────
+# rendering: watch mode (delta rows)
+# ────────────────────────────────────────────────────────────────────
+
+def watch_row(prev: dict, curr: dict) -> str:
+    """One delta line summarizing what happened between prev and curr."""
+    d_succ = curr["succ_total"] - prev["succ_total"]
+    d_stop = curr["succ_stop"] - prev["succ_stop"]
+    d_length = curr["succ_length"] - prev["succ_length"]
+    d_abort = curr["succ_abort"] - prev["succ_abort"]
+    d_error = curr["succ_error"] - prev["succ_error"]
+    d_rep = curr["succ_repetition"] - prev["succ_repetition"]
+
+    d_prompt = curr["prompt_tokens_total"] - prev["prompt_tokens_total"]
+    d_gen = curr["gen_tokens_total"] - prev["gen_tokens_total"]
+
+    d_ttft_n = curr["ttft"]["count"] - prev["ttft"]["count"]
+    d_ttft_s = curr["ttft"]["sum"] - prev["ttft"]["sum"]
+    avg_ttft = (d_ttft_s / d_ttft_n) if d_ttft_n else None
+
+    d_e2e_n = curr["e2e"]["count"] - prev["e2e"]["count"]
+    d_e2e_s = curr["e2e"]["sum"] - prev["e2e"]["sum"]
+    avg_e2e = (d_e2e_s / d_e2e_n) if d_e2e_n else None
+
+    d_drafts = curr["spec_drafts"] - prev["spec_drafts"]
+    d_dtoks = curr["spec_draft_tokens"] - prev["spec_draft_tokens"]
+    d_acc = curr["spec_accepted"] - prev["spec_accepted"]
+    accept_rate = (d_acc / d_dtoks) if d_dtoks else None
+
+    line = f"{hms()}"
+    if d_succ == 0 and curr["running"] == 0:
+        line += "  idle"
+    else:
+        finishes = []
+        if d_stop:
+            finishes.append(f"{int(d_stop)}×stop")
+        if d_length:
+            finishes.append(f"{int(d_length)}×length")
+        if d_abort:
+            finishes.append(f"{int(d_abort)}×abort")
+        if d_error:
+            finishes.append(f"{int(d_error)}×error")
+        if d_rep:
+            finishes.append(f"{int(d_rep)}×rep")
+        if not finishes and d_succ:
+            finishes.append(f"{int(d_succ)}×?")
+
+        line += f"  +{int(d_succ)} req"
+        if finishes:
+            line += f" [{', '.join(finishes)}]"
+        if d_prompt:
+            line += f"  prompt={fmt_int(d_prompt)}"
+        if d_gen:
+            line += f"  gen={fmt_int(d_gen)}"
+        if avg_ttft is not None:
+            line += f"  ttft={fmt_float(avg_ttft, 2, 's')}"
+        if avg_e2e is not None:
+            line += f"  e2e={fmt_float(avg_e2e, 2, 's')}"
+        if d_succ and d_e2e_n:
+            decode_window = avg_e2e - avg_ttft if (avg_ttft is not None) else None
+            if decode_window and decode_window > 0:
+                gen_per_req = d_gen / max(d_succ, 1)
+                tps = gen_per_req / decode_window
+                line += f"  decode_tps={fmt_float(tps, 1)}"
+        if accept_rate is not None:
+            line += f"  accept={fmt_float(accept_rate * 100, 0, '%')}"
+        if curr["running"]:
+            line += f"  (still running={int(curr['running'])})"
+
+        # truncation flag: a "stop" with very few gen tokens after a real prompt
+        if d_stop and d_succ:
+            avg_gen = d_gen / d_succ
+            avg_prompt = d_prompt / d_succ
+            if avg_gen < 5 and avg_prompt > 100:
+                line += "  ⚠ SUSPECT_TRUNC"
+        if d_abort or d_error or d_rep:
+            line += "  ⚠"
+
+    return line
+
+
+# ────────────────────────────────────────────────────────────────────
+# main
+# ────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="Lightweight monitoring for llama-swap engine stack."
+    )
+    p.add_argument("--port", type=int, default=None,
+                   help="Engine port (default: auto-discover from docker ps)")
+    p.add_argument("--container", default=None,
+                   help="Engine container name (default: auto-discover)")
+    p.add_argument("--watch", nargs="?", const=5.0, type=float, default=None,
+                   help="Watch mode; optional interval in seconds (default 5)")
+    p.add_argument("--window", type=int, default=20,
+                   help="Rolling window size for --watch summary (default 20)")
+    p.add_argument("--snapshot", default="/tmp/stack-status.txt",
+                   help="Path to write one-shot snapshot (default /tmp/stack-status.txt)")
+    p.add_argument("--no-snapshot", action="store_true",
+                   help="Skip writing the snapshot file")
+    args = p.parse_args()
+
+    # discover engine
+    if args.port and args.container:
+        engine = {"name": args.container, "port": args.port,
+                  "status": "user-supplied"}
+    else:
+        engines = discover_engines()
+        if not engines:
+            print("ERROR: no running vllm-* container found "
+                  "(docker ps --filter name=vllm-)", file=sys.stderr)
+            return 2
+        # prefer one matching --port if set
+        if args.port:
+            engine = next((e for e in engines if e["port"] == args.port), engines[0])
+        else:
+            engine = engines[0]
+        if args.container:
+            engine = {"name": args.container, "port": engine["port"],
+                      "status": engine["status"]}
+
+    # initial fetch
+    metrics = fetch_metrics(engine["port"])
+    if metrics is None:
+        print(f"ERROR: failed to scrape http://127.0.0.1:{engine['port']}/metrics",
+              file=sys.stderr)
+        return 2
+
+    if args.watch is None:
+        # one-shot
+        snap = snapshot(metrics)
+        log_rows = tail_engine_log(engine["name"], since_seconds=120)
+        text = render_oneshot(engine, snap, log_rows)
+        sys.stdout.write(text)
+        if not args.no_snapshot:
+            try:
+                with open(args.snapshot, "w") as f:
+                    f.write(text)
+                print(f"(snapshot → {args.snapshot})")
+            except OSError as e:
+                print(f"(snapshot write failed: {e})", file=sys.stderr)
+        return 0
+
+    # watch mode
+    interval = max(1.0, float(args.watch))
+    print(f"# stack-status --watch {interval}s — engine {engine['name']} "
+          f"(port {engine['port']})  Ctrl-C to exit")
+    print(f"# rolling window = {args.window}; ⚠ flags abort/error/repetition/trunc")
+    prev = snapshot(metrics)
+    history: list[str] = []
+    try:
+        while True:
+            time.sleep(interval)
+            metrics = fetch_metrics(engine["port"])
+            if metrics is None:
+                print(f"{hms()}  ⚠ scrape failed")
+                continue
+            curr = snapshot(metrics)
+            row = watch_row(prev, curr)
+            print(row, flush=True)
+            history.append(row)
+            history = history[-args.window:]
+            prev = curr
+    except KeyboardInterrupt:
+        print(f"\n# stopped — last {len(history)} rows above")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
