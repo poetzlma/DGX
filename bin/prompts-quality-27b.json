@@ -1,0 +1,20 @@
+[
+  {
+    "name": "bug-fix-binary-search",
+    "system": "You are a senior software engineer. Be concise and precise.",
+    "user": "Find every bug in this Python function and provide a corrected version. Explain each bug briefly.\n\n```python\ndef binary_search(arr, target):\n    lo, hi = 0, len(arr)\n    while lo < hi:\n        mid = (lo + hi) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            lo = mid\n        else:\n            hi = mid\n    return -1\n```",
+    "max_tokens": 1024
+  },
+  {
+    "name": "impl-thread-safe-lru",
+    "system": "You are a senior software engineer. Write production-quality code.",
+    "user": "Implement a thread-safe LRU cache in Python with the following interface:\n\n```python\nclass LRUCache:\n    def __init__(self, capacity: int): ...\n    def get(self, key) -> Any | None: ...\n    def put(self, key, value) -> None: ...\n    def __len__(self) -> int: ...\n```\n\nRequirements:\n- O(1) get and put.\n- Safe under concurrent access from multiple threads.\n- Evicts the least-recently-used entry when at capacity.\n- Update recency on `get` even for hits.\n\nProvide ONLY the implementation, with a one-line comment above the class noting the synchronization strategy.",
+    "max_tokens": 1536
+  },
+  {
+    "name": "refactor-async-express",
+    "system": "You are a senior software engineer. Be concise and precise.",
+    "user": "Refactor this Express.js handler to use async/await with proper error handling. Surface errors via `next(err)` so they reach the global error middleware. Do not change the externally observable behavior.\n\n```javascript\napp.get('/users/:id/orders', (req, res) => {\n  db.users.findById(req.params.id, (err, user) => {\n    if (err) { res.status(500).send('error'); return; }\n    if (!user) { res.status(404).send('not found'); return; }\n    db.orders.findByUser(user.id, (err, orders) => {\n      if (err) { res.status(500).send('error'); return; }\n      enrichOrders(orders, (err, enriched) => {\n        if (err) { res.status(500).send('error'); return; }\n        res.json({ user, orders: enriched });\n      });\n    });\n  });\n});\n```\n\nProvide the refactored code only.",
+    "max_tokens": 1024
+  }
+]
