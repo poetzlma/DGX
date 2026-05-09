@@ -108,6 +108,19 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                     "request_bytes": len(body_bytes),
                     "response_bytes": chunks_written,
                 }
+
+                # ── Auth: capture Authorization for downstream user/key
+                # enrichment. Stores prefix (display form) only; the full
+                # token is in /tmp/log-proxy and never leaves the host.
+                auth = request.headers.get("Authorization", "")
+                if auth.lower().startswith("bearer "):
+                    token = auth[7:].strip()
+                    meta["key_full"] = token
+                    if len(token) > 8:
+                        meta["key_masked"] = f"{token[:6]}…{token[-4:]}"
+                    else:
+                        meta["key_masked"] = "…"
+                    meta["key_prefix"] = token[:8]
                 # Pull a few notable fields out of the request body
                 try:
                     rb = json.loads(body_bytes)
@@ -128,6 +141,7 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                     txt = open(f"{base}.resp.txt", "rb").read()
                     if not (rb.get("stream") if isinstance(rb, dict) else False):
                         rj = json.loads(txt)
+                        meta["response_id"] = rj.get("id")
                         ch = rj.get("choices", [{}])[0]
                         meta["finish_reason"] = ch.get("finish_reason")
                         msg = ch.get("message", {})
@@ -149,10 +163,22 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                            meta["post_think_chars"] < 5:
                             meta["SUSPECT_TRUNC"] = True
                     else:
-                        # SSE stream — pull last data: line, count chunks
+                        # SSE stream — pull response id from first chunk +
+                        # finish_reason from last meaningful chunk.
                         chunks = [l for l in txt.split(b"\n") if l.startswith(b"data: ")]
                         meta["sse_chunks"] = len(chunks)
-                        # peek finish_reason in last meaningful chunk
+                        for c in chunks:
+                            payload = c[6:].strip()
+                            if payload in (b"[DONE]", b""):
+                                continue
+                            try:
+                                cj = json.loads(payload)
+                                rid = cj.get("id")
+                                if rid:
+                                    meta["response_id"] = rid
+                                    break
+                            except json.JSONDecodeError:
+                                continue
                         for c in reversed(chunks):
                             payload = c[6:].strip()
                             if payload in (b"[DONE]", b""):

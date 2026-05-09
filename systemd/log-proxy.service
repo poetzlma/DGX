@@ -1,0 +1,18 @@
+[Unit]
+Description=log-proxy: transparent logging proxy in front of llama-swap (port 8079 → 8080)
+After=network-online.target llama-swap.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=max
+Group=max
+WorkingDirectory=/home/max/llm-stack
+ExecStart=/home/max/llm-stack/venv/bin/python3 /home/max/llm-stack/bin/log-proxy.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/max/llm-stack/logs/log-proxy.log
+StandardError=append:/home/max/llm-stack/logs/log-proxy.err
+
+[Install]
+WantedBy=multi-user.target
