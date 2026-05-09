@@ -22,15 +22,9 @@ Usage:
 Press Ctrl-C to quit (alt-screen restored).
 """
 import argparse
-import re
-import subprocess
+import os
 import sys
-import threading
 import time
-import urllib.error
-import urllib.request
-from collections import OrderedDict, defaultdict, deque
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -42,6 +36,12 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 from rich import box
+
+# Make sibling `stack/` package importable when stack-tui is launched from
+# anywhere (systemd, ./bin/stack-tui, full path).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from stack.engine import discover_engines  # noqa: E402
+from stack.monitor import EngineMonitor, RequestState  # noqa: E402
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -76,373 +76,11 @@ TN_THEME = Theme({
 
 
 # ────────────────────────────────────────────────────────────────────────
-# engine discovery
+# (engine discovery, /metrics parsing, system stats, RequestState +
+# LogTailer, cold-start stage detection have all moved to the stack/
+# package. View those modules for the data-layer logic.)
 # ────────────────────────────────────────────────────────────────────────
 
-def discover_engines() -> list[dict]:
-    try:
-        out = subprocess.run(
-            ["docker", "ps", "--format",
-             "{{.Names}}\t{{.Status}}\t{{.Ports}}"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return []
-    engines = []
-    for line in out.strip().splitlines():
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        name, status, ports = parts[0], parts[1], parts[2]
-        if not name.startswith("vllm-"):
-            continue
-        m = re.search(r"0\.0\.0\.0:(\d+)->", ports)
-        if not m:
-            continue
-        engines.append({"name": name, "port": int(m.group(1)),
-                        "status": status})
-    return engines
-
-
-# ────────────────────────────────────────────────────────────────────────
-# Prometheus parsing (subset for TUI gauges)
-# ────────────────────────────────────────────────────────────────────────
-
-_METRIC_RE = re.compile(
-    r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([0-9eE.+-]+)\s*$'
-)
-_LABEL_RE = re.compile(
-    r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"'
-)
-
-
-def parse_metrics(text: str) -> dict:
-    out = defaultdict(list)
-    for line in text.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        m = _METRIC_RE.match(line)
-        if not m:
-            continue
-        name, labels_raw, val_raw = m.group(1), m.group(2) or "", m.group(3)
-        try:
-            val = float(val_raw)
-        except ValueError:
-            continue
-        labels = dict(_LABEL_RE.findall(labels_raw))
-        out[name].append((labels, val))
-    return out
-
-
-def fetch_metrics(port: int, timeout: float = 2.0) -> Optional[dict]:
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics",
-                                    timeout=timeout) as r:
-            return parse_metrics(r.read().decode("utf-8", errors="replace"))
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return None
-
-
-def first_value(metrics: dict, name: str, **filt) -> Optional[float]:
-    for labels, val in metrics.get(name, []):
-        if all(labels.get(k) == v for k, v in filt.items()):
-            return val
-    return None
-
-
-def sum_values(metrics: dict, name: str, **filt) -> float:
-    s = 0.0
-    for labels, val in metrics.get(name, []):
-        if all(labels.get(k) == v for k, v in filt.items()):
-            s += val
-    return s
-
-
-def gauge_snapshot(metrics: dict) -> dict:
-    return {
-        "running": first_value(metrics, "vllm:num_requests_running") or 0,
-        "waiting": first_value(metrics, "vllm:num_requests_waiting") or 0,
-        "kv": (first_value(metrics, "vllm:kv_cache_usage_perc") or 0) * 100,
-        "awake": first_value(metrics, "vllm:engine_sleep_state",
-                             sleep_state="awake") or 0,
-        "spec_drafted": sum_values(
-            metrics, "vllm:spec_decode_num_draft_tokens_total"),
-        "spec_accepted": sum_values(
-            metrics, "vllm:spec_decode_num_accepted_tokens_total"),
-        "preempt": sum_values(metrics, "vllm:num_preemptions_total"),
-        "succ_stop": sum_values(metrics, "vllm:request_success_total",
-                                finished_reason="stop"),
-        "succ_length": sum_values(metrics, "vllm:request_success_total",
-                                  finished_reason="length"),
-        "succ_abort": sum_values(metrics, "vllm:request_success_total",
-                                 finished_reason="abort"),
-        "succ_error": sum_values(metrics, "vllm:request_success_total",
-                                 finished_reason="error"),
-        "gen_total": sum_values(metrics, "vllm:generation_tokens_total"),
-        "prompt_total": sum_values(metrics, "vllm:prompt_tokens_total"),
-        # histogram counts/sums for lifecycle event detection
-        "ttft_count": sum_values(metrics,
-                                 "vllm:time_to_first_token_seconds_count"),
-        "ttft_sum": sum_values(metrics,
-                               "vllm:time_to_first_token_seconds_sum"),
-    }
-
-
-# ────────────────────────────────────────────────────────────────────────
-# system data (nvidia-smi, /proc/meminfo)
-# ────────────────────────────────────────────────────────────────────────
-
-def read_nvidia_stats() -> dict:
-    out = {"util": None, "temp": None, "power": None, "clock": None}
-    try:
-        r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu,"
-             "power.draw,clocks.current.graphics",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=2,
-        )
-        line = (r.stdout or "").strip().splitlines()
-        if line:
-            parts = [p.strip() for p in line[0].split(",")]
-            try:
-                out["util"] = float(parts[0]) if parts[0] != "[N/A]" else None
-                out["temp"] = float(parts[1]) if parts[1] != "[N/A]" else None
-                out["power"] = float(parts[2]) if parts[2] != "[N/A]" else None
-                out["clock"] = float(parts[3]) if parts[3] != "[N/A]" else None
-            except (ValueError, IndexError):
-                pass
-    except (subprocess.SubprocessError, FileNotFoundError):
-        pass
-    return out
-
-
-def read_meminfo() -> dict:
-    out = {"total_gb": None, "available_gb": None, "used_gb": None}
-    try:
-        with open("/proc/meminfo") as f:
-            kv = {}
-            for line in f:
-                if ":" in line:
-                    k, v = line.split(":", 1)
-                    kv[k.strip()] = v.strip()
-        total_kb = int(kv.get("MemTotal", "0").split()[0])
-        avail_kb = int(kv.get("MemAvailable", "0").split()[0])
-        out["total_gb"] = total_kb / 1024 / 1024
-        out["available_gb"] = avail_kb / 1024 / 1024
-        out["used_gb"] = out["total_gb"] - out["available_gb"]
-    except (OSError, ValueError):
-        pass
-    return out
-
-
-# ────────────────────────────────────────────────────────────────────────
-# cold-start stage tracking
-# ────────────────────────────────────────────────────────────────────────
-
-COLD_STAGES = [
-    "container starting",
-    "loading weights",
-    "compiling graphs",
-    "capturing cudagraphs",
-    "starting server",
-    "ready",
-]
-COLD_STAGE_TYPICAL_S = {
-    "container starting":     15.0,
-    "loading weights":       180.0,
-    "compiling graphs":       90.0,
-    "capturing cudagraphs":  240.0,
-    "starting server":        10.0,
-}
-
-_RX_STAGE_PATTERNS = [
-    (re.compile(r"Loading safetensors checkpoint shards:\s+(?P<pct>\d+)%"
-                r"[^|]*\|\s*(?P<idx>\d+)/(?P<tot>\d+)"),
-     "loading weights",
-     lambda m: f"shards {m.group('idx')}/{m.group('tot')} ({m.group('pct')}%)"),
-    (re.compile(r"Loading weights took"),
-     "compiling graphs", lambda m: "weights loaded"),
-    (re.compile(r"Dynamo bytecode transform time"),
-     "compiling graphs", lambda m: "dynamo"),
-    (re.compile(r"Compiling a graph for compile range \((?P<r>[^)]+)\)"),
-     "compiling graphs", lambda m: f"compile range {m.group('r')}"),
-    (re.compile(r"torch\.compile took"),
-     "capturing cudagraphs", lambda m: "starting capture"),
-    (re.compile(r"Capturing cudagraph for batch_size=(?P<bs>\d+)"),
-     "capturing cudagraphs", lambda m: f"batch_size={m.group('bs')}"),
-    (re.compile(r"Capturing CUDA graph shapes:\s+(?P<pct>\d+)%"),
-     "capturing cudagraphs", lambda m: f"{m.group('pct')}%"),
-    (re.compile(r"Started server process|Application startup complete"),
-     "ready", lambda m: ""),
-    (re.compile(r"Engine core initialization failed|Engine core failed to start"),
-     "CRASHED", lambda m: ""),
-]
-
-
-# ────────────────────────────────────────────────────────────────────────
-# per-request state + log tailer
-# ────────────────────────────────────────────────────────────────────────
-
-VIEW_PRESETS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800}
-
-
-@dataclass
-class RequestState:
-    request_id: str
-    start_ts: float
-    prompt_tokens: Optional[int] = None
-    prefill_done_ts: Optional[float] = None
-    end_ts: Optional[float] = None
-    gen_tokens: Optional[int] = None
-    finish_reason: Optional[str] = None
-    # accumulated share of gen_total deltas while this request was decoding
-    gen_accum: float = 0.0
-
-
-_RX_RECV_PATTERNS = [
-    re.compile(r"Received request (?P<id>[\w\-]+).*?prompt[_ ]tokens?[= ]+(?P<pt>\d+)"),
-    re.compile(r"Received request (?P<id>[\w\-]+).*?num_prompt_tokens[= ]+(?P<pt>\d+)"),
-    re.compile(r"Received request (?P<id>[\w\-]+)"),
-]
-_RX_FIRST = re.compile(
-    r"(?:First token for|first token request|FirstToken) (?:request )?(?P<id>[\w\-]+)"
-)
-_RX_FINISH_PATTERNS = [
-    re.compile(
-        r"Finished request (?P<id>[\w\-]+).*?finish(?:ed)?_reason[= ]+(?P<fr>\w+)"
-        r".*?(?:gen(?:erated|eration)?_tokens|completion_tokens)[= ]+(?P<gt>\d+)"
-    ),
-    re.compile(
-        r"Finished request (?P<id>[\w\-]+).*?(?:gen(?:erated|eration)?_tokens|completion_tokens)[= ]+(?P<gt>\d+)"
-        r".*?finish(?:ed)?_reason[= ]+(?P<fr>\w+)"
-    ),
-    re.compile(r"Finished request (?P<id>[\w\-]+).*?finish(?:ed)?_reason[= ]+(?P<fr>\w+)"),
-    re.compile(r"Finished request (?P<id>[\w\-]+)"),
-]
-
-
-class LogTailer(threading.Thread):
-    def __init__(self, container: str, requests: "OrderedDict[str, RequestState]",
-                 lock: threading.Lock):
-        super().__init__(daemon=True)
-        self.container = container
-        self.requests = requests
-        self.lock = lock
-        self.proc: Optional[subprocess.Popen] = None
-        self.stop_flag = threading.Event()
-        self.lines_seen = 0
-        self.lines_matched = 0
-        self.stage = "container starting"
-        self.stage_detail = ""
-        self.stage_start_ts = time.time()
-
-    def run(self):
-        while not self.stop_flag.is_set():
-            try:
-                self.proc = subprocess.Popen(
-                    ["docker", "logs", "-f", "--tail", "50", self.container],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1,
-                )
-                assert self.proc.stdout is not None
-                for line in self.proc.stdout:
-                    if self.stop_flag.is_set():
-                        break
-                    self.lines_seen += 1
-                    if self._handle(line):
-                        self.lines_matched += 1
-            except Exception:
-                pass
-            if self.stop_flag.is_set():
-                break
-            self.stage = "container starting"
-            self.stage_detail = ""
-            self.stage_start_ts = time.time()
-            time.sleep(2.0)
-
-    def _handle(self, line: str) -> bool:
-        now = time.time()
-        for rx, stage, fn in _RX_STAGE_PATTERNS:
-            m = rx.search(line)
-            if m:
-                if stage != self.stage:
-                    self.stage = stage
-                    self.stage_start_ts = now
-                self.stage_detail = fn(m)
-                break
-        for rx in _RX_RECV_PATTERNS:
-            m = rx.search(line)
-            if m:
-                rid = m.group("id")
-                pt = None
-                try:
-                    pt = int(m.group("pt"))
-                except (IndexError, ValueError):
-                    pass
-                with self.lock:
-                    if rid not in self.requests:
-                        self.requests[rid] = RequestState(
-                            request_id=rid, start_ts=now, prompt_tokens=pt,
-                        )
-                    elif pt is not None and self.requests[rid].prompt_tokens is None:
-                        self.requests[rid].prompt_tokens = pt
-                return True
-        m = _RX_FIRST.search(line)
-        if m:
-            rid = m.group("id")
-            with self.lock:
-                r = self.requests.get(rid)
-                if r and r.prefill_done_ts is None:
-                    r.prefill_done_ts = now
-            return True
-        for rx in _RX_FINISH_PATTERNS:
-            m = rx.search(line)
-            if m:
-                rid = m.group("id")
-                fr = m.groupdict().get("fr")
-                gt = None
-                try:
-                    gt = int(m.group("gt"))
-                except (IndexError, ValueError):
-                    pass
-                with self.lock:
-                    r = self.requests.get(rid)
-                    if r is None:
-                        r = RequestState(request_id=rid, start_ts=now - 1.0)
-                        self.requests[rid] = r
-                    if r.end_ts is None:
-                        r.end_ts = now
-                        r.finish_reason = fr
-                        r.gen_tokens = gt
-                return True
-        return False
-
-    def stop(self):
-        self.stop_flag.set()
-        if self.proc:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
-
-
-def stage_progress(tailer: LogTailer) -> dict:
-    elapsed = time.time() - tailer.stage_start_ts
-    typical = COLD_STAGE_TYPICAL_S.get(tailer.stage, 0.0)
-    remaining = max(0.0, typical - elapsed) if typical else 0.0
-    try:
-        idx = COLD_STAGES.index(tailer.stage)
-    except ValueError:
-        idx = -1
-    return {
-        "stage": tailer.stage,
-        "detail": tailer.stage_detail,
-        "idx": idx,
-        "n_progress_stages": len(COLD_STAGES) - 1,
-        "elapsed": elapsed,
-        "typical": typical,
-        "remaining": remaining,
-    }
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -526,8 +164,29 @@ def pill(label: str, style: str) -> str:
 # ────────────────────────────────────────────────────────────────────────
 
 def make_instruments_row(snap: dict, gpu: dict, mem: dict,
-                         tps: float) -> Panel:
-    BAR_W = 12  # smooth-bar width in cells
+                         tps: float, total_width: int = 100) -> Panel:
+    # 3 gauges per row, 2 rows. Each gauge: fixed-width prefix (label +
+    # value), then bar, then optional trailing percentage. The fixed prefix
+    # makes bars start at the same x-position in every gauge.
+    PREFIX_W = 11   # cells for "LBL  VAL" (e.g. "GPU   65C")
+    TRAIL_W  = 5    # cells for trailing percentage (e.g. " 65%")
+
+    inner_w = max(48, total_width - 8)  # panel borders + outer padding
+    slot_w = inner_w // 3
+    # Each slot also pays 2 cells of inter-column table padding.
+    bar_w = max(6, slot_w - PREFIX_W - TRAIL_W - 4)
+
+    def fmt_gauge(label: str, value: str, bar_pct: float, fill_color: str,
+                  trail: str = "") -> str:
+        plain_prefix = f"{label:<3}  {value}"
+        prefix_pad = max(0, PREFIX_W - len(plain_prefix))
+        prefix_str = (f"[tn.fg.dim]{label:<3}[/]  "
+                      f"[{fill_color}]{value}[/]" + " " * prefix_pad)
+        bar_str = smooth_bar(bar_pct, bar_w, fill_color=fill_color)
+        plain_trail = trail
+        trail_pad = max(0, TRAIL_W - len(plain_trail))
+        trail_str = " " * trail_pad + (f"[tn.fg.dim]{trail}[/]" if trail else "")
+        return f"{prefix_str} {bar_str} {trail_str}"
 
     # GPU
     temp = gpu.get("temp")
@@ -537,48 +196,54 @@ def make_instruments_row(snap: dict, gpu: dict, mem: dict,
         gpu_part = "[tn.fg.muted]GPU --[/]"
     else:
         c = thresh_color(temp, 60, 80)
-        gpu_part = (f"[tn.fg.dim]GPU[/]  [{c}]{temp:>3.0f}C[/]  "
-                    f"{smooth_bar(util, BAR_W, fill_color=c)}  "
-                    f"[tn.fg.dim]{util:>3.0f}%[/]")
+        gpu_part = fmt_gauge("GPU", f"{temp:>3.0f}C", util, c,
+                             f"{util:>3.0f}%")
 
     # MEM
     if mem.get("total_gb") and mem.get("used_gb") is not None:
         used_pct = mem["used_gb"] / mem["total_gb"] * 100
         c = thresh_color(used_pct, 70, 90)
-        mem_part = (f"[tn.fg.dim]MEM[/]  [{c}]{mem['used_gb']:>3.0f}G[/]"
-                    f"[tn.fg.muted]/{mem['total_gb']:.0f}G[/]  "
-                    f"{smooth_bar(used_pct, BAR_W, fill_color=c)}")
+        mem_part = fmt_gauge("MEM", f"{mem['used_gb']:>3.0f}G", used_pct, c,
+                             f"{used_pct:>3.0f}%")
     else:
         mem_part = "[tn.fg.muted]MEM --[/]"
 
     # KV
     kv_pct = snap.get("kv") or 0.0
     c = thresh_color(kv_pct, 70, 90)
-    kv_part = (f"[tn.fg.dim]KV[/]   [{c}]{kv_pct:>4.1f}%[/]  "
-               f"{smooth_bar(kv_pct, BAR_W, fill_color=c)}")
+    kv_part = fmt_gauge("KV", f"{kv_pct:>4.1f}%", kv_pct, c)
 
     # ACC (spec acceptance, higher is better)
     acc_pct = 0.0
     if snap.get("spec_drafted"):
         acc_pct = snap["spec_accepted"] / snap["spec_drafted"] * 100
     c = thresh_color_inv(acc_pct, 50, 70)
-    acc_part = (f"[tn.fg.dim]ACC[/]  [{c}]{acc_pct:>3.0f}%[/]   "
-                f"{smooth_bar(acc_pct, BAR_W, fill_color=c)}")
+    acc_part = fmt_gauge("ACC", f"{acc_pct:>3.0f}%", acc_pct, c)
 
     # TPS (decode tok/s, normalized to 30 t/s for bar)
     tps_norm = min(100.0, (tps / 30.0) * 100)
     tps_color = ("tn.success" if tps > 10
                  else "tn.warning" if tps > 5 else "tn.fg.muted")
-    tps_part = (f"[tn.fg.dim]TPS[/]  [{tps_color}]{tps:>4.1f}[/]   "
-                f"{smooth_bar(tps_norm, BAR_W, fill_color=tps_color)}  "
-                f"[tn.fg.dim]{pwr:>3.0f}W[/]")
+    tps_part = fmt_gauge("TPS", f"{tps:>4.1f}", tps_norm, tps_color)
 
-    sep = "    "  # whitespace separators, no |
-    line1 = f" {gpu_part}{sep}{mem_part}{sep}{kv_part}"
-    line2 = f" {acc_part}{sep}{tps_part}"
-    return Panel(f"{line1}\n{line2}", title="cockpit",
-                 title_align="left", border_style="tn.border",
-                 box=box.ROUNDED, padding=(0, 1))
+    # PWR (power draw, % of 240W TDP)
+    pwr_pct = min(100.0, (pwr / 240.0) * 100)
+    pwr_color = thresh_color(pwr_pct, 60, 85)
+    pwr_part = fmt_gauge("PWR", f"{pwr:>3.0f}W", pwr_pct, pwr_color,
+                         f"{pwr_pct:>3.0f}%")
+
+    # Real Table with HORIZONTALS box draws a divider line between the two
+    # gauge rows so they don't bleed into one continuous bar of same color.
+    t = Table(box=box.HORIZONTALS, show_header=False, show_edge=False,
+              show_lines=True, expand=True, padding=(0, 1),
+              border_style="tn.fg.muted")
+    t.add_column(ratio=1, no_wrap=True)
+    t.add_column(ratio=1, no_wrap=True)
+    t.add_column(ratio=1, no_wrap=True)
+    t.add_row(gpu_part, mem_part, kv_part)
+    t.add_row(acc_part, tps_part, pwr_part)
+    return Panel(t, title="cockpit", title_align="left",
+                 border_style="tn.border", box=box.ROUNDED, padding=(0, 0))
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -788,14 +453,16 @@ def make_gantt_table(requests: "OrderedDict[str, RequestState]",
     completed = [r for r in requests.values()
                  if r.end_ts is not None and r.end_ts >= view_start]
 
-    # Fixed-width columns: id(6) + start(8) + ttft(6) + tps(5) + dur(7)
-    # + status(12) + 6 column-paddings(2*7=12) + 2 panel borders + slack
-    # = ~62. Give the rest of the terminal to the dynamic info column.
-    fixed_cols_w = 6 + 8 + 6 + 5 + 7 + 12 + 14
+    # Fixed-width columns: id(6) + key(13) + start(8) + ttft(6) + tps(5)
+    # + dur(7) + status(12) + 7 column-paddings(2*8=16) + 2 panel borders.
+    # The key column is populated from log-proxy meta files (Phase 3).
+    KEY_W = 13
+    fixed_cols_w = 6 + KEY_W + 8 + 6 + 5 + 7 + 12 + 16
     info_w = max(40, terminal_width - fixed_cols_w)
 
     table = Table.grid(expand=False, padding=(0, 1))
     table.add_column("id", no_wrap=True, width=6)
+    table.add_column("key", no_wrap=True, width=KEY_W)
     table.add_column("start", width=8)
     table.add_column("info", width=info_w, no_wrap=True)
     table.add_column("ttft", justify="right", width=6)
@@ -806,6 +473,7 @@ def make_gantt_table(requests: "OrderedDict[str, RequestState]",
     # column header row
     table.add_row(
         Text("id", style="tn.fg.muted"),
+        Text("key", style="tn.fg.muted"),
         Text("start", style="tn.fg.muted"),
         Text(" in / timeline / out".ljust(info_w), style="tn.fg.muted"),
         Text("ttft", style="tn.fg.muted"),
@@ -815,6 +483,7 @@ def make_gantt_table(requests: "OrderedDict[str, RequestState]",
     )
     table.add_row(
         Text("─" * 6, style="tn.border"),
+        Text("─" * KEY_W, style="tn.border"),
         Text("─" * 8, style="tn.border"),
         Text("─" * info_w, style="tn.border"),
         Text("─" * 6, style="tn.border"),
@@ -822,6 +491,10 @@ def make_gantt_table(requests: "OrderedDict[str, RequestState]",
         Text("─" * 7, style="tn.border"),
         Text("─" * 12, style="tn.border"),
     )
+
+    def _key_cell(r: "RequestState", style: str) -> Text:
+        label = r.key_masked or "—"
+        return Text(label, style=style)
 
     if inflight:
         for r in sorted(inflight, key=lambda x: x.start_ts):
@@ -832,6 +505,7 @@ def make_gantt_table(requests: "OrderedDict[str, RequestState]",
                 ttft_str = "-"
             table.add_row(
                 Text(fmt_id(r.request_id), style="bold tn.info"),
+                _key_cell(r, "tn.accent"),
                 Text(datetime.fromtimestamp(r.start_ts).strftime("%H:%M:%S"),
                      style="tn.fg.dim"),
                 render_inflight_info(r, view_start, now, info_w),
@@ -842,7 +516,7 @@ def make_gantt_table(requests: "OrderedDict[str, RequestState]",
             )
         # subtle divider before completed section
         table.add_row(
-            Text(""), Text(""),
+            Text(""), Text(""), Text(""),
             Text("·" * info_w, style="tn.fg.muted"),
             Text(""), Text(""), Text(""), Text(""),
         )
@@ -851,7 +525,7 @@ def make_gantt_table(requests: "OrderedDict[str, RequestState]",
         table.add_row(
             Text("(idle - no requests in view window)",
                  style="tn.fg.muted italic"),
-            "", "", "", "", "", "",
+            "", "", "", "", "", "", "",
         )
         return table
 
@@ -891,6 +565,7 @@ def make_gantt_table(requests: "OrderedDict[str, RequestState]",
 
         table.add_row(
             Text(fmt_id(r.request_id), style="tn.fg.dim"),
+            _key_cell(r, "tn.fg.dim"),
             Text(datetime.fromtimestamp(r.start_ts).strftime("%H:%M:%S"),
                  style="tn.fg.muted"),
             render_completed_info(r, info_w),
@@ -954,10 +629,52 @@ def make_progress_line(metrics_ok: bool, sp: dict) -> str:
     return f"{label}    {progress}    [tn.fg.dim]{eta}[/]"
 
 
+def make_engine_stats_line(snap: dict) -> str:
+    """Aggregate stats since engine boot (mean TTFT, mean per-request decode
+    rate, mean prompt/gen tokens, spec acceptance). Empty if no completed
+    requests yet."""
+    succ_total = (snap["succ_stop"] + snap["succ_length"] +
+                  snap["succ_abort"] + snap["succ_error"])
+    parts = []
+
+    # mean TTFT (vLLM histogram sum/count, since boot)
+    if snap["ttft_count"] > 0:
+        mean_ttft = snap["ttft_sum"] / snap["ttft_count"]
+        parts.append(f"[tn.fg.dim]TTFT[/] [tn.fg]{fmt_dur(mean_ttft)}[/]")
+
+    # mean per-request decode rate (= 1 / mean TPOT)
+    if snap["tpot_count"] > 0 and snap["tpot_sum"] > 0:
+        mean_tpot = snap["tpot_sum"] / snap["tpot_count"]
+        if mean_tpot > 0:
+            mean_rate = 1.0 / mean_tpot
+            parts.append(f"[tn.fg.dim]tok/s[/] [tn.fg]{mean_rate:.1f}[/]")
+
+    # mean in/out tokens per request
+    if succ_total > 0:
+        mean_in = snap["prompt_total"] / succ_total
+        mean_out = snap["gen_total"] / succ_total
+        parts.append(f"[tn.fg.dim]in/out[/] [tn.fg]"
+                     f"{fmt_size(int(mean_in))}/{fmt_size(int(mean_out))}[/]")
+
+    # spec acceptance (since boot)
+    if snap["spec_drafted"] > 0:
+        acc = snap["spec_accepted"] / snap["spec_drafted"] * 100
+        c = thresh_color_inv(acc, 50, 70)
+        parts.append(f"[tn.fg.dim]acc[/] [{c}]{acc:.0f}%[/]")
+
+    # mean e2e latency (since boot)
+    if snap["e2e_count"] > 0:
+        mean_e2e = snap["e2e_sum"] / snap["e2e_count"]
+        parts.append(f"[tn.fg.dim]e2e[/] [tn.fg]{fmt_dur(mean_e2e)}[/]")
+
+    return "    ".join(parts)
+
+
 def make_header(engine: dict, snap: dict, uptime_s: float, view_label: str,
                 tailer_status: str, metrics_ok: bool, sp: dict) -> Panel:
     state = make_state_pill(metrics_ok, snap, sp)
     progress = make_progress_line(metrics_ok, sp)
+    stats = make_engine_stats_line(snap) if metrics_ok else ""
 
     succ_total = (snap["succ_stop"] + snap["succ_length"] +
                   snap["succ_abort"] + snap["succ_error"])
@@ -979,9 +696,12 @@ def make_header(engine: dict, snap: dict, uptime_s: float, view_label: str,
         f"[tn.fg.dim]up {fmt_dur(uptime_s)}[/]{flag_str}"
     )
     body = line1
+    # Progress wins the middle slot during cold-start; stats fill it once ready.
     if progress:
         body += f"\n{progress}"
-    body += f"\n[tn.fg.muted]view={view_label}    {tailer_status}[/]"
+    elif stats:
+        body += f"\n{stats}"
+    body += f"\n[tn.fg.muted]{tailer_status}[/]"
 
     return Panel(body, title="vLLM engine", title_align="left",
                  border_style="tn.border", box=box.ROUNDED)
@@ -1010,6 +730,9 @@ def make_footer(view_label: str, n_inflight: int, n_completed: int,
 # main
 # ────────────────────────────────────────────────────────────────────────
 
+VIEW_PRESETS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800}
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Live cockpit TUI for the llama-swap engine stack."
@@ -1036,154 +759,24 @@ def main() -> int:
             engine["name"] = args.container
 
     view_duration = VIEW_PRESETS[args.view]
-
-    requests: "OrderedDict[str, RequestState]" = OrderedDict()
-    lock = threading.Lock()
-    tailer = LogTailer(engine["name"], requests, lock)
-    tailer.start()
-
+    monitor = EngineMonitor(engine, view_duration_s=float(view_duration))
     console = Console(theme=TN_THEME)
 
-    prev_gen_total = 0.0
-    prev_tick_ts = time.time()
-    tps_window: deque = deque(maxlen=5)
-    start_ts = time.time()
-    # vLLM 0.20.1 does not log per-request prompt_tokens / first_token /
-    # finish_reason. We derive ALL of those from /metrics histogram deltas
-    # and attribute them oldest-first to in-flight requests (FIFO).
-    prev_succ: dict = {}
-    prev_ttft_count = 0.0
-    prev_ttft_sum = 0.0
-    prev_prompt_total = 0.0
-    # accumulator for prompt tokens between first-token events:
-    # prompt_tokens_total can increment in earlier ticks (chunked prefill)
-    # before ttft fires, so we accumulate and divide at first-token time
-    prompt_accum = 0.0
-
     def render() -> Layout:
-        nonlocal prev_gen_total, prev_tick_ts, prev_succ
-        nonlocal prev_ttft_count, prev_ttft_sum, prev_prompt_total, prompt_accum
         layout = Layout()
         layout.split_column(
             Layout(name="header", size=5),
-            Layout(name="instruments", size=4),
+            Layout(name="instruments", size=5),
             Layout(name="body"),
             Layout(name="footer", size=1),
         )
 
-        m = fetch_metrics(engine["port"])
-        metrics_ok = m is not None
-        snap = (gauge_snapshot(m) if m else
-                {"running": 0, "waiting": 0, "kv": 0, "awake": 1,
-                 "spec_drafted": 0, "spec_accepted": 0, "preempt": 0,
-                 "succ_stop": 0, "succ_length": 0, "succ_abort": 0,
-                 "succ_error": 0, "gen_total": 0, "prompt_total": 0,
-                 "ttft_count": 0, "ttft_sum": 0.0})
+        monitor.tick()
+        snap = monitor.snap
+        sp = monitor.stage()
+        counts = monitor.counts()
 
-        now = time.time()
-        dt = max(0.001, now - prev_tick_ts)
-        d_gen = max(0.0, snap["gen_total"] - prev_gen_total) if prev_gen_total > 0 else 0.0
-        if prev_gen_total > 0:
-            tps_window.append(d_gen / dt)
-
-        # Lifecycle attribution from /metrics deltas (vLLM 0.20.1 doesn't
-        # log per-request prompt_tokens/first_token/finish events).
-        REASONS = ("stop", "length", "abort", "error")
-        if not prev_succ:
-            # first tick: baseline; do not attribute pre-existing counts
-            prev_succ = {r: snap[f"succ_{r}"] for r in REASONS}
-            prev_ttft_count = snap["ttft_count"]
-            prev_ttft_sum = snap["ttft_sum"]
-            prev_prompt_total = snap["prompt_total"]
-            prompt_accum = 0.0
-        else:
-            # accumulate prompt tokens since last first-token event (chunked
-            # prefill spans multiple ticks for big prompts)
-            d_prompt = max(0.0, snap["prompt_total"] - prev_prompt_total)
-            prompt_accum += d_prompt
-
-            # FIRST-TOKEN attribution (set prefill_done_ts and prompt_tokens)
-            d_ttft_count = int(snap["ttft_count"] - prev_ttft_count)
-            d_ttft_sum = max(0.0, snap["ttft_sum"] - prev_ttft_sum)
-            if d_ttft_count > 0:
-                avg_ttft = d_ttft_sum / d_ttft_count
-                avg_prompt = (prompt_accum / d_ttft_count) if d_ttft_count else 0
-                with lock:
-                    candidates = sorted(
-                        (r for r in requests.values()
-                         if r.end_ts is None and r.prefill_done_ts is None),
-                        key=lambda x: x.start_ts,
-                    )
-                    for r in candidates[:d_ttft_count]:
-                        # place prefill_done at start_ts + avg_ttft so the
-                        # bar shows prefill phase of correct length
-                        r.prefill_done_ts = r.start_ts + avg_ttft
-                        if r.prompt_tokens is None and avg_prompt > 0:
-                            r.prompt_tokens = int(avg_prompt)
-                prompt_accum = 0.0
-
-            # GEN-TOKEN accumulation: distribute this tick's gen_total delta
-            # evenly across currently-decoding requests. d_gen is per-tick
-            # (~1s of decode), but a request runs over many ticks; without
-            # accumulating, completion would only see the last tick's slice
-            # (~10-20 tokens) instead of the full output.
-            if d_gen > 0:
-                with lock:
-                    decoding = [
-                        r for r in requests.values()
-                        if r.prefill_done_ts is not None and r.end_ts is None
-                    ]
-                    if decoding:
-                        share = d_gen / len(decoding)
-                        for r in decoding:
-                            r.gen_accum += share
-
-            # COMPLETION attribution (set end_ts, finish_reason, gen_tokens)
-            deltas = {r: int(snap[f"succ_{r}"] - prev_succ.get(r, 0))
-                      for r in REASONS}
-            total_new = sum(d for d in deltas.values() if d > 0)
-            if total_new > 0:
-                with lock:
-                    pending = sorted(
-                        (r for r in requests.values() if r.end_ts is None),
-                        key=lambda x: x.start_ts,
-                    )
-                    for reason, d in deltas.items():
-                        if d <= 0:
-                            continue
-                        for _ in range(d):
-                            if not pending:
-                                break
-                            req = pending.pop(0)
-                            req.end_ts = now
-                            req.finish_reason = reason
-                            if req.gen_tokens is None:
-                                # use this request's accumulated share
-                                if req.gen_accum > 0:
-                                    req.gen_tokens = int(req.gen_accum)
-                                elif d_gen > 0 and total_new > 0:
-                                    # fallback: request started+finished
-                                    # within a single tick, never decoded
-                                    # under concurrency
-                                    req.gen_tokens = int(d_gen / total_new)
-                            # also fill prompt_tokens if still missing
-                            # (request started+completed within one tick)
-                            if req.prompt_tokens is None and prompt_accum > 0 and total_new > 0:
-                                req.prompt_tokens = int(prompt_accum / total_new)
-
-            prev_succ = {r: snap[f"succ_{r}"] for r in REASONS}
-            prev_ttft_count = snap["ttft_count"]
-            prev_ttft_sum = snap["ttft_sum"]
-            prev_prompt_total = snap["prompt_total"]
-
-        prev_gen_total = snap["gen_total"]
-        prev_tick_ts = now
-        smoothed_tps = sum(tps_window) / max(1, len(tps_window))
-
-        gpu = read_nvidia_stats()
-        mem = read_meminfo()
-        sp = stage_progress(tailer)
-
+        tailer = monitor.tailer
         if tailer.lines_matched > 0:
             ts_status = (f"log {tailer.lines_matched}/"
                          f"{tailer.lines_seen} matched")
@@ -1194,40 +787,28 @@ def main() -> int:
                          "is --enable-log-requests on?")
 
         layout["header"].update(make_header(
-            engine, snap, now - start_ts, args.view, ts_status,
-            metrics_ok, sp,
+            engine, snap, time.time() - monitor.start_ts, args.view, ts_status,
+            monitor.metrics_ok, sp,
         ))
         layout["instruments"].update(
-            make_instruments_row(snap, gpu, mem, smoothed_tps)
+            make_instruments_row(snap, monitor.gpu, monitor.mem,
+                                 monitor.smoothed_tps,
+                                 total_width=console.size.width)
         )
 
-        with lock:
-            cutoff = now - view_duration * 2
-            stale = [k for k, v in requests.items()
-                     if v.end_ts is not None and v.end_ts < cutoff]
-            for k in stale:
-                del requests[k]
-
-            n_inflight = sum(1 for r in requests.values() if r.end_ts is None)
-            view_start = now - view_duration
-            n_completed = sum(1 for r in requests.values()
-                              if r.end_ts is not None and r.end_ts >= view_start)
-            trunc_count = sum(
-                1 for r in requests.values()
-                if r.end_ts is not None and r.gen_tokens is not None
-                and r.gen_tokens < 5 and (r.prompt_tokens or 0) > 100
-                and r.finish_reason == "stop"
-            )
+        with monitor.lock:
             term_w = console.size.width
-            gantt = make_gantt_table(requests, view_duration,
+            gantt = make_gantt_table(monitor.requests, view_duration,
                                      terminal_width=term_w)
 
         layout["body"].update(Panel(gantt, title="request timeline",
                                     title_align="left",
                                     border_style="tn.border",
                                     box=box.ROUNDED))
-        layout["footer"].update(make_footer(args.view, n_inflight, n_completed,
-                                            trunc_count, tailer.lines_seen))
+        layout["footer"].update(make_footer(
+            args.view, counts["inflight"], counts["completed_in_view"],
+            counts["trunc"], tailer.lines_seen,
+        ))
         return layout
 
     try:
@@ -1239,7 +820,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        tailer.stop()
+        monitor.stop()
     return 0
 
 

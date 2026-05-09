@@ -1,0 +1,21 @@
+[Unit]
+Description=stack-api: HTTP snapshot API for the llama-swap engine stack monitor
+After=network-online.target docker.service llama-swap.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=max
+Group=max
+SupplementaryGroups=docker
+WorkingDirectory=/home/max/llm-stack
+EnvironmentFile=/home/max/llm-stack/.env-stack-api
+ExecStart=/home/max/llm-stack/venv/bin/python3 /home/max/llm-stack/bin/stack-api
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/max/llm-stack/logs/stack-api.log
+StandardError=append:/home/max/llm-stack/logs/stack-api.err
+
+[Install]
+WantedBy=multi-user.target

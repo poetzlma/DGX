@@ -1,0 +1,161 @@
+#!/home/max/llm-stack/venv/bin/python3
+"""HTTP API exposing the same engine state as stack-tui.
+
+Endpoints:
+    GET /api/snapshot   — current engine state, cockpit gauges, header stats,
+                          last-N requests, counts.
+    GET /api/healthz    — liveness probe (no auth).
+
+Auth:
+    Bearer-token via Authorization header. Token comes from the
+    STACK_API_TOKEN environment variable (set by systemd unit's
+    EnvironmentFile). If unset, the service refuses to start.
+
+Background:
+    A monitor.tick() runs every TICK_INTERVAL_S in an asyncio executor so it
+    doesn't block aiohttp request handling.
+
+Usage:
+    STACK_API_TOKEN=... stack-api [--port 8090] [--host 0.0.0.0]
+"""
+import argparse
+import asyncio
+import logging
+import os
+import sys
+import time
+
+from aiohttp import web
+
+# Make sibling `stack/` package importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from stack.engine import discover_engines  # noqa: E402
+from stack.monitor import EngineMonitor  # noqa: E402
+
+TICK_INTERVAL_S = 1.0
+
+log = logging.getLogger("stack-api")
+
+
+def auth_required(handler):
+    """Decorator: 401 unless Authorization: Bearer <STACK_API_TOKEN>."""
+    async def wrapper(request: web.Request) -> web.Response:
+        token = request.app["token"]
+        got = request.headers.get("Authorization", "")
+        if got != f"Bearer {token}":
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return await handler(request)
+    wrapper.__name__ = handler.__name__
+    return wrapper
+
+
+@auth_required
+async def snapshot(request: web.Request) -> web.Response:
+    monitor: EngineMonitor = request.app["monitor"]
+    return web.json_response(monitor.snapshot())
+
+
+async def healthz(request: web.Request) -> web.Response:
+    monitor: EngineMonitor = request.app["monitor"]
+    return web.json_response({
+        "ok": True,
+        "engine": monitor.engine["name"],
+        "metrics_ok": monitor.metrics_ok,
+        "uptime_s": time.time() - monitor.start_ts,
+    })
+
+
+async def tick_loop(app: web.Application):
+    monitor: EngineMonitor = app["monitor"]
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            # tick() does blocking I/O (urllib + nvidia-smi); run in executor
+            await loop.run_in_executor(None, monitor.tick)
+            await asyncio.sleep(TICK_INTERVAL_S)
+    except asyncio.CancelledError:
+        return
+
+
+async def on_startup(app: web.Application):
+    app["tick_task"] = asyncio.create_task(tick_loop(app))
+
+
+async def on_cleanup(app: web.Application):
+    app["tick_task"].cancel()
+    try:
+        await app["tick_task"]
+    except asyncio.CancelledError:
+        pass
+    app["monitor"].stop()
+
+
+def build_app(monitor: EngineMonitor, token: str) -> web.Application:
+    app = web.Application()
+    app["monitor"] = monitor
+    app["token"] = token
+    app.add_routes([
+        web.get("/api/snapshot", snapshot),
+        web.get("/api/healthz", healthz),
+    ])
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="HTTP API for the llama-swap engine stack monitor."
+    )
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8090)
+    p.add_argument("--engine-port", type=int, default=None,
+                   help="vLLM engine port (defaults to first discovered)")
+    p.add_argument("--container", default=None,
+                   help="container name (defaults to first vllm-* discovered)")
+    p.add_argument("--view", default="5m",
+                   help="view duration: one of 1m/5m/15m/30m. Used only for "
+                        "FIFO request pruning + truncation counting; the API "
+                        "exposes whatever's in the monitor's request map.")
+    args = p.parse_args()
+
+    logging.basicConfig(
+        level=os.environ.get("STACK_API_LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    token = os.environ.get("STACK_API_TOKEN")
+    if not token:
+        log.error("STACK_API_TOKEN not set; refusing to start "
+                  "(an unauthenticated dashboard endpoint is a non-starter)")
+        return 2
+
+    if args.engine_port and args.container:
+        engine = {"name": args.container, "port": args.engine_port}
+    else:
+        engines = discover_engines()
+        if not engines:
+            log.error("no running vllm-* container found")
+            return 2
+        if args.engine_port:
+            engine = next((e for e in engines if e["port"] == args.engine_port),
+                          engines[0])
+        else:
+            engine = engines[0]
+        if args.container:
+            engine["name"] = args.container
+
+    view_durations = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800}
+    view_s = float(view_durations.get(args.view, 300))
+    monitor = EngineMonitor(engine, view_duration_s=view_s)
+
+    log.info("stack-api starting on %s:%d, monitoring %s :%d",
+             args.host, args.port, engine["name"], engine["port"])
+    app = build_app(monitor, token)
+    web.run_app(app, host=args.host, port=args.port,
+                access_log=None, print=None)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

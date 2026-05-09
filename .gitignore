@@ -17,7 +17,9 @@ __pycache__/
 
 # Local overrides
 .env
+.env-*
 *.local
 
 # Timestamped config backups (created when editing llama-swap.yaml etc.)
 *.bak.*
+*.bak
