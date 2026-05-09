@@ -1077,7 +1077,8 @@ def main() -> int:
                 {"running": 0, "waiting": 0, "kv": 0, "awake": 1,
                  "spec_drafted": 0, "spec_accepted": 0, "preempt": 0,
                  "succ_stop": 0, "succ_length": 0, "succ_abort": 0,
-                 "succ_error": 0, "gen_total": 0, "prompt_total": 0})
+                 "succ_error": 0, "gen_total": 0, "prompt_total": 0,
+                 "ttft_count": 0, "ttft_sum": 0.0})
 
         now = time.time()
         dt = max(0.001, now - prev_tick_ts)
