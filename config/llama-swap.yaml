@@ -220,6 +220,26 @@ models:
     checkEndpoint: /health
     ttl: 3600
 
+  # ─────────────────────────────────────────────────────────────────────
+  # DeepSeek V4 Flash via antirez/ds4 (custom C/CUDA engine) — 2026-05-12.
+  #
+  # WHY:    Alternate V4-Flash lane. ds4 is a from-scratch implementation
+  #         with compressed-KV that scales to 256k+ ctx on Spark, a built-in
+  #         persistent disk KV cache (cold/continued/evict/shutdown), and
+  #         native MTP speculative decoding. The parked llama.cpp-fork slot
+  #         (port 9011) stays as rollback.
+  # ROLE:   Planner-only lane. Decode is ~13 t/s on Spark q2-imatrix —
+  #         NOT a coding workhorse. qwen3.6-27b-fp8 still owns coding.
+  # NOTE:   Cold-load ~104s, warm ~74s (80.76 GiB tensor pages). checkEndpoint
+  #         /v1/models — ds4-server has no /health, /v1/models is in source.
+  #         Disk KV at /home/max/ds4/kv-cache, 32 GB budget, survives swap.
+  # ─────────────────────────────────────────────────────────────────────
+  deepseek-v4-flash-ds4:
+    cmd: /home/max/llm-stack/bin/launch-ds4-server.sh
+    proxy: http://127.0.0.1:9010
+    checkEndpoint: /v1/models
+    ttl: 3600
+
 groups:
   # The main group: heavy models, only one active at a time.
   # CHANGE 2026-04-24: qwen3.6-27b joined (solo NVFP4+MTP, was in qwen36 pair).
@@ -237,6 +257,7 @@ groups:
       - qwen3.6-27b-clean-dflash  # eval candidate 2026-05-08 (superseded)
       - nemotron-3-nano-omni
       - deepseek-v4-flash
+      - deepseek-v4-flash-ds4     # added 2026-05-12 (antirez ds4 engine, planner lane)
       # gemma-4-26b-a4b, minimax-m2.7, supergemma-4-26b, gemma-4-e4b removed 2026-05-02
       # qwen3.6-35b-a3b removed 2026-04-27 (now alias of qwen3.6-27b)
       # qwen3.5-35b-distill, qwen3.5-122b-nvfp4 removed 2026-04-28 (3.5 gen)
