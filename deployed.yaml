@@ -1,32 +1,50 @@
 # Deployed LLM stack manifest — source of truth for downstream proxies (LiteLLM, etc.)
 #
-# Updated: 2026-05-02
-# Gateway: http://192.168.1.12:8080/v1   (llama-swap, OpenAI-compatible)
+# Updated: 2026-05-15
+# Gateway: http://192.168.1.12:8079/v1   (log-proxy → llama-swap, OpenAI-compatible)
+#                                         underlying engine gateway: :8080 (llama-swap)
 #
 # All models share the gateway URL — clients route by `model` field.
-# Per-model ports (9008, 9011, 9012, 9013) are internal — only up while loaded.
+# llama-swap's `main` group is swap-exclusive: exactly one engine is resident
+# at a time. Per-model internal ports (9008–9016, 9010 for ds4) are internal
+# only while loaded; cold-load on swap.
 #
-# Cold-start budget: vLLM models 2–10 min on first request after swap.
-# Set request_timeout >= 600s on any client to avoid timing out a cold load.
+# Cold-start budget: vLLM models ~2–3 min on first request after swap; the
+# ds4 native binary is ~104s cold / ~74s warm. Set request_timeout >= 600s on
+# any client to avoid timing out a cold load.
 #
-# `model_list` block below is drop-in for LiteLLM proxy config.
+# `model_list` block below is drop-in for LiteLLM proxy config. All routes
+# go through log-proxy on :8079 so each request is captured to
+# ~/llm-stack/logs/proxy/{date}/{model}/ (req+resp+meta triple).
 
 gateway:
-  url: http://192.168.1.12:8080/v1
+  url: http://192.168.1.12:8079/v1
   api_key: not-needed   # LAN-only, no auth
   swap_mode: exclusive  # one model resident at a time
   request_timeout_min_s: 600
 
 deployed:
-  - name: qwen3.6-27b
-    role: production coding
-    method: NVFP4 + DFlash k=15 spec decode
-    aliases: [qwen3.6-35b-a3b, qwen3.6-27b-dflash]
+  - name: qwen3.6-27b-fp8
+    role: production coding (default qwen3.6-27b route)
+    method: Qwen official FP8 + native MTP n=2 + --reasoning-parser qwen3
+    aliases: [qwen3.6-27b, qwen3.6-35b-a3b]
+    port_internal: 9016
+    promoted: 2026-05-08
+
+  - name: qwen3.6-27b-sakamaki-mtp
+    role: rollback (was prod 2026-05-08 AM; demoted PM for </think>C truncation)
+    method: sakamakismile NVFP4 + MTP n=2
+    port_internal: 9015
+
+  - name: qwen3.6-27b-aeon-dflash
+    role: older rollback
+    method: aeon NVFP4 + DFlash k=15 spec decode
+    aliases: [qwen3.6-27b-dflash]
     port_internal: 9013
 
   - name: qwen3.6-27b-mtp
-    role: dormant rollback (MTP n=3)
-    method: NVFP4 + MTP
+    role: dormant rollback (oldest, kept 2026-04-30)
+    method: NVFP4 + MTP n=3
     port_internal: 9008
 
   - name: nemotron-3-nano-omni
@@ -35,40 +53,76 @@ deployed:
     port_internal: 9012
 
   - name: deepseek-v4-flash
-    role: long-context specialty (parallel=1)
+    role: long-context specialty (llama.cpp fork, parallel=1)
     method: IQ2_XXS, patched llama.cpp fork
     port_internal: 9011
 
+  - name: deepseek-v4-flash-ds4
+    role: planner lane (long-ctx with persistent disk KV cache, decode ~10 t/s)
+    method: antirez/ds4 native C/CUDA, IQ2_XXS imatrix + MTP n=2
+    port_internal: 9010
+    added: 2026-05-12
+
 # ─── LiteLLM model_list (drop into proxy config) ───────────────────────────
+# api_base routes through log-proxy on :8079 (NOT :8080). The log-proxy
+# transparently forwards to llama-swap and captures req+resp+meta per call.
+# Reverting any api_base to :8080 silently drops observability.
 model_list:
-  - model_name: qwen3.6-27b
+  - model_name: qwen3.6-27b-fp8
+    litellm_params:
+      model: openai/qwen3.6-27b-fp8
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-27b           # alias of -fp8 in llama-swap
     litellm_params:
       model: openai/qwen3.6-27b
-      api_base: http://192.168.1.12:8080/v1
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-27b-sakamaki-mtp
+    litellm_params:
+      model: openai/qwen3.6-27b-sakamaki-mtp
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-27b-aeon-dflash
+    litellm_params:
+      model: openai/qwen3.6-27b-aeon-dflash
+      api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
   - model_name: qwen3.6-27b-mtp
     litellm_params:
       model: openai/qwen3.6-27b-mtp
-      api_base: http://192.168.1.12:8080/v1
+      api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
   - model_name: nemotron-3-nano-omni
     litellm_params:
       model: openai/nemotron-3-nano-omni
-      api_base: http://192.168.1.12:8080/v1
+      api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
   - model_name: deepseek-v4-flash
     litellm_params:
       model: openai/deepseek-v4-flash
-      api_base: http://192.168.1.12:8080/v1
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: deepseek-v4-flash-ds4
+    litellm_params:
+      model: openai/deepseek-v4-flash-ds4
+      api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
 litellm_settings:
   request_timeout: 900   # cold-start headroom; do not lower below 600
 
-# ─── Removed models (do NOT route to these) ────────────────────────────────
+# ─── Removed / archived (do NOT route to these) ────────────────────────────
+# 2026-05-08: qwen3.6-27b-dflash promoted then demoted; renamed to -aeon-dflash
+# 2026-05-08: qwen3.6-27b-clean-dflash kept in llama-swap as eval candidate,
+#             not exposed via LiteLLM (superseded by fp8 same day)
 # 2026-05-02: gemma-4-26b-a4b, minimax-m2.7, supergemma-4-26b, gemma-4-e4b
-# 2026-04-28: qwen3.5-35b-distill, qwen3.5-122b-nvfp4
-# 2026-04-27: qwen3.6-35b-a3b (now an alias of qwen3.6-27b)
+# 2026-04-28: qwen3.5-35b-distill, qwen3.5-122b-nvfp4 (3.5 generation)
+# 2026-04-27: qwen3.6-35b-a3b (MoE, retired; name now aliases qwen3.6-27b-fp8)
