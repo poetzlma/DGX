@@ -166,9 +166,83 @@ models:
     proxy: http://127.0.0.1:9016
     checkEndpoint: /health
     ttl: 3600
+    # ─── ROLLBACK to fp8 ─────────────────────────────────────────────────
+    # If int4-dflash misbehaves in opencode coding traffic, move the
+    # `qwen3.6-27b` + `qwen3.6-35b-a3b` aliases from `qwen3.6-27b-int4-dflash`
+    # below back here. llama-swap -watch-config picks up the edit hot.
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.6-27B Intel AutoRound INT4 + native MTP n=2 — eval-only slot 2026-05-17.
+  #
+  # Initial config (no DFlash). Got 22 tok/s single-stream on Spark. Limited
+  # by GPTQ-Marlin INT4 forward latency (~104ms/forward) plus single-layer MTP
+  # speculation (mean accept 2.26, per-pos 0.75/0.51). Kept addressable for
+  # rollback and for A/B against the int4-dflash entry below.
+  # ─────────────────────────────────────────────────────────────────────
+  qwen3.6-27b-int4-autoround:
+    cmd: /home/max/llm-stack/bin/launch-vllm-27b-int4-autoround.sh
+    proxy: http://127.0.0.1:9017
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.6-27B Intel AutoRound INT4 + z-lab DFlash drafter n=4 — PROMOTED
+  # 2026-05-17 (production candidate).
+  #
+  # Was the fastest single-stream config we measured on 2026-05-17 after a
+  # 4-hour optimization pass:
+  #   - INT4 base only:               13.4 tok/s
+  #   - INT4 + MTP n=2 (Intel card):  22 tok/s   (mean accept 2.26)
+  #   - INT4 + MTP n=1:               19 tok/s
+  #   - INT4 + DFlash n=8:            27 tok/s   (accept falls past pos 4)
+  #   - INT4 + DFlash n=4:            27 tok/s   (winner — same throughput,
+  #                                                less drafter waste, simpler)
+  #   - AlphaOxO NVFP4 + DFlash n=15: 19 tok/s   (drafter overhead dominates)
+  #
+  # 50 tok/s target was NOT reached. AEON-7's published 37 tok/s on Spark
+  # depends on FlashInfer NVFP4 GEMM autotune + their proprietary abliterated
+  # weights (which we rolled back from for coding quality on 2026-05-08). On
+  # Intel's INT4 base, GPTQ-Marlin kernel latency on sm121a (~100 ms/forward)
+  # caps us in the high-20s. A drafter distilled specifically against the INT4
+  # base (not the BF16/NVFP4 base) would lift acceptance past position 4 and
+  # push toward 40+ tok/s; none such exists yet.
+  #
+  # Image: ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v3 (same image as
+  # the legacy AEON DFlash prod path — it bundles the sliding-window-attention
+  # patch DFlash needs; vanilla v0.20.1 doesn't have it).
+  # Cold start: ~6 min after first run (torch_compile + flashinfer cache hit).
+  #
+  # WHY we promoted anyway: user request "no need to switch back, put in
+  # rotation". +22% over native MTP n=2, with the kaitchup 2026-05-12
+  # accuracy-parity-with-FP8 result on INT4-AutoRound suggesting no quality
+  # regression vs the previous fp8 prod. Real-traffic A/B is still warranted.
+  # ─────────────────────────────────────────────────────────────────────
+  qwen3.6-27b-int4-dflash:
+    cmd: /home/max/llm-stack/bin/launch-vllm-27b-int4-dflash.sh
+    proxy: http://127.0.0.1:9018
+    checkEndpoint: /health
+    ttl: 3600
     aliases:
       - qwen3.6-27b
       - qwen3.6-35b-a3b
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.6-35B-A3B-NVFP4 MoE — re-eval slot 2026-05-17.
+  #
+  # RedHatAI's NVFP4 quant of the MoE. Scargall's 2026-04 Spark recipe claims
+  # 55.9 tok/s single-user / 433 tok/s at c=32, MTP n=1 with 85% accept.
+  # ~17 GB weights / 3B active params per token → bandwidth-cheap on Spark.
+  # Re-running here at user request (was rejected 2026-05-11 for coding
+  # accuracy vs 27B dense, but throughput is much higher).
+  #
+  # Image: vllm/vllm-openai:cu130-nightly (Scargall's recommended image).
+  # Port 9019. 125k+ context supported via --max-model-len 131072.
+  # ─────────────────────────────────────────────────────────────────────
+  qwen3.6-35b-a3b-nvfp4:
+    cmd: /home/max/llm-stack/bin/launch-vllm-35b-moe-nvfp4.sh
+    proxy: http://127.0.0.1:9019
+    checkEndpoint: /health
+    ttl: 3600
 
   # ─────────────────────────────────────────────────────────────────────
   # Nemotron-3-Nano-Omni-30B-A3B Reasoning NVFP4 (vLLM) — added 2026-04-29.
@@ -241,16 +315,28 @@ models:
     ttl: 3600
 
 groups:
-  # The main group: heavy models, only one active at a time.
-  # CHANGE 2026-04-24: qwen3.6-27b joined (solo NVFP4+MTP, was in qwen36 pair).
-  # At --gpu-memory-utilization 0.92 it consumes ~110 GB on its own — must
-  # swap-exclusive with the other heavies or any request for a main-group
-  # model would OOM. Cold-start ~2-3 min in either direction.
+  # CO-RESIDENT QWEN GROUP (2026-05-17) — both engines stay loaded simultaneously.
+  # Dense INT4+DFlash @ 120k c=1 (~56 GB) + MoE NVFP4 @ 80k c=2 (~45 GB) = ~101 GB.
+  # Headroom ~14 GB for OS / cudagraph slack. NOT swap-exclusive: both can serve
+  # in parallel via separate routes (qwen3.6-27b → dense, qwen3.6-35b-a3b-nvfp4
+  # → MoE). Other heavy models in `main` below remain swap-exclusive; loading
+  # one will OOM if these two are also loaded — user must manage explicitly.
+  qwen-coresident:
+    swap: false
+    exclusive: false
+    members:
+      - qwen3.6-27b-int4-dflash
+      - qwen3.6-35b-a3b-nvfp4
+
+  # The main group: heavy models, only one active at a time. Co-resident qwen
+  # group above is NOT cross-group exclusive — beware loading these while the
+  # qwen pair is resident (~14 GB free, each main member needs ≥50 GB).
   main:
     swap: true
     exclusive: true
     members:
-      - qwen3.6-27b-fp8           # PROMOTED 2026-05-08 — production (Qwen official FP8)
+      - qwen3.6-27b-fp8           # rollback 2026-05-17 (was prod 2026-05-08; Qwen official FP8 + MTP n=3)
+      - qwen3.6-27b-int4-autoround # eval 2026-05-17 (Intel INT4 + native MTP n=2, 22 tok/s)
       - qwen3.6-27b-sakamaki-mtp  # rollback 2026-05-08 (was prod, truncation bug)
       - qwen3.6-27b-aeon-dflash   # rollback 2026-05-08 (older)
       - qwen3.6-27b-mtp           # dormant rollback slot 2026-04-30

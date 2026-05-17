@@ -1,17 +1,25 @@
 # Deployed LLM stack manifest — source of truth for downstream proxies (LiteLLM, etc.)
 #
-# Updated: 2026-05-15
+# Updated: 2026-05-17
 # Gateway: http://192.168.1.12:8079/v1   (log-proxy → llama-swap, OpenAI-compatible)
 #                                         underlying engine gateway: :8080 (llama-swap)
 #
 # All models share the gateway URL — clients route by `model` field.
-# llama-swap's `main` group is swap-exclusive: exactly one engine is resident
-# at a time. Per-model internal ports (9008–9016, 9010 for ds4) are internal
-# only while loaded; cold-load on swap.
 #
-# Cold-start budget: vLLM models ~2–3 min on first request after swap; the
-# ds4 native binary is ~104s cold / ~74s warm. Set request_timeout >= 600s on
-# any client to avoid timing out a cold load.
+# 2026-05-17 routing change: the two production Qwen3.6 engines (dense
+# INT4+DFlash and MoE NVFP4) are now CO-RESIDENT, not swap-exclusive. Both
+# stay loaded on the GPU (~104 GB / 119 GB) and serve their own routes in
+# parallel. The rest of `main` (sakamaki / aeon / mtp rollbacks, nemotron,
+# both deepseek lanes) remain swap-exclusive with each other, but loading
+# any of them while the qwen pair is resident will OOM — only ~15 GB free.
+# Run `docker rm -f vllm-qwen-27b-int4-dflash` (or the MoE container) to
+# free memory before triggering a swap-exclusive engine.
+#
+# Per-model internal ports (9008–9019) are internal-only while loaded.
+#
+# Cold-start budget: vLLM models ~2–6 min on first request after swap;
+# the ds4 native binary is ~104s cold / ~74s warm. Set request_timeout >=
+# 600s on any client to avoid timing out a cold load.
 #
 # `model_list` block below is drop-in for LiteLLM proxy config. All routes
 # go through log-proxy on :8079 so each request is captured to
@@ -20,16 +28,46 @@
 gateway:
   url: http://192.168.1.12:8079/v1
   api_key: not-needed   # LAN-only, no auth
-  swap_mode: exclusive  # one model resident at a time
+  swap_mode: hybrid     # dense+MoE co-resident; rest swap-exclusive
   request_timeout_min_s: 600
 
 deployed:
-  - name: qwen3.6-27b-fp8
+  # ─── co-resident pair (both always loaded since 2026-05-17) ──────────
+  - name: qwen3.6-27b-int4-dflash
     role: production coding (default qwen3.6-27b route)
-    method: Qwen official FP8 + native MTP n=2 + --reasoning-parser qwen3
+    method: Intel/Qwen3.6-27B-int4-AutoRound + z-lab DFlash drafter n=4
+    image: ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v4
     aliases: [qwen3.6-27b, qwen3.6-35b-a3b]
+    port_internal: 9018
+    promoted: 2026-05-17
+    coresident_group: qwen-coresident
+    config: max-model-len=120000 max-num-seqs=1 gpu-mem-util=0.50
+    measured_single_stream_tok_s: 29   # +80% over previous fp8+MTP n=3 prod
+
+  - name: qwen3.6-35b-a3b-nvfp4
+    role: throughput lane (MoE, opt-in by explicit name)
+    method: RedHatAI/Qwen3.6-35B-A3B-NVFP4 + native MTP n=1 (Scargall recipe)
+    image: vllm/vllm-openai:cu130-nightly
+    port_internal: 9019
+    added: 2026-05-17
+    coresident_group: qwen-coresident
+    config: max-model-len=80000 max-num-seqs=2 gpu-mem-util=0.40
+    measured_single_stream_tok_s: 56   # c=1 short input; 101 agg at c=2
+
+  # ─── swap-exclusive (main group; only one of these at a time, AND
+  # neither qwen-coresident member loaded) ─────────────────────────────
+  - name: qwen3.6-27b-fp8
+    role: rollback (was prod 2026-05-08 → 2026-05-17)
+    method: Qwen official FP8 + native MTP n=3 + --reasoning-parser qwen3
     port_internal: 9016
-    promoted: 2026-05-08
+    demoted: 2026-05-17
+
+  - name: qwen3.6-27b-int4-autoround
+    role: eval slot (Intel INT4 + native MTP n=2, no DFlash)
+    method: Intel/Qwen3.6-27B-int4-AutoRound + qwen3_next_mtp n=2
+    port_internal: 9017
+    added: 2026-05-17
+    measured_single_stream_tok_s: 22
 
   - name: qwen3.6-27b-sakamaki-mtp
     role: rollback (was prod 2026-05-08 AM; demoted PM for </think>C truncation)
@@ -68,15 +106,33 @@ deployed:
 # transparently forwards to llama-swap and captures req+resp+meta per call.
 # Reverting any api_base to :8080 silently drops observability.
 model_list:
-  - model_name: qwen3.6-27b-fp8
+  - model_name: qwen3.6-27b           # → int4-dflash (co-resident prod, 2026-05-17)
+    litellm_params:
+      model: openai/qwen3.6-27b
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-27b-int4-dflash
+    litellm_params:
+      model: openai/qwen3.6-27b-int4-dflash
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-35b-a3b-nvfp4   # MoE throughput lane, co-resident with dense
+    litellm_params:
+      model: openai/qwen3.6-35b-a3b-nvfp4
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-27b-fp8         # rollback (demoted 2026-05-17)
     litellm_params:
       model: openai/qwen3.6-27b-fp8
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
-  - model_name: qwen3.6-27b           # alias of -fp8 in llama-swap
+  - model_name: qwen3.6-27b-int4-autoround
     litellm_params:
-      model: openai/qwen3.6-27b
+      model: openai/qwen3.6-27b-int4-autoround
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
@@ -120,9 +176,11 @@ litellm_settings:
   request_timeout: 900   # cold-start headroom; do not lower below 600
 
 # ─── Removed / archived (do NOT route to these) ────────────────────────────
+# 2026-05-17: qwen3.6-27b alias moved from -fp8 to -int4-dflash (Intel INT4 + DFlash n=4)
+# 2026-05-17: qwen3.6-35b-a3b-nvfp4 added (RedHatAI MoE NVFP4, re-eval after 05-11 rejection)
 # 2026-05-08: qwen3.6-27b-dflash promoted then demoted; renamed to -aeon-dflash
 # 2026-05-08: qwen3.6-27b-clean-dflash kept in llama-swap as eval candidate,
 #             not exposed via LiteLLM (superseded by fp8 same day)
 # 2026-05-02: gemma-4-26b-a4b, minimax-m2.7, supergemma-4-26b, gemma-4-e4b
 # 2026-04-28: qwen3.5-35b-distill, qwen3.5-122b-nvfp4 (3.5 generation)
-# 2026-04-27: qwen3.6-35b-a3b (MoE, retired; name now aliases qwen3.6-27b-fp8)
+# 2026-04-27: qwen3.6-35b-a3b (MoE name; now aliases qwen3.6-27b-int4-dflash)

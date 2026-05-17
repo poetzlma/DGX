@@ -26,7 +26,8 @@ m = import_module("bench-deep")
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "qwen3.6-27b-mtp"
 TARGET = int(sys.argv[2]) if len(sys.argv) > 2 else 100_000
 LEVELS = [int(x) for x in (sys.argv[3:] or ["1", "3", "5", "8"])]
-OUT_TOKENS = 256
+import os
+OUT_TOKENS = int(os.environ.get("BENCH_OUT_TOKENS", "256"))
 
 # Each filler block is ~370 tokens; tune repeats to hit TARGET.
 TOKENS_PER_FILLER = 370
