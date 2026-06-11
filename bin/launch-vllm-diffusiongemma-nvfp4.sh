@@ -50,7 +50,7 @@ exec docker run --name vllm-diffusiongemma-nvfp4 \
   --attention-backend TRITON_ATTN \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.30 \
-  --max-model-len 32768 \
+  --max-model-len 131072 \
   --max-num-seqs 4 \
   --enable-auto-tool-choice \
   --tool-call-parser gemma4 \

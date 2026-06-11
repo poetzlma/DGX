@@ -62,7 +62,7 @@ deployed:
     image: vllm/vllm-openai:gemma-aarch64-cu130   # day-0 2026-06-10 gemma build
     port_internal: 9021
     added: 2026-06-11
-    config: max-model-len=32768 max-num-seqs=4 gpu-mem-util=0.30 attn=TRITON_ATTN
+    config: max-model-len=131072 max-num-seqs=4 gpu-mem-util=0.30 attn=TRITON_ATTN
     measured_single_stream_tok_s: 116   # short answer; 218 tok/s on long thinking-mode gen
     note: quality < AR Gemma 4 per Google; speed/breadth lane, not coding-quality
 
