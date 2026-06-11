@@ -45,7 +45,7 @@ exec docker run --name vllm-qwen-35b-moe-nvfp4 \
   -e ENABLE_NVFP4_SM100=0 \
   -e VLLM_USE_FLASHINFER_SAMPLER=1 \
   -e VLLM_ENGINE_READY_TIMEOUT_S=1800 \
-  vllm/vllm-openai:cu130-nightly \
+  vllm/vllm-openai:cu130-nightly-20260423 \
   RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
   --served-model-name qwen3.6-35b-a3b-nvfp4 \
   --host 0.0.0.0 --port 9019 \

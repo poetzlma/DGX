@@ -56,6 +56,16 @@ deployed:
 
   # ─── swap-exclusive (main group; only one of these at a time, AND
   # neither qwen-coresident member loaded) ─────────────────────────────
+  - name: diffusiongemma-26b
+    role: eval slot — non-coding / speed lane (Google dLLM, added 2026-06-11)
+    method: nvidia/diffusiongemma-26B-A4B-it-NVFP4 (ModelOpt NVFP4), diffusion runner-v2
+    image: vllm/vllm-openai:gemma-aarch64-cu130   # day-0 2026-06-10 gemma build
+    port_internal: 9021
+    added: 2026-06-11
+    config: max-model-len=32768 max-num-seqs=4 gpu-mem-util=0.30 attn=TRITON_ATTN
+    measured_single_stream_tok_s: 116   # short answer; 218 tok/s on long thinking-mode gen
+    note: quality < AR Gemma 4 per Google; speed/breadth lane, not coding-quality
+
   - name: qwen3.6-27b-fp8
     role: rollback (was prod 2026-05-08 → 2026-05-17)
     method: Qwen official FP8 + native MTP n=3 + --reasoning-parser qwen3
@@ -151,6 +161,12 @@ model_list:
   - model_name: qwen3.6-27b-mtp
     litellm_params:
       model: openai/qwen3.6-27b-mtp
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: diffusiongemma-26b
+    litellm_params:
+      model: openai/diffusiongemma-26b
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
