@@ -51,7 +51,13 @@ export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=1024
 # bypassed. Five live curl queries with MTP+Q4 enabled steadied at ~13.8 t/s
 # (~= old prod MTP+Q8). Dropping MTP frees Q4 and gets ~18 t/s decode.
 export DS4_CUDA_Q4_DECODE=1
-exec /home/max/ds4-rebase/ds4-server \
+# 2026-06-27: ROLLED BACK from the rebase binary (~/ds4-rebase, commit 65f9552).
+# The rebase gained ~3 t/s decode but lost the ngc-shj host-register prefill
+# fallback and ignores DS4_CUDA_Q8_F16_CACHE_RESERVE_MB, latching the q8 slow
+# path: ~97 t/s prefill vs this fork's ~371 t/s (verified live: 10.9k-tok prompt
+# 111.6s -> 29.3s). On 80k-tok prompts that was ~14-min TTFT -> all reqs aborted.
+# Do NOT repoint to ds4-rebase until that binary honors the Q8 reserve override.
+exec /home/max/ds4-q4/ds4-server \
   --cuda \
   --host 127.0.0.1 --port 9010 \
   --model /home/max/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
