@@ -1,0 +1,18 @@
+# Cosmos3 deploy config — guardrails DISABLED (LAN eval lane).
+#
+# Mirrors the image's auto-loaded vllm_omni/deploy/cosmos3_omni.yaml, plus a
+# per-stage model_config.guardrails=false so vLLM-Omni never eager-loads the
+# Cosmos safety checker — which otherwise fetches the GATED
+# nvidia/Cosmos-1.0-Guardrail repo at startup and 403s without license access.
+# Passed to the launcher via --deploy-config. See memory project_cosmos3_serving.
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: Cosmos3OmniDiffusersPipeline
+    model_config:
+      guardrails: false
+      offload_guardrail_models: false
