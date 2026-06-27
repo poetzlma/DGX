@@ -30,6 +30,7 @@ exec docker run --name vllm-qwen-27b-fp8 \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -p 0.0.0.0:9016:9016 \
   -v /home/max/.cache/huggingface:/root/.cache/huggingface \
+  -v /home/max/llm-stack/etc:/llm-stack-etc:ro \
   -e HF_TOKEN_FILE=/root/.cache/huggingface/token \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   -e TORCH_CUDA_ARCH_LIST=12.1a \
@@ -49,11 +50,11 @@ exec docker run --name vllm-qwen-27b-fp8 \
   --tensor-parallel-size 1 \
   --dtype auto \
   --kv-cache-dtype fp8 \
-  --max-model-len 200000 \
-  --max-num-seqs 2 \
+  --max-model-len 131072 \
+  --max-num-seqs 3 \
   --max-num-batched-tokens 32768 \
-  --max-cudagraph-capture-size 256 \
-  --gpu-memory-utilization 0.85 \
+  --max-cudagraph-capture-size 16 \
+  --gpu-memory-utilization 0.80 \
   --async-scheduling \
   -O3 \
   --enable-chunked-prefill \
@@ -66,5 +67,6 @@ exec docker run --name vllm-qwen-27b-fp8 \
   --language-model-only \
   --generation-config vllm \
   --enable-log-requests \
+  --chat-template /llm-stack-etc/qwen3.6-chat-template-froggeric.jinja \
   --default-chat-template-kwargs '{"preserve_thinking": true}' \
   --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":3}'

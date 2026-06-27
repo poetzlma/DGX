@@ -14,13 +14,16 @@ set -euo pipefail
 
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build/bin/llama-server}"
 MODEL="$HOME/models/ornith-1.0-35b/ornith-1.0-35b-Q4_K_M.gguf"
-CTX="${ORNITH_CTX:-32768}"
+# Total ctx shared across PARALLEL slots: 393216 = 3 slots x 131072. So c=3 @ 131k.
+CTX="${ORNITH_CTX:-393216}"
+PARALLEL="${ORNITH_PARALLEL:-3}"
 
 exec "$LLAMA_SERVER" \
   --host 127.0.0.1 --port 9022 \
   --alias ornith-1.0-35b \
   -m "$MODEL" \
   --ctx-size "$CTX" \
+  --parallel "$PARALLEL" \
   --n-gpu-layers 99 \
   -fa on \
   -b 2048 -ub 512 \

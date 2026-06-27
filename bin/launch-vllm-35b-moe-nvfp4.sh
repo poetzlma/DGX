@@ -52,9 +52,9 @@ exec docker run --name vllm-qwen-35b-moe-nvfp4 \
   --quantization compressed-tensors \
   --moe-backend flashinfer_cutlass \
   --tensor-parallel-size 1 \
-  --gpu-memory-utilization 0.40 \
-  --max-model-len 80000 \
-  --max-num-seqs 2 \
+  --gpu-memory-utilization 0.70 \
+  --max-model-len 131072 \
+  --max-num-seqs 3 \
   --max-num-batched-tokens 32768 \
   --kv-cache-dtype fp8_e4m3 \
   --enable-chunked-prefill \

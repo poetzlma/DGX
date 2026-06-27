@@ -19,7 +19,20 @@ Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`b
 | `diffusiongemma-26b` | speed / non-coding | 142 | 131 k | 50 GB | vLLM | `launch-vllm-diffusiongemma-nvfp4.sh` |
 | `deepseek-v4-flash-ds4` | long-context planner | 21 | 131 k | 22 GB | ds4 | `launch-ds4-server.sh` |
 
-¹ Ornith ctx is `ORNITH_CTX`-tunable (default 32 k, native 262 k). &nbsp; ² **Thinking model** — output goes to `reasoning_content`; give generous `max_tokens` or `content` returns empty. &nbsp; ds4 decode does **not** scale with concurrency (run one request at a time). Max-ctx is the launcher's configured limit; several vLLM launchers still carry the old co-resident mem-util splits and can be raised now that they load solo.
+¹ Ornith ctx is `ORNITH_CTX`/`ORNITH_PARALLEL`-tunable (now 3 slots × 131 k). &nbsp; ² **Thinking model** — output goes to `reasoning_content`; give generous `max_tokens` or `content` returns empty. &nbsp; tok/s / mem above are the 2026-06-27 single-stream sweep (pre-retune).
+
+> **Concurrency (2026-06-27 retune):** every model **except `int4-dflash` and `ds4`** is now tuned to serve **c=1/2/3 at 131 k context** (`qwopus` is c=2 — its DFlash path forces heavier bf16 KV). `int4-dflash` stays single-stream (it's the prefill-bound coding default) and `ds4` stays single-stream (its decode doesn't scale with concurrency). See [decision #21](#decision-log).
+
+### What each model is for
+
+- **`qwen3.6-27b-int4-dflash`** — Alibaba's **Qwen3.6-27B dense**, the coding workhorse; on our own evals it beat the 35B-A3B MoE by ≥4 pts SWE-bench, so it's the default. Intel's AutoRound **INT4** keeps quality within noise of FP8 while halving the weight bandwidth that bottlenecks GB10, and the z-lab **DFlash** speculative drafter pushes it to ~41 tok/s. Reach for it for everyday coding and agentic/tool-use work.
+- **`qwen3.6-35b-a3b-nvfp4`** — Qwen's **sparse MoE** (35B total, ~3B active/token), so it sidesteps the bandwidth wall and stays cheap under load. RedHat's NVFP4 quant + native MTP give 61 tok/s single-stream and the best concurrency/long-ctx throughput in the stack. Use it when you want speed and parallelism over the dense model's last few quality points.
+- **`qwen3.6-27b-fp8`** — the **official Qwen FP8** build, "near-lossless" per the card with no community-quant noise. It's the ground-truth reference: when an INT4/NVFP4 result looks off, A/B against this. Use it for quality baselining and canonical Qwen3.6 behavior.
+- **`qwopus3.6-27b-int4-dflash`** — Jackrong's **Qwopus**, a Qwen3.6-27B fine-tune **distilled on Claude-Opus reasoning traces**, so it keeps Qwen's coding base but reasons in a more Opus-like style. Same INT4+DFlash speed path as the default. Use it for coding/reasoning when you want Opus-flavored chains of thought.
+- **`ornith-1.0-35b`** 🆕 — DeepReinforce's **Ornith-1.0** (MIT), a new agentic-coding MoE (35B/3B-active) that **writes its own RL training scaffold**; it scored **64.2 on Terminal-Bench 2.1, beating Qwen3.5-397B** (10× its size). Thinking model, and the fastest coding model here at 77 tok/s. The most interesting new model to pit against the Qwen incumbents on agentic/terminal tasks.
+- **`diffusiongemma-26b`** — Google DeepMind's first **diffusion LLM**, which denoises 256-token blocks instead of decoding token-by-token, hitting ~142 tok/s (fastest in the stack). Google notes quality is below autoregressive Gemma 4, so it's a **speed lane, not a coding lane**. Use it for fast non-coding work — summaries, drafts, classification — where latency beats peak quality.
+- **`nemotron-3-nano-omni`** — NVIDIA's **multimodal omni** model, a Mamba2-Transformer hybrid MoE with vision + audio encoders handling **text, image, audio, and video** in one model. It's the only multimodal option here — use it for anything the text-only coders can't see or hear.
+- **`deepseek-v4-flash-ds4`** — DeepSeek's **V4-Flash**, whose multi-head-latent / compressed-KV attention scales to **256 k+ context cheaply**, run on the from-scratch antirez/ds4 C/CUDA engine with persistent disk-KV. Decode is slow (~21 tok/s) and doesn't parallelize, so it's a **planner, not a chat workhorse**. Use it for long-context planning/reasoning over whole codebases or long documents.
 
 ### Call it
 
@@ -434,7 +447,7 @@ for model in \
 done
 ```
 
-### 20. ds4 best-config A/B/C — our custom-Q4 decode wins; rebased onto mainline *(2026-06-27)*
+### 30. ds4 best-config A/B/C — our custom-Q4 decode wins; rebased onto mainline *(2026-06-27)*
 
 Searched for the fastest ds4 config for DeepSeek-V4-Flash on GB10. Ran an A/B/C concurrency matrix (`bin/bench-ds4-matrix.py`, c=1/2/4, 3-run median, idle 90 s, GB10 allocator confounder):
 
@@ -547,6 +560,21 @@ Other notable flags (full set in the launcher):
 - `--kv-cache-dtype fp8`, `--tool-call-parser qwen3_coder`, `--video-pruning-rate 0.5`.
 
 Cold start ~150 s steady state (warm HF cache).
+
+### 31. Concurrency retune — c=1/2/3 @ 131 k for the swap models *(2026-06-27)*
+
+The launcher contexts/concurrency were co-resident-era fossils (`gpu-util 0.40–0.70`, reduced `--max-model-len`, throughput-tuned `--max-num-seqs`). Solo + swap-exclusive, that left 30–70 GB unused on most models. Retuned every model **except `int4-dflash` and `ds4`** to serve **c=1/2/3 at 131 k**, sized by KV math against ~113 GB usable (weights + `seqs × 131 072 × KV/token`):
+
+| Model | Before (len/seqs/util) | After | KV/tok | Max c @ 131 k |
+|---|---|---|---|:---:|
+| `qwen3.6-35b-a3b-nvfp4` | 80 k / 2 / 0.40 | 131 k / 3 / 0.70 | 145 KB fp8 | c=3 |
+| `qwen3.6-27b-fp8` | 200 k / 2 / 0.70 | 131 k / 3 / 0.80 | 145 KB fp8 | c=3 |
+| `qwopus3.6-27b-int4-dflash` | 128 k / 8 / 0.85 | 131 k / **2** / 0.85 | 290 KB bf16 | **c=2** |
+| `nemotron-3-nano-omni` | 131 k / 8 / 0.65 | 131 k / 8 / 0.72 | 145 KB fp8 | c≥3 (util bump for headroom) |
+| `ornith-1.0-35b` | 32 k / 1 slot | `--ctx 393216 --parallel 3` | 125 KB f16 | c=3 |
+| `diffusiongemma-26b` | unchanged (131 k / 4 / 0.30) | — | diffusion | c=4 (seqs=4 card-mandatory) |
+
+Excluded by design: **`int4-dflash`** stays single-stream — it's the prefill-bound coding default, and a 131 k prompt already costs ~150 s TTFT, so concurrency would compound that. **`ds4`** stays single-stream — its decode is bandwidth-bound and does **not** scale with concurrency (measured: flat aggregate at c=1/2/4, see §30). **`qwopus` is c=2 only**: its DFlash path forces FLASH_ATTN, which can't do fp8 KV, so each stream's bf16 KV is ~2× heavier and c=3 wouldn't fit. Values are KV-math estimates (±10 % vs vLLM's real block accounting) — verify each loads at the target before trusting c=3 under load.
 
 ---
 

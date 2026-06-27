@@ -50,7 +50,7 @@ exec docker run --name vllm-nemotron-omni \
   --max-num-batched-tokens 8192 \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
-  --gpu-memory-utilization 0.65 \
+  --gpu-memory-utilization 0.72 \
   --video-pruning-rate 0.5 \
   --allowed-local-media-path /home/max \
   --media-io-kwargs '{"video": {"fps": 2, "num_frames": 256}}' \

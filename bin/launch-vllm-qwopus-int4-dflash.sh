@@ -44,8 +44,8 @@ exec docker run --name vllm-qwopus-int4-dflash \
       --tensor-parallel-size 1 \
       --dtype auto \
       --kv-cache-dtype auto \
-      --max-model-len 128000 \
-      --max-num-seqs 8 \
+      --max-model-len 131072 \
+      --max-num-seqs 2 \
       --max-num-batched-tokens 32768 \
       --gpu-memory-utilization 0.85 \
       --enable-chunked-prefill \
