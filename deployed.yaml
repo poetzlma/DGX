@@ -121,6 +121,18 @@ model_list:
 
   # retired 2026-06-27: qwen3.6-27b-{int4-autoround,sakamaki-mtp,aeon-dflash,mtp}
 
+  - model_name: ornith-1.0-35b          # eval 2026-06-27 (DeepReinforce 35B-A3B MoE, llama.cpp)
+    litellm_params:
+      model: openai/ornith-1.0-35b
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwopus3.6-27b-int4-dflash  # eval (Opus-distill 27B, INT4+DFlash)
+    litellm_params:
+      model: openai/qwopus3.6-27b-int4-dflash
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
   - model_name: diffusiongemma-26b
     litellm_params:
       model: openai/diffusiongemma-26b
