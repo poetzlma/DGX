@@ -93,6 +93,16 @@ deployed:
     measured_single_stream_tok_s: 116   # short answer; 218 tok/s on long thinking-mode gen
     note: quality < AR Gemma 4 per Google; speed/breadth lane, not coding-quality
 
+  - name: cosmos3-nano-omni
+    role: eval — NVIDIA Cosmos3-Nano omni world model (text→image/video/audio generation)
+    method: nvidia/Cosmos3-Nano (~15B omni) via vLLM-Omni; local ~/cosmos3/models/Cosmos3-Nano served
+    image: vllm/vllm-omni:cosmos3-aarch64   # Cosmos3 vLLM-Omni build for GB10/aarch64
+    port_internal: 9023
+    added: 2026-06-27
+    endpoints: [/v1/videos, /v1/videos/sync, /v1/images/generations]   # generation model — NOT /v1/chat/completions
+    config: --omni --trust-remote-code   # gen model: no token context_window; fits ~30 GB BF16
+    note: Cosmos3-Super (64B) is multi-GPU-only and stays standalone in ~/cosmos3 (not swappable on one GB10)
+
   - name: nemotron-3-nano-omni
     role: multimodal omni (text/image/audio/video)
     method: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 (Mamba2-Transformer hybrid MoE)
@@ -168,6 +178,14 @@ model_list:
       model: openai/nemotron-3-nano-omni
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+
+  - model_name: cosmos3-nano-omni       # eval 2026-06-27 (NVIDIA Cosmos3-Nano omni — image/video GENERATION, not chat)
+    litellm_params:
+      model: openai/cosmos3-nano-omni
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+    model_info:
+      mode: image_generation            # routes /v1/images/generations; video via /v1/videos passthrough on the gateway
 
   # retired 2026-06-27: deepseek-v4-flash (old llama.cpp fork) — use -ds4
 
