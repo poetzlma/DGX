@@ -21,8 +21,11 @@
 #     if interactive UX matters more than parsed reasoning_content fields.
 #   - NO --attention-backend FLASHINFER: hybrid Mamba2 path may not be covered;
 #     let vLLM pick the default (likely TRITON_ATTN for the SSM blocks).
-#   - --allowed-local-media-path /home/max: enables local file:// URLs for
-#     multimodal without exposing the whole FS.
+#   - --allowed-local-media-path /home/max/llm-stack/media: enables local
+#     file:// URLs for multimodal, scoped to a dedicated empty media dir.
+#     Do NOT point this at /home/max — an unauthed multimodal request could
+#     then read file:///home/max/.cache/huggingface/token, ~/.ssh keys, etc.
+#     Only this dir is bind-mounted into the container (read-only).
 #   - Image tag cu130-nightly-omni: derived from cu130-nightly with av/soundfile/
 #     librosa pre-installed (vLLM caches a PlaceholderModule for soundfile at
 #     startup; hot-install after the fact errors with PlaceholderModule
@@ -36,7 +39,7 @@ exec docker run --name vllm-nemotron-omni \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -p 0.0.0.0:9012:9012 \
   -v /home/max/.cache/huggingface:/root/.cache/huggingface \
-  -v /home/max:/home/max:ro \
+  -v /home/max/llm-stack/media:/home/max/llm-stack/media:ro \
   -e HF_TOKEN_FILE=/root/.cache/huggingface/token \
   -e VLLM_ENGINE_READY_TIMEOUT_S=1800 \
   -e VLLM_ENABLE_CUDA_COMPATIBILITY=0 \
@@ -52,7 +55,7 @@ exec docker run --name vllm-nemotron-omni \
   --enable-prefix-caching \
   --gpu-memory-utilization 0.72 \
   --video-pruning-rate 0.5 \
-  --allowed-local-media-path /home/max \
+  --allowed-local-media-path /home/max/llm-stack/media \
   --media-io-kwargs '{"video": {"fps": 2, "num_frames": 256}}' \
   --reasoning-parser nemotron_v3 \
   --enable-auto-tool-choice \
