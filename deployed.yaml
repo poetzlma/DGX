@@ -14,6 +14,11 @@
 # no-OOM), EXCEPT the two deliberately-narrow lanes: int4-dflash (120k/c=1,
 # the DFlash drafter lane) and ds4 (131k planner, decode-bound).
 #
+# CODING-HARNESS CONTRACT: each engine below carries `context_window:` — the
+# per-request token window the downstream coding server must configure. Read
+# THAT field, not `config:`. For llama.cpp engines (ornith) it already accounts
+# for the --parallel slot split, so context_window != the engine's total ctx.
+#
 # Per-model internal ports (9010–9022) are internal-only while loaded.
 #
 # Cold-start budget: vLLM models ~2–6 min on first request after swap;
@@ -40,6 +45,7 @@ deployed:
     image: ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v4
     aliases: [qwen3.6-27b, qwen3.6-35b-a3b]
     port_internal: 9018
+    context_window: 120000   # per-request window for the coding harness
     config: max-model-len=120000 max-num-seqs=1 gpu-mem-util=0.50   # narrow by design (DFlash lane)
     measured_single_stream_tok_s: 29   # +80% over previous fp8+MTP n=3 prod
 
@@ -48,6 +54,7 @@ deployed:
     method: RedHatAI/Qwen3.6-35B-A3B-NVFP4 + native MTP n=1 (Scargall recipe)
     image: vllm/vllm-openai:cu130-nightly
     port_internal: 9019
+    context_window: 131072   # per-request window for the coding harness
     config: max-model-len=131072 max-num-seqs=3 gpu-mem-util=0.70   # retuned 2026-06-27 (was 80k/2/0.40)
     measured_single_stream_tok_s: 56   # c=1 short input; 101 agg at c=2
 
@@ -55,6 +62,7 @@ deployed:
     role: rollback (was prod 2026-05-08 → 2026-05-17)
     method: Qwen official FP8 + native MTP n=3 + --reasoning-parser qwen3
     port_internal: 9016
+    context_window: 131072   # per-request window for the coding harness
     config: max-model-len=131072 max-num-seqs=3 gpu-mem-util=0.80   # retuned 2026-06-27 (was 200k/2/0.70)
 
   - name: qwopus3.6-27b-int4-dflash
@@ -63,6 +71,7 @@ deployed:
     image: ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v4
     port_internal: 9020
     added: 2026-06-27
+    context_window: 131072   # per-request window for the coding harness
     config: max-model-len=131072 max-num-seqs=2 gpu-mem-util=0.85   # c=2 (bf16 KV ceiling)
 
   - name: ornith-1.0-35b
@@ -71,13 +80,15 @@ deployed:
     image: native (~/llama.cpp/build/bin/llama-server)
     port_internal: 9022
     added: 2026-06-27
-    config: ctx=393216 parallel=3   # 3 slots x 131072 = c=3 @ 131k
+    context_window: 131072   # per-request window for the coding harness — NOT the 393216 engine total (llama.cpp splits ctx across the 3 parallel slots)
+    config: ctx=393216 parallel=3   # engine total: 3 slots x 131072 = c=3 @ 131k
 
   - name: diffusiongemma-26b
     role: eval — non-coding / speed lane (Google dLLM, added 2026-06-11)
     method: nvidia/diffusiongemma-26B-A4B-it-NVFP4 (ModelOpt NVFP4), diffusion runner-v2
     image: vllm/vllm-openai:gemma-aarch64-cu130   # day-0 2026-06-10 gemma build
     port_internal: 9021
+    context_window: 131072   # per-request window for the coding harness
     config: max-model-len=131072 max-num-seqs=4 gpu-mem-util=0.30 attn=TRITON_ATTN
     measured_single_stream_tok_s: 116   # short answer; 218 tok/s on long thinking-mode gen
     note: quality < AR Gemma 4 per Google; speed/breadth lane, not coding-quality
@@ -87,6 +98,7 @@ deployed:
     method: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 (Mamba2-Transformer hybrid MoE)
     image: vllm/vllm-openai:cu130-nightly-omni
     port_internal: 9012
+    context_window: 131072   # per-request window for the coding harness
     config: max-model-len=131072 max-num-seqs=8 gpu-mem-util=0.72   # retuned 2026-06-27 (util 0.65→0.72)
     measured_agg_tok_s: 383   # c=8 peak
 
@@ -95,6 +107,7 @@ deployed:
     method: antirez/ds4 native C/CUDA (mainline-rebased 2026-06-27), IQ2_XXS imatrix + custom Q4 decode
     port_internal: 9010
     added: 2026-05-12
+    context_window: 131072   # per-request window for the coding harness
     config: ctx=131072   # decode ~21 t/s (custom Q4 dense decode; MTP off)
 
   # RETIRED 2026-06-27: qwen3.6-27b-{int4-autoround,sakamaki-mtp,aeon-dflash,mtp}
