@@ -38,6 +38,7 @@ exec docker run --name vllm-qwen-27b-clean-dflash \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -p 0.0.0.0:9014:9014 \
   -v /home/max/.cache/huggingface:/root/.cache/huggingface \
+  -v /home/max/llm-stack/etc:/llm-stack-etc:ro \
   -e HF_TOKEN_FILE=/root/.cache/huggingface/token \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   -e TORCH_CUDA_ARCH_LIST=12.1a \
@@ -53,6 +54,7 @@ exec docker run --name vllm-qwen-27b-clean-dflash \
   ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v3 \
   bash -c '
     exec vllm serve AlphaOxO/Qwen3.6-27B-NVFP4 \
+      --chat-template /llm-stack-etc/qwen3.6-chat-template-froggeric.jinja \
       --served-model-name qwen3.6-27b-clean-dflash \
       --host 0.0.0.0 --port 9014 \
       --tensor-parallel-size 1 \
