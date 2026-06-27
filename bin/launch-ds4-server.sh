@@ -31,12 +31,30 @@
 #         - Disk KV at /home/max/ds4/kv-cache, 32 GB budget. Persists
 #           across restarts and llama-swap evictions.
 set -e
-exec /home/max/ds4/ds4-server \
+# Q8->FP16 weight cache: override the default 5%-of-total reserve (6.08 GiB on
+# Spark's 121 GiB unified pool). cudaMemGetInfo's "free" on GB10 unified memory
+# reads ~5 GiB even when the unified pool has 30 GiB+ headroom, so the default
+# reserve trips on the very first request and latches q8 fallback for the
+# process lifetime, slowing prefill from ~340 t/s to ~95 t/s on real prompts.
+# 1 GiB is plenty (model ~81 GB + ctx ~5 GB = ~86 GB used of 119 GB).
+export DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=1024
+# 2026-05-18: switched to ngc-shj fork's q4-only build (cherry-picked onto
+# antirez be43477 + local metrics patch). Opt-in Q4 lazy cache + dp4a decode
+# matmul takes single-stream decode 13.22 -> 18.77 t/s on ds4-bench, and the
+# bundled host-register-fallback takes prefill at 2048 ctx 96 -> 396 t/s
+# (independent of Q4). See ~/.claude/projects/-home-max/memory/project_ds4_ngcshj_fork.md
+# Rollback: launch-ds4-server.sh.bak.20260518-pre-q4 (binary at /home/max/ds4/ds4-server).
+#
+# 2026-05-18 follow-up: MTP disabled. Every Q4 dispatch in ds4_cuda.cu is
+# gated on `n_tok == 1`; with --mtp-draft 2 the main forward processes 3
+# tokens in parallel (1 verify + 2 draft predictions) so Q4 is silently
+# bypassed. Five live curl queries with MTP+Q4 enabled steadied at ~13.8 t/s
+# (~= old prod MTP+Q8). Dropping MTP frees Q4 and gets ~18 t/s decode.
+export DS4_CUDA_Q4_DECODE=1
+exec /home/max/ds4-rebase/ds4-server \
   --cuda \
   --host 127.0.0.1 --port 9010 \
   --model /home/max/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
-  --mtp /home/max/ds4/gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
-  --mtp-draft 2 \
   --ctx 131072 \
   --kv-disk-dir /home/max/ds4/kv-cache \
   --kv-disk-space-mb 32768 \

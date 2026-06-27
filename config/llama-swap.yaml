@@ -44,101 +44,12 @@ models:
   # deleted (BF16 + Q8_0 GGUF, 23 GB total). To restore: re-download
   # google/gemma-4-E4B-it + ggml-org/gemma-4-E4B-it-GGUF and revert.
 
-  # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.6-27B AEON-7 NVFP4 + DFlash — DEMOTED 2026-05-08 (rollback slot).
-  #
-  # Was production 2026-04-30 → 2026-05-08. Lost A/B vs sakamakismile + MTP n=3
-  # on real-traffic-shaped coding prompts (13k/60k/100k input, c=1):
-  #   bucket   total wall-clock   AEON-7 DFlash  →  sakamaki MTP   Δ
-  #   13k      75.0 s            →  50.6 s     -32 %
-  #   60k      274.4 s           →  132.8 s    -52 %
-  #   100k     534.6 s           →  230.2 s    -57 %
-  #   acceptance@100k             6.0 % (DFlash) vs 66.2 % (MTP)
-  # Root cause: DFlash drafter style-mismatch on long-context coding traffic;
-  # acceptance collapses with context. MTP head is in-target so it cannot diverge.
-  # Full report: /home/max/llm-stack/logs/bench-coding-AB-report-20260508.md
-  #
-  # KEPT addressable as `qwen3.6-27b-aeon-dflash` for fast rollback (k=4 is the
-  # most-recent-tuned DFlash setting; k=15 was reverted 2026-05-08).
-  # The aliases that previously routed `qwen3.6-27b` and `qwen3.6-35b-a3b` here
-  # have been moved to the sakamakismile entry below.
-  # ─────────────────────────────────────────────────────────────────────
-  qwen3.6-27b-aeon-dflash:
-    cmd: /home/max/llm-stack/bin/launch-vllm-27b-dflash.sh
-    proxy: http://127.0.0.1:9013
-    checkEndpoint: /health
-    ttl: 3600
-    aliases:
-      - qwen3.6-27b-dflash   # explicit DFlash name still valid (added 2026-04-30)
-    # ─── ROLLBACK to this entry ──────────────────────────────────────────
-    # If sakamakismile misbehaves, move the `qwen3.6-27b` and
-    # `qwen3.6-35b-a3b` aliases from the sakamakismile entry below back up to
-    # this `aliases:` list. llama-swap -watch-config picks up the yaml edit
-    # without restart. The sakamakismile container will TTL out next.
-
-  # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.6-27B dense + MTP — DORMANT rollback slot (kept 2026-04-30).
-  #
-  # Was production 2026-04-24 → 2026-04-30. Demoted in favor of DFlash above.
-  # Addressable by explicit name `qwen3.6-27b-mtp` for A/B or rollback.
-  # Same launcher, port 9008, container vllm-qwen-27b — but
-  # --served-model-name is now `qwen3.6-27b-mtp` only (no longer aliases the
-  # default name) so requests to qwen3.6-27b never land here unintentionally.
-  # ─────────────────────────────────────────────────────────────────────
-  qwen3.6-27b-mtp:
-    cmd: /home/max/llm-stack/bin/launch-vllm-27b-nvfp4.sh
-    proxy: http://127.0.0.1:9008
-    checkEndpoint: /health
-    ttl: 3600
-
-  # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.6-27B clean (AlphaOxO) NVFP4 + DFlash drafter — added 2026-05-08.
-  #
-  # Hypothesis: prod's bad coding quality is caused by AEON-7's abliteration,
-  # not by Qwen3.6 itself. AlphaOxO is the same base as AEON-7 but unaltered;
-  # the z-lab DFlash drafter shares E/LM-head with the base, so it should
-  # attach to either target — acceptance rate is the open variable.
-  # If c=1 lands near prod's 41 tok/s with clean weights, we promote this to
-  # the qwen3.6-27b alias and retire the AEON-7 launcher.
-  # WHY:    Strictly evaluative — not aliased to qwen3.6-27b, so opencode /
-  #         LiteLLM traffic NEVER lands here unintentionally. Test by
-  #         hitting `qwen3.6-27b-clean-dflash` explicitly.
-  # NOTE:   Cold start ~10–12 min (autotuner + CUDA-graph). Bench plan:
-  #         drive the bench-bigctx-concurrency.py + bench-quality-27b.py
-  #         scripts at this name, compare side-by-side with prod numbers.
-  # ─────────────────────────────────────────────────────────────────────
-  qwen3.6-27b-clean-dflash:
-    cmd: /home/max/llm-stack/bin/launch-vllm-27b-clean-dflash.sh
-    proxy: http://127.0.0.1:9014
-    checkEndpoint: /health
-    ttl: 3600
-
-  # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.6-27B sakamakismile clean + MTP head (NVFP4 modelopt) — DEMOTED
-  # 2026-05-08 (rollback slot, second time today).
-  #
-  # WAS production 2026-05-08 (AM) → 2026-05-08 (PM). Won the coding-A/B
-  # against AEON-7 DFlash decisively (32–57 % wall-clock improvement at
-  # 13k/60k/100k buckets) but in real opencode traffic exhibited intermittent
-  # `</think>C`-style truncation: model emits `</think>` then 0–1 chars and
-  # EOS with finish_reason=stop. Symptom matches sakamakismile model card
-  # discussion #9 ("silent ends of coding agents") which traces to a chat
-  # template bug in upstream Qwen3.6, possibly compounded by NVFP4 tail
-  # variance at the </think> distribution-shift boundary.
-  #
-  # ROLLBACK to this entry: move the `qwen3.6-27b` and `qwen3.6-35b-a3b`
-  # aliases from `qwen3.6-27b-fp8` below back here. llama-swap -watch-config
-  # picks up the edit hot. Re-add `--reasoning-parser qwen3` to the launcher
-  # if you want to test the parser-only fix on this entry instead of moving
-  # to FP8.
-  # NOTE:  max-num-seqs 2 is load-bearing per model card (fp8 KV + spec n=3 +
-  #        200K ctx silently OOMs at max-num-seqs ≥ 4).
-  # ─────────────────────────────────────────────────────────────────────
-  qwen3.6-27b-sakamaki-mtp:
-    cmd: /home/max/llm-stack/bin/launch-vllm-27b-sakamaki-mtp.sh
-    proxy: http://127.0.0.1:9015
-    checkEndpoint: /health
-    ttl: 3600
+  # ─── RETIRED 2026-06-27 (full rollback-slot cleanup) ──────────────────
+  # qwen3.6-27b-aeon-dflash (was prod 04-30→05-08), qwen3.6-27b-mtp (dormant),
+  # qwen3.6-27b-clean-dflash (eval), qwen3.6-27b-sakamaki-mtp (was prod 05-08).
+  # All superseded 27B NVFP4 rollback/eval slots. Weights evicted 2026-06-27.
+  # A/B history preserved in memory: project_qwen36_27b_{dflash,sakamaki_mtp}.
+  # Launchers kept in bin/ (launch-vllm-27b-{dflash,nvfp4,clean-dflash,sakamaki-mtp}.sh).
 
   # ─────────────────────────────────────────────────────────────────────
   # Qwen3.6-27B official FP8 + native MTP — PROMOTED 2026-05-08 (production).
@@ -171,19 +82,9 @@ models:
     # `qwen3.6-27b` + `qwen3.6-35b-a3b` aliases from `qwen3.6-27b-int4-dflash`
     # below back here. llama-swap -watch-config picks up the edit hot.
 
-  # ─────────────────────────────────────────────────────────────────────
-  # Qwen3.6-27B Intel AutoRound INT4 + native MTP n=2 — eval-only slot 2026-05-17.
-  #
-  # Initial config (no DFlash). Got 22 tok/s single-stream on Spark. Limited
-  # by GPTQ-Marlin INT4 forward latency (~104ms/forward) plus single-layer MTP
-  # speculation (mean accept 2.26, per-pos 0.75/0.51). Kept addressable for
-  # rollback and for A/B against the int4-dflash entry below.
-  # ─────────────────────────────────────────────────────────────────────
-  qwen3.6-27b-int4-autoround:
-    cmd: /home/max/llm-stack/bin/launch-vllm-27b-int4-autoround.sh
-    proxy: http://127.0.0.1:9017
-    checkEndpoint: /health
-    ttl: 3600
+  # ─── RETIRED 2026-06-27: qwen3.6-27b-int4-autoround (Intel INT4 + MTP n=2,
+  # 22 tok/s eval slot). Superseded by int4-dflash prod, which shares the same
+  # Intel weights (NOT evicted). Launcher kept: launch-vllm-27b-int4-autoround.sh.
 
   # ─────────────────────────────────────────────────────────────────────
   # Qwen3.6-27B Intel AutoRound INT4 + z-lab DFlash drafter n=4 — PROMOTED
@@ -245,6 +146,47 @@ models:
     ttl: 3600
 
   # ─────────────────────────────────────────────────────────────────────
+  # DiffusionGemma 26B-A4B-it NVFP4 — EVAL slot 2026-06-11. Google DeepMind's
+  # first diffusion LLM (released 2026-06-10); NVIDIA quotes ~150 tok/s c=1 on
+  # DGX Spark. Testing for NON-CODING tasks (quality < AR Gemma 4). Day-0
+  # gemma-aarch64-cu130 image + model-runner-v2. Swap-exclusive (`main`): the
+  # qwen co-resident pair must be freed before this loads (~15 GB free else).
+  # Launcher: bin/launch-vllm-diffusiongemma-nvfp4.sh
+  # ─────────────────────────────────────────────────────────────────────
+  diffusiongemma-26b:
+    cmd: /home/max/llm-stack/bin/launch-vllm-diffusiongemma-nvfp4.sh
+    proxy: http://127.0.0.1:9021
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Qwopus3.6-27B-v2 (Jackrong) INT4 AutoRound + DFlash n=4 — EVAL slot 2026-05-27.
+  # Claude-Opus-trace-distilled fine-tune of Qwen3.6-27B; same arch as prod
+  # int4-dflash, quantized locally (RTN, Intel layer recipe: in_proj_a/b+mtp.fc
+  # fp16). max-num-seqs 8 + 128k ctx so a c1..c8 / 8k..120k speed sweep isn't
+  # capped (prod runs seqs=1). Launcher: launch-vllm-qwopus-int4-dflash.sh
+  # ─────────────────────────────────────────────────────────────────────
+  qwopus3.6-27b-int4-dflash:
+    cmd: /home/max/llm-stack/bin/launch-vllm-qwopus-int4-dflash.sh
+    proxy: http://127.0.0.1:9020
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Ornith-1.0-35B-MoE (DeepReinforce) — GGUF via mainline llama.cpp.
+  # Added 2026-06-27. Arch qwen35moe (Qwen3.5 MoE, 256 experts, 40 layers,
+  # ~3B active, native ctx 262144). MIT, agentic coding; 64.2 Terminal-Bench
+  # 2.1 (> Qwen3.5-397B's 53.5). Q4_K_M GGUF 21 GB. Runtime: ~/llama.cpp
+  # (mainline CUDA build for GB10) — the deepseek fork lacks qwen35moe.
+  # Launcher: bin/launch-ornith.sh (ORNITH_CTX env overrides ctx, default 32768).
+  # ─────────────────────────────────────────────────────────────────────
+  ornith-1.0-35b:
+    cmd: /home/max/llm-stack/bin/launch-ornith.sh
+    proxy: http://127.0.0.1:9022
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
   # Nemotron-3-Nano-Omni-30B-A3B Reasoning NVFP4 (vLLM) — added 2026-04-29.
   #
   # NVIDIA's Mamba2-Transformer hybrid MoE with vision + audio encoders.
@@ -261,38 +203,11 @@ models:
     checkEndpoint: /health
     ttl: 3600
 
-  # ─────────────────────────────────────────────────────────────────────
-  # DeepSeek V4 Flash IQ2_XXS — patched llama.cpp fork
-  # (phuongncn/llama.cpp-gx10-dgx-sparks-deepseekv4) added 2026-04-28.
-  #
-  # WHY:    Upstream llama.cpp can't serve DeepSeek V4 above ~8k ctx — the
-  #         compressor's metadata pool (~5 MB) and tensor-slot table (2k)
-  #         overflow on the 41 compressed layers, which create ~350k tensor
-  #         objects per token. The fork bumps pool→170 MB and slots→450k.
-  # NOTE:   Repo benchmark: 8.48 PP / 6.65 gen tok/s. parallel=1 REQUIRED
-  #         (multi-seq trips an assert in the compressor). 124 GB resident
-  #         at 128k ctx — must remain swap-exclusive with `main` group.
-  #         Native binary, not docker — needs the patched build.
-  # ─────────────────────────────────────────────────────────────────────
-  deepseek-v4-flash:
-    cmd: >
-      /home/max/llama.cpp-gx10-dsv4/build/bin/llama-server
-      --host 127.0.0.1 --port 9011
-      --alias deepseek-v4-flash
-      -m /home/max/models/deepseek-v4-flash/DeepSeek-V4-Flash-IQ2XXS.gguf
-      --ctx-size 65536
-      --n-gpu-layers 99
-      -b 4096 -ub 512
-      -ctk f32 -ctv f32
-      --parallel 1
-      --threads 4 --threads-batch 20
-      -fa on
-      --no-mmap
-      --reasoning-budget -1
-      --jinja
-    proxy: http://127.0.0.1:9011
-    checkEndpoint: /health
-    ttl: 3600
+  # ─── RETIRED 2026-06-27: deepseek-v4-flash (patched llama.cpp fork, port 9011,
+  # IQ2_XXS, parallel=1, 8.48 PP / 6.65 gen tok/s). Superseded by the -ds4 lane
+  # (faster prefill, disk-KV, MTP). 81 GB GGUF evicted 2026-06-27; the -ds4 lane
+  # uses its own ~/ds4/gguf/...v2-imatrix.gguf (NOT evicted). Fork build kept at
+  # ~/llama.cpp-gx10-dsv4 for rebuild if ever needed.
 
   # ─────────────────────────────────────────────────────────────────────
   # DeepSeek V4 Flash via antirez/ds4 (custom C/CUDA engine) — 2026-05-12.
@@ -315,38 +230,33 @@ models:
     ttl: 3600
 
 groups:
-  # CO-RESIDENT QWEN GROUP (2026-05-17) — both engines stay loaded simultaneously.
-  # Dense INT4+DFlash @ 120k c=1 (~56 GB) + MoE NVFP4 @ 80k c=2 (~45 GB) = ~101 GB.
-  # Headroom ~14 GB for OS / cudagraph slack. NOT swap-exclusive: both can serve
-  # in parallel via separate routes (qwen3.6-27b → dense, qwen3.6-35b-a3b-nvfp4
-  # → MoE). Other heavy models in `main` below remain swap-exclusive; loading
-  # one will OOM if these two are also loaded — user must manage explicitly.
-  qwen-coresident:
-    swap: false
-    exclusive: false
-    members:
-      - qwen3.6-27b-int4-dflash
-      - qwen3.6-35b-a3b-nvfp4
-
-  # The main group: heavy models, only one active at a time. Co-resident qwen
-  # group above is NOT cross-group exclusive — beware loading these while the
-  # qwen pair is resident (~14 GB free, each main member needs ≥50 GB).
-  main:
+  # ─── EXPERIMENTATION PHASE (2026-06-27) ────────────────────────────────
+  # No dedicated production model. Every model is a swap-exclusive member of
+  # this one group: exactly ONE loads at a time, on demand, and is unloaded
+  # before the next loads. Co-resident pair RETIRED — when we want a model we
+  # load it alone (full 119 GB available → can push context higher than the
+  # old co-resident 0.40/0.50 mem-util splits allowed).
+  #
+  # Each member is being characterised on three axes (see README "Roster"
+  # table + bin/bench-models.py): single-stream tok/s, cold load time, and
+  # max usable context. The `qwen3.6-27b` / `qwen3.6-35b-a3b` aliases on
+  # int4-dflash are kept only so legacy opencode clients still resolve.
+  experiments:
     swap: true
     exclusive: true
     members:
-      - qwen3.6-27b-fp8           # rollback 2026-05-17 (was prod 2026-05-08; Qwen official FP8 + MTP n=3)
-      - qwen3.6-27b-int4-autoround # eval 2026-05-17 (Intel INT4 + native MTP n=2, 22 tok/s)
-      - qwen3.6-27b-sakamaki-mtp  # rollback 2026-05-08 (was prod, truncation bug)
-      - qwen3.6-27b-aeon-dflash   # rollback 2026-05-08 (older)
-      - qwen3.6-27b-mtp           # dormant rollback slot 2026-04-30
-      - qwen3.6-27b-clean-dflash  # eval candidate 2026-05-08 (superseded)
-      - nemotron-3-nano-omni
-      - deepseek-v4-flash
-      - deepseek-v4-flash-ds4     # added 2026-05-12 (antirez ds4 engine, planner lane)
+      - qwen3.6-27b-int4-dflash   # Intel INT4 + DFlash n=4
+      - qwen3.6-35b-a3b-nvfp4     # RedHatAI MoE NVFP4 + MTP n=1
+      - qwen3.6-27b-fp8           # Qwen official FP8 + MTP n=3
+      - qwopus3.6-27b-int4-dflash # Qwopus Opus-distill fine-tune, INT4+DFlash
+      - ornith-1.0-35b            # NEW 2026-06-27: DeepReinforce 35B-A3B MoE (GGUF/llama.cpp)
+      - diffusiongemma-26b        # Google diffusion LLM, NVFP4
+      - nemotron-3-nano-omni      # multimodal omni, NVFP4
+      - deepseek-v4-flash-ds4     # antirez/ds4 native engine, long-ctx planner
+      # ─── retired 2026-06-27 (rollback-slot cleanup) ────────────────────
+      # qwen3.6-27b-int4-autoround, -sakamaki-mtp, -aeon-dflash, -mtp,
+      #   -clean-dflash → superseded 27B slots (history: memory
+      #   project_qwen36_27b_{dflash,sakamaki_mtp}). NVFP4 weights evicted.
+      # deepseek-v4-flash (old llama.cpp fork) → superseded by -ds4 lane.
       # gemma-4-26b-a4b, minimax-m2.7, supergemma-4-26b, gemma-4-e4b removed 2026-05-02
-      # qwen3.6-35b-a3b removed 2026-04-27 (now alias of qwen3.6-27b)
       # qwen3.5-35b-distill, qwen3.5-122b-nvfp4 removed 2026-04-28 (3.5 gen)
-
-  # qwen36 coexistence group REMOVED 2026-04-24 (solo 27B on Spark).
-  # The MoE is disabled upstairs; the 27B moved into `main`.

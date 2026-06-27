@@ -1,79 +1,48 @@
 # Spark LLM Stack
 
-Single OpenAI-compatible endpoint on a DGX Spark (GB10, 119 GB unified). One llama-swap gateway at `192.168.1.12:8080` (log-proxy intercept at `:8079`), with a co-resident Qwen3.6 dense + MoE pair on the hot path and a swap-exclusive pool of fallbacks / specialty engines.
+OpenAI-compatible LLM gateway on one **DGX Spark (GB10, 119 GB unified)**. Call it at **`http://192.168.1.12:8079/v1`** and route by the `model` field. **One model is resident at a time** — asking for a different `model` unloads the current one and cold-loads the next (1–10 min for vLLM engines, ~30–105 s for the ds4 / llama.cpp binaries).
 
-> **TL;DR — what's live right now (2026-05-17)**
->
-> | Route | Engine | Quant | Ctx | Concurrent | Speed | Memory |
-> |---|---|---|---:|---:|---:|---:|
-> | `qwen3.6-27b` *(default)* | dense INT4+DFlash | Intel AutoRound INT4 | 120 k | c=1 | 29 tok/s | 55 GB |
-> | `qwen3.6-35b-a3b-nvfp4` | MoE | RedHatAI NVFP4 | 80 k | c=2 | 56 tok/s (101 agg) | 49 GB |
->
-> Both stay resident together — ~104 / 119 GB GPU. Other heavies (nemotron, ds4) still swap-exclusive; loading any of them OOMs while the qwen pair is up.
->
-> **Rollback path:** edit `config/llama-swap.yaml`, move the `qwen3.6-27b` alias from `qwen3.6-27b-int4-dflash` to `qwen3.6-27b-fp8`. `-watch-config` hot-reloads in ~1 s.
+> **Phase (2026-06-27): experimentation — no fixed production model.** Every model is a swap-exclusive member of the single `experiments` group, so each loads alone with the full 119 GB. Pick the one you want from the table. The `qwen3.6-27b` / `qwen3.6-35b-a3b` aliases still resolve for legacy clients.
 
----
+## Models
 
-## Live rotation
+Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`bin/bench-models.py`, single-stream, each cold-loaded alone; raw in `logs/bench-results.json`). **Settings for each model live in its launcher** (`bin/<launcher>`) and are explained in [Per-launcher details](#per-launcher-details).
 
-### Production routes (both always resident since 2026-05-17)
+| Route (`model`) | Use it for | tok/s | Max ctx | Peak mem | Engine | Launcher (`bin/`) |
+|---|---|---:|---:|---:|---|---|
+| **`qwen3.6-27b-int4-dflash`** | **coding — default** | 41 | 120 k | 61 GB | vLLM | `launch-vllm-27b-int4-dflash.sh` |
+| `qwen3.6-35b-a3b-nvfp4` | coding, long-ctx throughput | 61 | 80 k | 53 GB | vLLM | `launch-vllm-35b-moe-nvfp4.sh` |
+| `ornith-1.0-35b` 🆕 | coding — agentic (thinking)² | 77 | 32 k¹ | 25 GB | llama.cpp | `launch-ornith.sh` |
+| `qwopus3.6-27b-int4-dflash` | coding — Opus-distilled | 39 | 128 k | 102 GB | vLLM | `launch-vllm-qwopus-int4-dflash.sh` |
+| `qwen3.6-27b-fp8` | coding — quality baseline | 21 | 200 k | 91 GB | vLLM | `launch-vllm-27b-qwen-fp8.sh` |
+| `nemotron-3-nano-omni` | multimodal (image/audio/video) | 56 | 131 k | 91 GB | vLLM | `launch-vllm-nemotron-omni.sh` |
+| `diffusiongemma-26b` | speed / non-coding | 142 | 131 k | 50 GB | vLLM | `launch-vllm-diffusiongemma-nvfp4.sh` |
+| `deepseek-v4-flash-ds4` | long-context planner | 21 | 131 k | 22 GB | ds4 | `launch-ds4-server.sh` |
 
-| Key | Aliases | Role | Launcher | Port | Image |
-|---|---|---|---|---:|---|
-| `qwen3.6-27b-int4-dflash` | `qwen3.6-27b`, `qwen3.6-35b-a3b` | Coding default (dense, single-stream lane) | `bin/launch-vllm-27b-int4-dflash.sh` | 9018 | `ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v4` |
-| `qwen3.6-35b-a3b-nvfp4` | — | Throughput lane (MoE, opt-in by name) | `bin/launch-vllm-35b-moe-nvfp4.sh` | 9019 | `vllm/vllm-openai:cu130-nightly` |
+¹ Ornith ctx is `ORNITH_CTX`-tunable (default 32 k, native 262 k). &nbsp; ² **Thinking model** — output goes to `reasoning_content`; give generous `max_tokens` or `content` returns empty. &nbsp; ds4 decode does **not** scale with concurrency (run one request at a time). Max-ctx is the launcher's configured limit; several vLLM launchers still carry the old co-resident mem-util splits and can be raised now that they load solo.
 
-### Rollback slots (swap-exclusive `main` group; loading one OOMs while qwen pair is resident)
-
-| Key | Role | Status | Launcher |
-|---|---|---|---|
-| `qwen3.6-27b-fp8` | Was prod 2026-05-08 → 2026-05-17 (Qwen official FP8 + native MTP n=3) | rollback | `bin/launch-vllm-27b-qwen-fp8.sh` |
-| `qwen3.6-27b-int4-autoround` | Intel INT4 + native MTP n=2 (no DFlash, 22 tok/s) | eval | `bin/launch-vllm-27b-int4-autoround.sh` |
-| `qwen3.6-27b-sakamaki-mtp` | Was prod 2026-05-08 AM only (NVFP4 + MTP graft; `</think>C` truncation bug) | rollback | `bin/launch-vllm-27b-sakamaki-mtp.sh` |
-| `qwen3.6-27b-aeon-dflash` | Was prod 2026-04-30 → 2026-05-08 (NVFP4 + DFlash k=4) | rollback | `bin/launch-vllm-27b-dflash.sh` |
-| `qwen3.6-27b-mtp` | Was prod 2026-04-24 → 2026-04-30 (AlphaOxO NVFP4 + MTP-3) | dormant | `bin/launch-vllm-27b-nvfp4.sh` |
-| `qwen3.6-27b-clean-dflash` | Eval slot (AlphaOxO NVFP4 + DFlash, superseded) | eval | `bin/launch-vllm-27b-clean-dflash.sh` |
-| `nemotron-3-nano-omni` | Multimodal omni (text/image/audio/video) | active | `bin/launch-vllm-nemotron-omni.sh` |
-| `deepseek-v4-flash` | Long-context (llama.cpp fork, parallel=1) | active | inline yaml |
-| `deepseek-v4-flash-ds4` | Planner lane (antirez/ds4 native + disk KV) | active | `bin/launch-ds4-server.sh` |
-
-### Headline benchmarks (2026-05-17, single-stream prompt~200 tok / 1024 out)
-
-| Config | c=1 | c=2 agg | c=4 agg | vs FP8 prod |
-|---|---:|---:|---:|---:|
-| **MoE NVFP4 (current MoE prod)** | **56.6** | 101.6 | 168.7 | 3.79× |
-| Dense INT4+DFlash (current dense prod, v4 image) | 29.0 | 59.4 | 100.7 | 1.96× |
-| Dense INT4 + MTP n=2 (no DFlash) | 22.0 | — | — | 1.49× |
-| Dense FP8 + native MTP n=3 (demoted) | 14.8 | — | — | 1.00× |
-
-Long-context (125 k input, 1024 out): MoE c=1 = 48.5 tok/s / TTFT 38 s; dense c=1 = 18 tok/s / TTFT 151 s. **MoE is the practical choice for long-context throughput**; dense is prefill-bound at 125 k.
-
----
-
-## Quick start
+### Call it
 
 ```sh
-# Service state
-sudo systemctl status llama-swap
-
-# Model list + which is currently hot
-curl -s http://192.168.1.12:8080/v1/models | jq -r '.data[].id'
-curl -s http://192.168.1.12:8080/running
-docker ps --filter name=vllm- --filter name=llama-
-
-# Active containers (production)
-docker logs -f vllm-qwen-27b-int4-dflash   # dense
-docker logs -f vllm-qwen-35b-moe-nvfp4     # MoE
-
-# GPU memory in use
-nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
-
-# Force an unload without stopping the service
-curl -X POST http://192.168.1.12:8080/unload
+curl http://192.168.1.12:8079/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.6-27b-int4-dflash",
+  "messages": [{"role": "user", "content": "hi"}]
+}'
+# Set client timeout ≥ 900s — a cold swap can take up to 10 min.
+# :8079 is the logged path (log-proxy → llama-swap); :8080 is the direct gateway.
 ```
 
-Cold-swap latency (when a swap-exclusive engine is hit): **2–10 min**. LiteLLM / any wrapping client should set `timeout ≥ 900s`.
+### Operate
+
+```sh
+curl -s http://192.168.1.12:8080/v1/models | jq -r '.data[].id'   # list routes
+curl -s http://192.168.1.12:8080/running                          # which model is hot
+sudo systemctl status llama-swap                                  # service health
+curl -X POST http://192.168.1.12:8080/unload                      # free the resident model
+docker ps --filter name=vllm- --filter name=llama-                # running engine container
+```
+
+Re-run the full characterisation sweep (speed + cold-load + peak mem for every model) with `python3 bin/bench-models.py`.
 
 ---
 
@@ -101,12 +70,12 @@ Cold-swap latency (when a swap-exclusive engine is hit): **2–10 min**. LiteLLM
 
 ### Group semantics
 
-- **`qwen-coresident`** (`swap: false, exclusive: false`) — both Qwen engines stay loaded. Each request routes to its own engine in parallel.
-- **`main`** (`swap: true, exclusive: true`) — at most one resident. Cold-swap latency 1–10 min depending on engine. Loading any member while the qwen pair is resident will OOM (only ~15 GB free). To use a `main` member, first `docker rm -f` one of the qwen containers.
+- **`experiments`** (`swap: true, exclusive: true`) — the only group. At most one model resident at a time; requesting a different model unloads the current one and cold-loads the next. Cold-swap latency 1–10 min for vLLM engines, ~30–105 s for the llama.cpp (Ornith) and ds4 native binaries. Each loads alone with the full 119 GB available.
+- *(historical: the `qwen-coresident` + `main` split was retired 2026-06-27 when we dropped the dedicated-prod model. See [decision log](#decision-log).)*
 
 ---
 
-## Per-launcher details (current production)
+## Per-launcher details
 
 ### Dense: `qwen3.6-27b-int4-dflash` (launcher: `bin/launch-vllm-27b-int4-dflash.sh`)
 
@@ -232,7 +201,7 @@ Results go to `logs/bench-*.json` and `logs/bench-*.log` with timestamped names.
 3. **Add a `models:` block** in `config/llama-swap.yaml`:
    - safetensors (BF16, FP8, NVFP4, INT4-AutoRound): use a vLLM launcher pattern (see `bin/launch-vllm-27b-int4-dflash.sh` as template).
    - GGUF: use a llama.cpp launcher pattern (see `bin/launch-vllm-qwen.sh` historical pattern).
-4. **Append the new key** to the relevant group members list (`qwen-coresident` or `main`).
+4. **Append the new key** to the `experiments` group members list.
 5. **Validate**: `python3 -c "import yaml; yaml.safe_load(open('config/llama-swap.yaml'))"`.
 6. **Save** — `-watch-config` reloads within ~1 s (see decision log §27). Verify via `curl -s http://localhost:8080/v1/models`.
 7. **Smoke test** by sending a 5-token completion — first request is the cold load.
@@ -266,7 +235,7 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 ```
 ~/llm-stack/
 ├── config/
-│   └── llama-swap.yaml             # active config (qwen-coresident + main groups)
+│   └── llama-swap.yaml             # active config (single `experiments` swap group)
 ├── deployed.yaml                   # source-of-truth manifest for downstream (LiteLLM)
 ├── bin/
 │   ├── launch-vllm-27b-int4-dflash.sh   # ACTIVE — dense prod (Intel INT4 + DFlash n=4, v4 image)
@@ -465,6 +434,20 @@ for model in \
 done
 ```
 
+### 20. ds4 best-config A/B/C — our custom-Q4 decode wins; rebased onto mainline *(2026-06-27)*
+
+Searched for the fastest ds4 config for DeepSeek-V4-Flash on GB10. Ran an A/B/C concurrency matrix (`bin/bench-ds4-matrix.py`, c=1/2/4, 3-run median, idle 90 s, GB10 allocator confounder):
+
+| Config | c=1 | c=2 agg | c=4 agg | peak mem |
+|---|---:|---:|---:|---:|
+| **A — fork q2 + custom Q4 decode** | **21.3** | 21.3 | 21.3 | ~105 GB |
+| B — mainline q2 + MTP draft=4 | 13.8 | 13.8 | 13.8 | ~109 GB |
+| C — mainline q2-q4 GGUF (native Q4_K experts) + MTP | 13.5 | 13.5 | 13.5 | 120/121 GB |
+
+Findings: (1) **The two "Q4"s are different mechanisms** — our fork re-quantizes *dense* Q8/F16 weights → Q4_0 *at decode time* (`DS4_CUDA_Q4_DECODE`, the source of 21.3); mainline's Q4 is *routed-MoE experts stored Q4_K in the GGUF*, which never fires on our 2-bit (IQ2_XXS) GGUF. (2) **MTP is a dud on GB10** — B and C ≈ the bare q2 baseline (~13.75); speculation can't help a memory-bandwidth-bound decode. (3) **Native Q4_K experts didn't move decode** (C = B) — expert compute on 6 layers isn't the bottleneck; dense-weight bandwidth is. (4) **ds4 decode does NOT scale with concurrency** — aggregate is flat; c=2/4 just split the fixed throughput. Run ds4 one request at a time. (5) The q2-q4 GGUF barely fits one GB10 (0 headroom) → would OOM on real ~100 k-ctx traffic.
+
+**Action: rebased our 3 custom-Q4 commits onto mainline** (`80ebbc3`, branch `q4-rebase` in worktree `~/ds4-rebase`). Conflicts were additive (upstream's SSD-streaming expert-cache structs/globals + host-register env knob alongside our Q4 cache). Rebuilt (`make cuda-spark`), verified **21.2 tok/s + coherent output**. So the live `deepseek-v4-flash-ds4` lane now runs **our custom-Q4 speed *and* the 225 upstream fixes** (tool-call recovery inside unclosed `<think>`, deterministic batched-prefill attention, SSD expert streaming, `--mtp-draft>2` verify fix). Launcher repointed to `~/ds4-rebase/ds4-server`; rollback = `~/ds4-q4/ds4-server` + `launch-ds4-server.sh.bak.20260627-pre-rebase`. Mainline's own metrics (`metrics_record_complete`) superseded our custom Prometheus patch (dropped; saved at `~/ds4-metrics-endpoint.patch`). **DFlash** (z-lab/ByteDance block-diffusion drafter) is *not* usable on ds4 yet — no V4-Flash drafter weights, no C/CUDA backend; watch `z-lab/dflash`.
+
 `hf download --force` reverts the patch — re-apply if weights are re-fetched.
 
 ### 20. MTP speculative decoding for Qwen3.5 / Qwen3.6
@@ -546,7 +529,7 @@ From 2026-04-27 → 2026-05-17, the `qwen3.6-35b-a3b` name was an alias on the a
 
 ### 29. `nemotron-3-nano-omni` multimodal slot (2026-04-29)
 
-NVIDIA's Mamba2-Transformer hybrid MoE 30B/3B-active with CRADIO-v4-H vision and Parakeet audio encoders. Sits in `main` swap-exclusive alongside the rest.
+NVIDIA's Mamba2-Transformer hybrid MoE 30B/3B-active with CRADIO-v4-H vision and Parakeet audio encoders. Swap-exclusive member of `experiments` like the rest.
 
 **Custom image required.** vLLM's audio path needs `av` + `soundfile` + `librosa` at process import time; base `cu130-nightly` ships without them. Hot-installing into a running container leaves a cached `PlaceholderModule` and audio fails. Build a derived image once:
 

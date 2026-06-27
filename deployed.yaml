@@ -72,38 +72,17 @@ deployed:
     port_internal: 9016
     demoted: 2026-05-17
 
-  - name: qwen3.6-27b-int4-autoround
-    role: eval slot (Intel INT4 + native MTP n=2, no DFlash)
-    method: Intel/Qwen3.6-27B-int4-AutoRound + qwen3_next_mtp n=2
-    port_internal: 9017
-    added: 2026-05-17
-    measured_single_stream_tok_s: 22
-
-  - name: qwen3.6-27b-sakamaki-mtp
-    role: rollback (was prod 2026-05-08 AM; demoted PM for </think>C truncation)
-    method: sakamakismile NVFP4 + MTP n=2
-    port_internal: 9015
-
-  - name: qwen3.6-27b-aeon-dflash
-    role: older rollback
-    method: aeon NVFP4 + DFlash k=15 spec decode
-    aliases: [qwen3.6-27b-dflash]
-    port_internal: 9013
-
-  - name: qwen3.6-27b-mtp
-    role: dormant rollback (oldest, kept 2026-04-30)
-    method: NVFP4 + MTP n=3
-    port_internal: 9008
+  # RETIRED 2026-06-27 (full rollback cleanup): qwen3.6-27b-int4-autoround,
+  # -sakamaki-mtp, -aeon-dflash, -mtp. Superseded 27B slots; NVFP4 weights
+  # evicted. qwen3.6-27b-fp8 kept above as the single rollback.
 
   - name: nemotron-3-nano-omni
     role: multimodal omni (text/image/audio/video)
     method: NVFP4
     port_internal: 9012
 
-  - name: deepseek-v4-flash
-    role: long-context specialty (llama.cpp fork, parallel=1)
-    method: IQ2_XXS, patched llama.cpp fork
-    port_internal: 9011
+  # RETIRED 2026-06-27: deepseek-v4-flash (old llama.cpp fork, port 9011).
+  # Superseded by -ds4 lane; 81 GB GGUF evicted (ds4 uses its own file).
 
   - name: deepseek-v4-flash-ds4
     role: planner lane (long-ctx with persistent disk KV cache, decode ~10 t/s)
@@ -140,29 +119,7 @@ model_list:
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
-  - model_name: qwen3.6-27b-int4-autoround
-    litellm_params:
-      model: openai/qwen3.6-27b-int4-autoround
-      api_base: http://192.168.1.12:8079/v1
-      api_key: not-needed
-
-  - model_name: qwen3.6-27b-sakamaki-mtp
-    litellm_params:
-      model: openai/qwen3.6-27b-sakamaki-mtp
-      api_base: http://192.168.1.12:8079/v1
-      api_key: not-needed
-
-  - model_name: qwen3.6-27b-aeon-dflash
-    litellm_params:
-      model: openai/qwen3.6-27b-aeon-dflash
-      api_base: http://192.168.1.12:8079/v1
-      api_key: not-needed
-
-  - model_name: qwen3.6-27b-mtp
-    litellm_params:
-      model: openai/qwen3.6-27b-mtp
-      api_base: http://192.168.1.12:8079/v1
-      api_key: not-needed
+  # retired 2026-06-27: qwen3.6-27b-{int4-autoround,sakamaki-mtp,aeon-dflash,mtp}
 
   - model_name: diffusiongemma-26b
     litellm_params:
@@ -176,11 +133,7 @@ model_list:
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
-  - model_name: deepseek-v4-flash
-    litellm_params:
-      model: openai/deepseek-v4-flash
-      api_base: http://192.168.1.12:8079/v1
-      api_key: not-needed
+  # retired 2026-06-27: deepseek-v4-flash (old llama.cpp fork) — use -ds4
 
   - model_name: deepseek-v4-flash-ds4
     litellm_params:

@@ -8,14 +8,17 @@ import urllib.error
 from pathlib import Path
 
 GATEWAY = "http://192.168.1.12:8080"
+# Experimentation-phase roster (2026-06-27): all swap-exclusive members of the
+# `experiments` group. One loads at a time; /unload between each.
 MODELS = [
-    "qwen3.5-35b-a3b",
-    "gemma-4-26b-a4b",
-    "minimax-m2.7",
-    "supergemma-4-26b",
-    "qwen3.5-35b-distill",
-    "qwen3.5-122b-nvfp4",
-    "gemma-4-e4b",
+    "qwen3.6-27b-int4-dflash",
+    "qwen3.6-35b-a3b-nvfp4",
+    "qwen3.6-27b-fp8",
+    "qwopus3.6-27b-int4-dflash",
+    "ornith-1.0-35b",
+    "diffusiongemma-26b",
+    "nemotron-3-nano-omni",
+    "deepseek-v4-flash-ds4",
 ]
 COLD_TIMEOUT_S = 900
 WARM_TIMEOUT_S = 180
