@@ -1,0 +1,706 @@
+#!/home/max/llm-stack/venv/bin/python3
+"""Live traffic cockpit for log-proxy.
+
+Reads `~/llm-stack/logs/proxy/{YYYY-MM-DD}/{model}/*.meta.json` and renders:
+
+  - header line: active engine, rps, error %, malformed-event count
+  - latency table: TTFT and E2E p50/p95/p99 + avg prefill/decode tok/s
+  - malformed signatures (window aggregate, prioritized)
+  - recent failures (per-event, with short excerpt of the offending field)
+  - per-key roll-up (top N by request count, with error %)
+  - per-tool roll-up (calls + arg_parse_errors)
+
+Single-engine assumption: llama-swap's `main` group is swap-exclusive, so
+there's always exactly one engine loaded. The "active engine" line shows
+the most recently observed `request_model`.
+
+Usage:
+    traffic-tui                # 5-minute view, 1-second refresh
+    traffic-tui --view 1m      # finer-grain 1-minute view
+    traffic-tui --view 30m     # broader 30-minute view
+    traffic-tui --refresh 0.5  # half-second refresh
+
+Press Ctrl-C to quit (alt-screen restored).
+"""
+import argparse
+import os
+import sys
+import time
+from datetime import datetime
+from typing import Optional
+
+from rich import box
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.theme import Theme
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from stack.traffic import TrafficMonitor  # noqa: E402
+
+
+# ─────────────────────────────────────────────── Tokyo Night Storm palette
+TN_THEME = Theme({
+    "tn.bg":     "#1a1b26",
+    "tn.fg":     "#a9b1d6",
+    "tn.dim":    "#565f89",
+    "tn.muted":  "#414868",
+    "tn.accent": "#7aa2f7",
+    "tn.info":   "#7dcfff",
+    "tn.ok":     "#9ece6a",
+    "tn.warn":   "#e0af68",
+    "tn.err":    "#f7768e",
+    "tn.purple": "#bb9af7",
+})
+
+VIEW_WINDOWS = {"1m": 60, "5m": 300, "30m": 1800}
+
+# Unicode ramp for sparklines + bars.
+SPARK_CHARS = "▁▂▃▄▅▆▇█"   # 8 levels — 0 maps to ▁, max maps to █
+GANTT_DECODE = "█"
+GANTT_PREFILL = "▓"
+
+# Outcome → bar style for the Gantt timeline.
+OUTCOME_STYLE = {
+    "stop":         "tn.ok",
+    "tool_calls":   "tn.info",
+    "length":       "tn.warn",
+    "error":        "tn.err",
+    "abort":        "tn.err",
+}
+
+
+def sparkline(values, width: int = 30, lo: float = None,
+              hi: float = None) -> str:
+    """Map a list of values to a Unicode sparkline. None → ' '. Auto-scales
+    unless lo/hi are given. Pads / truncates to `width`."""
+    seq = list(values[-width:]) if len(values) > width else list(values)
+    nums = [v for v in seq if v is not None]
+    if not nums:
+        return " " * len(seq)
+    lo = min(nums) if lo is None else lo
+    hi = max(nums) if hi is None else hi
+    span = hi - lo
+    out = []
+    for v in seq:
+        if v is None:
+            out.append(" ")
+        elif span <= 0:
+            out.append(SPARK_CHARS[0])
+        else:
+            idx = int((v - lo) / span * (len(SPARK_CHARS) - 1))
+            idx = max(0, min(len(SPARK_CHARS) - 1, idx))
+            out.append(SPARK_CHARS[idx])
+    return "".join(out)
+
+# Priority + color for each malformed signature.
+SIG_ORDER_STYLE = [
+    ("arg_parse_error",         "tn.err"),
+    ("hallucinated_tool",       "tn.err"),
+    ("finish_inconsistent",     "tn.err"),
+    ("engine_error",            "tn.err"),
+    ("status_5xx",              "tn.err"),
+    ("upstream_abort",          "tn.err"),
+    ("client_abort",            "tn.warn"),
+    ("length_truncated",        "tn.warn"),
+    ("reasoning_only",          "tn.warn"),
+    ("empty_response",          "tn.warn"),
+    ("giant_prompt_no_progress","tn.warn"),
+    ("status_4xx",              "tn.warn"),
+    ("no_messages",             "tn.warn"),
+]
+SIG_STYLE_MAP = dict(SIG_ORDER_STYLE)
+
+
+# ─────────────────────────────────────────────────────────── formatters
+def fmt_dur(s):
+    if s is None:
+        return "—"
+    if s < 1:
+        return f"{s * 1000:.0f}ms"
+    if s < 60:
+        return f"{s:.1f}s"
+    return f"{s / 60:.1f}m"
+
+
+def fmt_int(n):
+    return "—" if n is None else f"{int(n)}"
+
+
+def fmt_tps(v):
+    return "—" if v is None else f"{v:.1f}"
+
+
+def err_style_for(pct):
+    if pct >= 10:
+        return "tn.err"
+    if pct >= 3:
+        return "tn.warn"
+    return "tn.dim"
+
+
+# ─────────────────────────────────────────────────────────── panels
+def make_header(monitor: TrafficMonitor, view_label: str,
+                window_s: int) -> Panel:
+    win = monitor.window(window_s)
+    n = len(win)
+    rps = n / window_s if window_s else 0
+    err_n = sum(1 for e in win if e.get("_signatures"))
+    err_pct = (err_n / n * 100) if n else 0
+    malformed_events = sum(len(e.get("_signatures") or []) for e in win)
+    active = monitor.active_engine() or "(no traffic in window)"
+    spike = monitor.spike_detected(short_s=60, long_s=window_s)
+
+    # Sparkline series — 30 buckets across the view window.
+    rps_series  = monitor.time_series(window_s, 30, agg="count")
+    ttft_series = monitor.time_series(window_s, 30, "ttft_s", "p99")
+    e2e_series  = monitor.time_series(window_s, 30, "elapsed_s", "p99")
+
+    line1 = Text.assemble(
+        ("traffic ", "tn.dim"),
+        ("· view ", "tn.dim"), (view_label, "tn.accent"),
+        ("  · active ", "tn.dim"), (active, "tn.purple"),
+        ("  · ", "tn.dim"),
+        (datetime.now().strftime("%H:%M:%S"), "tn.fg"),
+        (" ", ""),
+        ("⚠ spike" if spike else "", "tn.err"),
+    )
+
+    def _spark_line(label, series, val, fmt, style):
+        s = sparkline(series, width=30)
+        return Text.assemble(
+            (f"{label:<9}", "tn.dim"),
+            (fmt.format(val) if val is not None else "—", style),
+            ("  ", ""),
+            (s, "tn.accent"),
+            ("   ", ""),
+        )
+
+    last_rps = (rps_series[-1] if rps_series else 0) / (window_s / 30)
+    last_ttft = next((v for v in reversed(ttft_series) if v is not None), None)
+    last_e2e = next((v for v in reversed(e2e_series)  if v is not None), None)
+
+    line2 = _spark_line("rps",       rps_series,  last_rps,  "{:.2f}/s", "tn.accent")
+    line3 = Text.assemble(
+        _spark_line("ttft p99", ttft_series, last_ttft, "{:.1f}s",
+                    "tn.warn" if last_ttft and last_ttft > 30 else "tn.fg"),
+        _spark_line("e2e  p99", e2e_series,  last_e2e,  "{:.1f}s",
+                    "tn.warn" if last_e2e and last_e2e > 60 else "tn.fg"),
+    )
+    line4 = Text.assemble(
+        ("err ", "tn.dim"),
+        (f"{err_pct:.1f}%", "tn.err" if err_pct > 5 else
+                            ("tn.warn" if err_pct > 1 else "tn.ok")),
+        ("   malformed events ", "tn.dim"),
+        (f"{malformed_events}",
+         "tn.warn" if malformed_events else "tn.dim"),
+        ("   reqs in window ", "tn.dim"), (f"{n}", "tn.fg"),
+    )
+    body = Text("\n").join([line1, line2, line3, line4])
+    return Panel(body, title="traffic", title_align="left",
+                 border_style="tn.muted", box=box.MINIMAL)
+
+
+def make_engine(monitor: TrafficMonitor) -> Panel:
+    """vLLM-compat /metrics + nvidia-smi snapshot for the active engine."""
+    es = monitor.engine_state()
+    gpu = monitor.gpu_state()
+    model = es.get("_model") or "—"
+    port  = es.get("_port") or "—"
+
+    if not es:
+        return Panel(Text("no engine metrics — engine not loaded or "
+                           "/metrics unreachable", style="tn.dim",
+                           justify="center"),
+                     title="engine",
+                     title_align="left", border_style="tn.muted",
+                     box=box.MINIMAL)
+
+    def _bar(pct: Optional[float], width: int = 12,
+             warn: float = 0.85, alert: float = 0.95) -> Text:
+        if pct is None:
+            return Text("─" * width, style="tn.dim")
+        pct = max(0.0, min(1.0, pct))
+        filled = int(pct * width)
+        style = ("tn.err" if pct >= alert else
+                 "tn.warn" if pct >= warn else "tn.ok")
+        return Text("█" * filled + "░" * (width - filled), style=style)
+
+    kv  = es.get("vllm:kv_cache_usage_perc")
+    rr  = es.get("vllm:num_requests_running")
+    rw  = es.get("vllm:num_requests_waiting")
+    gen_rate = es.get("generation_tokens_total_rate")
+    pre_rate = es.get("prompt_tokens_total_rate")
+    draft = es.get("spec_decode_num_draft_tokens_total")
+    accept = es.get("spec_decode_num_accepted_tokens_total")
+    mtp_pct = (accept / draft) if (draft and accept is not None) else None
+
+    fins = {
+        "stop":   es.get("vllm:request_success_total[stop]"),
+        "length": es.get("vllm:request_success_total[length]"),
+        "abort":  es.get("vllm:request_success_total[abort]"),
+        "error":  es.get("vllm:request_success_total[error]"),
+    }
+    ttft_avg = (es.get("vllm:time_to_first_token_seconds_sum") /
+                es.get("vllm:time_to_first_token_seconds_count")) \
+        if es.get("vllm:time_to_first_token_seconds_count") else None
+    e2e_avg = (es.get("vllm:e2e_request_latency_seconds_sum") /
+               es.get("vllm:e2e_request_latency_seconds_count")) \
+        if es.get("vllm:e2e_request_latency_seconds_count") else None
+
+    t = Table(show_header=False, box=box.MINIMAL, expand=True, padding=(0, 1))
+    t.add_column(style="tn.dim", no_wrap=True)
+    t.add_column(no_wrap=True)
+    t.add_column(style="tn.dim", no_wrap=True)
+    t.add_column(no_wrap=True)
+    t.add_column(style="tn.dim", no_wrap=True)
+    t.add_column(no_wrap=True)
+
+    # row 1: KV / GPU util / temp
+    t.add_row(
+        "KV", Text.assemble(_bar(kv), Text(f" {kv*100:.0f}%" if kv else " —",
+                                            style="tn.fg")),
+        "GPU", Text.assemble(_bar(gpu.get("util_pct", 0) / 100 if gpu.get("util_pct") is not None else None),
+                              Text(f" {gpu.get('util_pct',0):.0f}%" if gpu.get('util_pct') is not None else " —",
+                                   style="tn.fg")),
+        "temp",
+        Text(f"{gpu.get('temp_c',0):.0f}°C  {gpu.get('power_w',0):.0f}W"
+             if gpu.get('temp_c') is not None else "—", style="tn.fg"),
+    )
+    # row 2: running/waiting / decode rate / MTP acceptance
+    t.add_row(
+        "run/wait",
+        Text(f"{int(rr or 0)} / {int(rw or 0)}",
+             style="tn.warn" if (rw or 0) > 0 else "tn.fg"),
+        "decode",
+        Text(f"{gen_rate:.1f} t/s" if gen_rate is not None else "—",
+             style="tn.fg"),
+        "MTP accept",
+        Text(f"{mtp_pct*100:.0f}%  ({int(accept or 0)}/{int(draft or 0)})"
+             if mtp_pct is not None else "—", style="tn.fg"),
+    )
+    # row 3: engine-side success totals
+    fin_styles = {"stop": "tn.ok", "length": "tn.warn",
+                  "abort": "tn.err", "error": "tn.err"}
+    fin_text = Text()
+    for k in ("stop", "length", "abort", "error"):
+        v = int(fins[k] or 0)
+        if v:
+            if len(fin_text):
+                fin_text.append("  ", "tn.dim")
+            fin_text.append(f"{k} ", "tn.dim")
+            fin_text.append(str(v), style=fin_styles[k])
+    if not len(fin_text):
+        fin_text = Text("—", style="tn.dim")
+    t.add_row(
+        "finishes", fin_text,
+        "ttft avg", Text(f"{ttft_avg:.1f}s" if ttft_avg else "—", style="tn.fg"),
+        "e2e avg",  Text(f"{e2e_avg:.1f}s" if e2e_avg else "—", style="tn.fg"),
+    )
+
+    return Panel(t, title=f"engine: {model} :{port}",
+                 title_align="left", border_style="tn.muted", box=box.MINIMAL)
+
+
+def make_gantt(monitor: TrafficMonitor, window_s: int,
+               n_rows: int = 10, bar_width: int = 80) -> Panel:
+    """Stack-tui-style request timeline. Each row is one recently-completed
+    request positioned in [view_start, now]; prefill (▓) vs decode (█) phases
+    distinguished; color = outcome / signature."""
+    win = sorted(monitor.window(window_s),
+                 key=lambda e: e.get("_ts_unix", 0))[-n_rows:]
+    now = time.time()
+    view_start = now - window_s
+
+    t = Table(show_header=True, header_style="tn.dim", box=box.MINIMAL,
+              expand=True, padding=(0, 1))
+    t.add_column("time", style="tn.dim", no_wrap=True)
+    t.add_column("key",  style="tn.dim", no_wrap=True)
+    t.add_column("p→g",  style="tn.dim", no_wrap=True, justify="right")
+    t.add_column("bar",  no_wrap=True)
+    t.add_column("end",  style="tn.fg", no_wrap=True)
+
+    if not win:
+        t.add_row("—", "—", "—", "no traffic in window", "—")
+        return Panel(t, title=f"request timeline · last {n_rows} of window",
+                     title_align="left", border_style="tn.muted", box=box.MINIMAL)
+
+    for e in win:
+        start = e.get("_ts_unix", 0)
+        elapsed = e.get("elapsed_s") or 0
+        ttft = e.get("ttft_s")
+        end = start + elapsed
+
+        # Outcome → color
+        sigs = e.get("_signatures") or []
+        if any(s in {"arg_parse_error", "hallucinated_tool",
+                     "engine_error", "finish_inconsistent",
+                     "status_5xx", "upstream_abort"} for s in sigs):
+            bar_style = "tn.err"
+        elif any(s in {"client_abort"} for s in sigs):
+            bar_style = "tn.err"
+        elif any(s in {"length_truncated", "reasoning_only",
+                       "empty_response"} for s in sigs):
+            bar_style = "tn.warn"
+        else:
+            fr = e.get("finish_reason") or "stop"
+            bar_style = OUTCOME_STYLE.get(fr, "tn.ok")
+
+        # Positions in [0, bar_width)
+        def _pos(t):
+            return max(0, min(bar_width - 1,
+                              int((t - view_start) / window_s * bar_width)))
+        p_start = _pos(start)
+        p_end   = _pos(end)
+        p_ttft  = _pos(start + ttft) if ttft is not None else p_end
+        # Ensure both phases are visible even on a long view: minimum bar
+        # is 2 chars (1 prefill + 1 decode) when both phases exist.
+        if ttft is not None and ttft > 0:
+            if p_end - p_start < 2:
+                p_end = min(bar_width, p_start + 2)
+            if p_ttft <= p_start:
+                p_ttft = p_start + 1
+            if p_ttft >= p_end:
+                p_ttft = p_end - 1
+        else:
+            if p_end <= p_start:
+                p_end = min(bar_width, p_start + 1)
+            p_ttft = p_start  # no prefill phase known → all-decode
+
+        bar = Text()
+        # leading dim padding
+        if p_start > 0:
+            bar.append(" " * p_start, style="tn.dim")
+        # prefill phase
+        if p_ttft > p_start:
+            bar.append(GANTT_PREFILL * (p_ttft - p_start), style=bar_style)
+        # decode phase
+        if p_end > p_ttft:
+            bar.append(GANTT_DECODE * (p_end - p_ttft), style=bar_style)
+        # trailing dim padding
+        if p_end < bar_width:
+            bar.append(" " * (bar_width - p_end), style="tn.dim")
+
+        # Time label = end-of-request
+        hms = datetime.fromtimestamp(end).strftime("%H:%M:%S")
+        key = ((e.get("key_masked") or e.get("key_prefix") or "?"))[:14]
+        pt = e.get("prompt_tokens"); ct = e.get("completion_tokens")
+        ratio = f"{(pt or 0)//1000}k→{ct or 0}" if (pt and pt >= 1000) \
+                else (f"{pt or 0}→{ct or 0}" if pt or ct else "—")
+        end_label = Text(e.get("finish_reason") or "?", style=bar_style)
+
+        t.add_row(hms, key, ratio, bar, end_label)
+
+    return Panel(t,
+                 title=f"request timeline · last {len(win)} in {window_s // 60}m window",
+                 title_align="left", border_style="tn.muted", box=box.MINIMAL)
+
+
+def make_tool_args(monitor: TrafficMonitor, window_s: int) -> Panel:
+    """Per-tool argument-size distribution (sparkline + median + max)."""
+    sizes = monitor.tool_arg_sizes(window_s)
+    if not sizes:
+        return Panel(Text("no tool calls in window", style="tn.dim",
+                          justify="center"),
+                     title="tool-arg sizes",
+                     title_align="left", border_style="tn.muted",
+                     box=box.MINIMAL)
+
+    t = Table(show_header=True, header_style="tn.dim", box=box.MINIMAL,
+              expand=True, padding=(0, 1))
+    t.add_column("tool",   style="tn.fg",  no_wrap=True)
+    t.add_column("n",      style="tn.dim", justify="right")
+    t.add_column("dist",   style="tn.accent", no_wrap=True)
+    t.add_column("median", style="tn.dim", justify="right")
+    t.add_column("max",    style="tn.dim", justify="right")
+
+    # Bucket all sizes globally for shared y-axis; histograms per tool.
+    def _hist(values, bins=10):
+        if not values:
+            return [0] * bins
+        lo, hi = min(values), max(values)
+        if hi <= lo:
+            return [len(values)] + [0] * (bins - 1)
+        out = [0] * bins
+        span = hi - lo
+        for v in values:
+            idx = min(bins - 1, int((v - lo) / span * bins))
+            out[idx] += 1
+        return out
+
+    def _fmt_sz(n):
+        return f"{n}" if n < 1024 else f"{n/1024:.1f}k"
+
+    rows = sorted(sizes.items(), key=lambda kv: -len(kv[1]))[:10]
+    for name, vs in rows:
+        n = len(vs)
+        s = sorted(vs)
+        median = s[len(s) // 2]
+        mx = s[-1]
+        spark = sparkline(_hist(vs, bins=10), width=10)
+        t.add_row(name[:18], str(n), spark, _fmt_sz(median), _fmt_sz(mx))
+
+    return Panel(t, title=f"tool-arg sizes ({window_s // 60}m)",
+                 title_align="left", border_style="tn.muted", box=box.MINIMAL)
+
+
+def make_latency(monitor: TrafficMonitor, window_s: int) -> Panel:
+    p_ttft = monitor.percentiles(window_s, "ttft_s")
+    p_e2e = monitor.percentiles(window_s, "elapsed_s")
+    s = monitor.latency_summary(window_s)
+
+    t = Table(show_header=True, header_style="tn.dim", box=box.MINIMAL,
+              expand=True, padding=(0, 1))
+    t.add_column("metric", style="tn.fg", no_wrap=True)
+    t.add_column("p50",  justify="right", style="tn.fg")
+    t.add_column("p95",  justify="right", style="tn.fg")
+    t.add_column("p99",  justify="right", style="tn.fg")
+    t.add_column("avg",  justify="right", style="tn.fg")
+    t.add_column("notes", style="tn.dim")
+
+    # The "prompt avg" rate is wall-clock pt/ttft — it reflects effective
+    # ingestion *including* prefix-cache wins (so on cache-hot agentic
+    # traffic it'll exceed raw engine prefill throughput by ≫10×).
+    t.add_row("TTFT",
+              fmt_dur(p_ttft[50]), fmt_dur(p_ttft[95]), fmt_dur(p_ttft[99]),
+              fmt_dur(s["ttft_avg"]),
+              f"prompt avg {fmt_tps(s['prefill_tps_avg'])} t/s (incl. cache)")
+    t.add_row("E2E ",
+              fmt_dur(p_e2e[50]),  fmt_dur(p_e2e[95]),  fmt_dur(p_e2e[99]),
+              fmt_dur(s["e2e_avg"]),
+              f"decode avg {fmt_tps(s['decode_tps_avg'])} t/s")
+    return Panel(t, title="latency", title_align="left",
+                 border_style="tn.muted", box=box.MINIMAL)
+
+
+def make_signatures(monitor: TrafficMonitor, window_s: int) -> Panel:
+    counts = monitor.malformed_counts(window_s)
+    if not counts:
+        return Panel(
+            Text("no malformed signatures in window — all clean",
+                 style="tn.ok", justify="center"),
+            title="malformed signatures",
+            title_align="left", border_style="tn.muted", box=box.MINIMAL,
+        )
+    t = Table(show_header=False, box=box.MINIMAL, expand=True, padding=(0, 1))
+    t.add_column(style="tn.fg")
+    t.add_column(justify="right")
+    seen = set()
+    for sig, style in SIG_ORDER_STYLE:
+        if sig in counts:
+            seen.add(sig)
+            t.add_row(Text(sig, style=style),
+                      Text(str(counts[sig]), style=style))
+    for sig, cnt in counts.items():
+        if sig not in seen:
+            t.add_row(Text(sig, style="tn.fg"),
+                      Text(str(cnt), style="tn.fg"))
+    return Panel(t, title="malformed signatures (window)",
+                 title_align="left", border_style="tn.muted", box=box.MINIMAL)
+
+
+def _failure_excerpt(e: dict) -> str:
+    sigs = set(e.get("_signatures") or [])
+    # Abort/error contexts win over softer signals like reasoning_only —
+    # if a request both reasoned-only AND was aborted, the abort is the
+    # operator-relevant explanation.
+    if "upstream_abort" in sigs:
+        return f"upstream cut after {e.get('elapsed_s')}s"
+    if "client_abort" in sigs:
+        return f"client cut after {e.get('elapsed_s')}s  pt={e.get('prompt_tokens')}"
+    if "status_5xx" in sigs:
+        return f"upstream status {e.get('status')}"
+    if "engine_error" in sigs:
+        return f"finish={e.get('finish_reason')}  status={e.get('status')}"
+    if "arg_parse_error" in sigs:
+        for tc in e.get("tool_calls") or []:
+            if tc.get("_args_parse_error"):
+                args = ((tc.get("function") or {}).get("arguments") or "")
+                name = (tc.get("function") or {}).get("name") or "?"
+                return f"{name}({args[:55]}…)" if len(args) > 55 \
+                       else f"{name}({args})"
+    if "hallucinated_tool" in sigs:
+        defs = e.get("tool_names") or []
+        for tc in e.get("tool_calls") or []:
+            n = (tc.get("function") or {}).get("name")
+            if n and n not in defs:
+                return f"emit:{n}  defs:{defs[:6]}"
+    if "reasoning_only" in sigs:
+        return (f"reason={e.get('reasoning_chars', 0)} "
+                f"content=0  max_tokens={e.get('max_tokens')}")
+    if "length_truncated" in sigs:
+        return (f"ct={e.get('completion_tokens')} "
+                f"max={e.get('max_tokens')}  e2e {e.get('elapsed_s')}s")
+    if "empty_response" in sigs:
+        return f"HTTP 200, zero everything  finish={e.get('finish_reason')}"
+    if "finish_inconsistent" in sigs:
+        return "finish=tool_calls but zero assembled"
+    if "giant_prompt_no_progress" in sigs:
+        return (f"pt={e.get('prompt_tokens')} ct={e.get('completion_tokens')} "
+                f"finish={e.get('finish_reason')}")
+    if "no_messages" in sigs:
+        return "request body had no messages[]"
+    return (f"finish={e.get('finish_reason')} "
+            f"pt={e.get('prompt_tokens')} ct={e.get('completion_tokens')}")
+
+
+def make_recent_failures(monitor: TrafficMonitor, n: int = 8,
+                         window_s: Optional[int] = None) -> Panel:
+    fails = monitor.recent_failures(n, seconds=window_s)
+    t = Table(show_header=True, header_style="tn.dim", box=box.MINIMAL,
+              expand=True, padding=(0, 1))
+    t.add_column("time",     style="tn.dim", no_wrap=True)
+    t.add_column("key",      style="tn.dim", no_wrap=True)
+    t.add_column("sig",      style="tn.err", no_wrap=True)
+    t.add_column("excerpt",  style="tn.fg")
+    if not fails:
+        t.add_row("—", "—", "—", "no failures in window")
+        return Panel(t, title="recent failures",
+                     title_align="left", border_style="tn.muted",
+                     box=box.MINIMAL)
+    for e in fails:
+        unix_ts = e.get("_ts_unix") or 0
+        hms = datetime.fromtimestamp(unix_ts).strftime("%H:%M:%S") \
+              if unix_ts else "—"
+        key = (e.get("key_masked") or "?")[:18]
+        sigs = list(e.get("_signatures") or [])
+        # show highest-priority sig first
+        sigs.sort(key=lambda s: [k for k, _ in SIG_ORDER_STYLE].index(s)
+                                 if s in SIG_STYLE_MAP else 99)
+        sig_label = sigs[0] if sigs else "?"
+        sig_style = SIG_STYLE_MAP.get(sig_label, "tn.fg")
+        excerpt = _failure_excerpt(e)
+        t.add_row(hms, key, Text(sig_label, style=sig_style), excerpt[:80])
+    return Panel(t, title="recent failures",
+                 title_align="left", border_style="tn.muted", box=box.MINIMAL)
+
+
+def make_keys(monitor: TrafficMonitor, window_s: int) -> Panel:
+    rows = monitor.per_key(window_s, n=8)
+    t = Table(show_header=True, header_style="tn.dim", box=box.MINIMAL,
+              expand=True, padding=(0, 1))
+    t.add_column("key",     style="tn.fg")
+    t.add_column("req",     justify="right", style="tn.fg")
+    t.add_column("rps",     justify="right", style="tn.dim")
+    t.add_column("tok/min", justify="right", style="tn.dim")
+    t.add_column("err%",    justify="right")
+    if not rows:
+        t.add_row("—", "—", "—", "—", "—")
+        return Panel(t, title="by key", title_align="left",
+                     border_style="tn.muted", box=box.MINIMAL)
+    for r in rows:
+        t.add_row(r["key"][:24],
+                  str(r["req"]),
+                  f"{r['rps']:.2f}",
+                  f"{r['tokens_per_min']/1000:.1f}k",
+                  Text(f"{r['err_pct']:.1f}%",
+                       style=err_style_for(r["err_pct"])))
+    return Panel(t,
+                 title=f"by key ({window_s // 60}m)",
+                 title_align="left", border_style="tn.muted", box=box.MINIMAL)
+
+
+def make_tools(monitor: TrafficMonitor, window_s: int) -> Panel:
+    rows = monitor.tool_calls(window_s)
+    t = Table(show_header=True, header_style="tn.dim", box=box.MINIMAL,
+              expand=True, padding=(0, 1))
+    t.add_column("tool",    style="tn.fg")
+    t.add_column("calls",   justify="right", style="tn.fg")
+    t.add_column("arg_err", justify="right")
+    if not rows:
+        t.add_row("—", "—", "—")
+        return Panel(t, title="tool calls", title_align="left",
+                     border_style="tn.muted", box=box.MINIMAL)
+    for r in rows[:10]:
+        err = r["arg_err"]
+        err_style = "tn.err" if err > 0 else "tn.dim"
+        t.add_row(r["name"][:24],
+                  str(r["calls"]),
+                  Text(str(err), style=err_style))
+    return Panel(t, title=f"tool calls ({window_s // 60}m)",
+                 title_align="left", border_style="tn.muted", box=box.MINIMAL)
+
+
+def make_footer(monitor: TrafficMonitor, view_label: str,
+                refresh: float) -> Panel:
+    total = len(monitor.entries)
+    line = Text.assemble(
+        ("press Ctrl-C to quit  · ", "tn.dim"),
+        ("view ", "tn.dim"), (view_label, "tn.accent"),
+        ("  · refresh ", "tn.dim"), (f"{refresh:.1f}s", "tn.fg"),
+        ("  · keep buffer ", "tn.dim"), (f"{total}", "tn.fg"),
+        ("/", "tn.dim"), (f"{monitor.max_keep}", "tn.dim"),
+    )
+    return Panel(line, border_style="tn.muted", box=box.MINIMAL)
+
+
+# ─────────────────────────────────────────────────────────── main loop
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--view", choices=list(VIEW_WINDOWS), default="5m")
+    ap.add_argument("--refresh", type=float, default=1.0)
+    ap.add_argument("--log-dir", default="/home/max/llm-stack/logs/proxy")
+    ap.add_argument("--once", action="store_true",
+                    help="Render one frame to stdout (no alt-screen) and exit")
+    args = ap.parse_args()
+    window_s = VIEW_WINDOWS[args.view]
+
+    monitor = TrafficMonitor(log_dir=args.log_dir)
+    monitor.scan()  # prime with today/yesterday
+
+    console = Console(theme=TN_THEME)
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header",     size=8),   # 4 lines × incl sparklines
+        Layout(name="latency",    size=7),
+        Layout(name="engine",     size=7),
+        Layout(name="gantt",      size=14),
+        Layout(name="mid"),                  # signatures | tools | tool_args
+        Layout(name="recent",     size=11),
+        Layout(name="keys",       size=10),
+        Layout(name="footer",     size=3),
+    )
+    layout["mid"].split_row(
+        Layout(name="signatures"),
+        Layout(name="tools"),
+        Layout(name="tool_args"),
+    )
+
+    def refresh_once():
+        monitor.scan()
+        monitor.refresh_engine_state()
+        monitor.refresh_gpu_state()
+        layout["header"].update(make_header(monitor, args.view, window_s))
+        layout["latency"].update(make_latency(monitor, window_s))
+        layout["engine"].update(make_engine(monitor))
+        layout["gantt"].update(make_gantt(monitor, window_s, n_rows=10))
+        layout["signatures"].update(make_signatures(monitor, window_s))
+        layout["tools"].update(make_tools(monitor, window_s))
+        layout["tool_args"].update(make_tool_args(monitor, window_s))
+        layout["recent"].update(make_recent_failures(monitor, n=7,
+                                                     window_s=window_s))
+        layout["keys"].update(make_keys(monitor, window_s))
+        layout["footer"].update(make_footer(monitor, args.view, args.refresh))
+
+    if args.once:
+        refresh_once()
+        console.print(layout)
+        return 0
+
+    try:
+        with Live(layout, console=console,
+                  refresh_per_second=max(1.0 / args.refresh, 1.0),
+                  screen=True):
+            while True:
+                refresh_once()
+                time.sleep(args.refresh)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

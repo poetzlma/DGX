@@ -26,3 +26,6 @@ __pycache__/
 
 # Agent operational memory — not for public repo (commercial notes, topology, gateway domain)
 memory/
+
+# Local quantized model weights (18 GB+) — never commit
+models/

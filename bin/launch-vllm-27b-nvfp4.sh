@@ -26,12 +26,14 @@ exec docker run --name vllm-qwen-27b \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -p 0.0.0.0:9008:9008 \
   -v /home/max/.cache/huggingface:/root/.cache/huggingface \
+  -v /home/max/llm-stack/etc:/llm-stack-etc:ro \
   -e HF_TOKEN_FILE=/root/.cache/huggingface/token \
   -e VLLM_ENGINE_READY_TIMEOUT_S=1800 \
   -e VLLM_ENABLE_CUDA_COMPATIBILITY=0 \
   vllm/vllm-openai:cu130-nightly \
   AlphaOxO/Qwen3.6-27B-NVFP4 \
   --host 0.0.0.0 --port 9008 \
+  --chat-template /llm-stack-etc/qwen3.6-chat-template-froggeric.jinja \
   --served-model-name qwen3.6-27b-mtp \
   --max-model-len 262144 \
   --max-num-seqs 10 \

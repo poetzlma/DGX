@@ -24,7 +24,7 @@ from .engine import fetch_metrics, gauge_snapshot, EMPTY_SNAP
 from .system import read_nvidia_stats, read_meminfo
 from .stages import RX_STAGE_PATTERNS, stage_progress
 
-LOG_PROXY_META_DIR = "/tmp/log-proxy"
+LOG_PROXY_META_DIR = "/home/max/llm-stack/logs/proxy"
 
 
 @dataclass
@@ -334,22 +334,39 @@ class EngineMonitor:
                 del self.requests[k]
 
     def _enrich_from_log_proxy(self) -> None:
-        """If log-proxy is running (LOG_PROXY_META_DIR exists), join its
+        """If log-proxy is writing under LOG_PROXY_META_DIR, join its
         meta.json files to in-memory RequestState entries by chatcmpl-XXX.
-        Silent no-op when log-proxy isn't deployed."""
+        Layout is `{LOG_PROXY_META_DIR}/{YYYY-MM-DD}/{model}/*.meta.json`.
+        Scans today and yesterday (for midnight overlap). Silent no-op
+        when log-proxy isn't deployed."""
         if not os.path.isdir(LOG_PROXY_META_DIR):
             return
-        try:
-            entries = os.listdir(LOG_PROXY_META_DIR)
-        except OSError:
-            return
-        new = [f for f in entries
-               if f.endswith(".meta.json") and f not in self._meta_seen]
+        from datetime import date, timedelta
+        today = date.today()
+        candidates = []
+        for d in (today - timedelta(days=1), today):
+            day_dir = os.path.join(LOG_PROXY_META_DIR, d.isoformat())
+            if not os.path.isdir(day_dir):
+                continue
+            try:
+                model_dirs = os.listdir(day_dir)
+            except OSError:
+                continue
+            for m in model_dirs:
+                m_path = os.path.join(day_dir, m)
+                if not os.path.isdir(m_path):
+                    continue
+                try:
+                    for fname in os.listdir(m_path):
+                        if fname.endswith(".meta.json"):
+                            candidates.append(os.path.join(m_path, fname))
+                except OSError:
+                    continue
+        new = [p for p in candidates if p not in self._meta_seen]
         if not new:
             return
-        for fname in new:
-            self._meta_seen.add(fname)
-            path = os.path.join(LOG_PROXY_META_DIR, fname)
+        for path in new:
+            self._meta_seen.add(path)
             try:
                 with open(path) as f:
                     meta = json.load(f)

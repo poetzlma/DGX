@@ -26,7 +26,7 @@ from aiohttp import web
 UPSTREAM = "http://127.0.0.1:8080"
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8079
-LOG_DIR = "/tmp/log-proxy"
+LOG_DIR = "/home/max/llm-stack/logs/proxy"
 
 os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
 # Logs hold request bodies + masked client keys; keep them owner-only even if
@@ -38,13 +38,35 @@ def _ts():
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
 
 
+def _safe(name):
+    if not name:
+        return "_unknown"
+    return name.replace("/", "_").replace(":", "_").replace("..", "_")[:64]
+
+
+def _bucket(ts, model):
+    day = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}"
+    d = f"{LOG_DIR}/{day}/{_safe(model)}"
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 async def proxy(request: web.Request) -> web.StreamResponse:
     reqid = uuid.uuid4().hex[:12]
     ts = _ts()
-    base = f"{LOG_DIR}/{ts}-{reqid}"
     is_chat = request.path == "/v1/chat/completions" and request.method == "POST"
 
     body_bytes = await request.read()
+    # Peek at the request body early so we can bucket logs by model.
+    early_model = None
+    try:
+        peek = json.loads(body_bytes)
+        if isinstance(peek, dict):
+            early_model = peek.get("model")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        peek = None
+    base = f"{_bucket(ts, early_model)}/{ts}-{reqid}"
+
     if is_chat:
         try:
             with open(f"{base}.req.json", "wb") as f:
@@ -84,17 +106,55 @@ async def proxy(request: web.Request) -> web.StreamResponse:
 
             log_f = open(f"{base}.resp.txt", "wb") if is_chat else None
             chunks_written = 0
+            t_first_byte = None
+            t_first_token = None
+            aborted = None  # None / "client" / "upstream"
             try:
                 async for chunk in upstream.content.iter_any():
+                    now = time.perf_counter()
+                    if t_first_byte is None:
+                        t_first_byte = now
                     chunks_written += len(chunk)
                     if log_f:
                         log_f.write(chunk)
-                    await resp.write(chunk)
+                    # First-content detection: scan SSE deltas until a
+                    # content / reasoning_content / tool_calls field appears.
+                    if t_first_token is None and is_chat:
+                        for line in chunk.split(b"\n"):
+                            if not line.startswith(b"data: "):
+                                continue
+                            pl = line[6:].strip()
+                            if pl in (b"[DONE]", b""):
+                                continue
+                            try:
+                                obj = json.loads(pl)
+                            except json.JSONDecodeError:
+                                continue
+                            for choice in obj.get("choices") or []:
+                                d = choice.get("delta") or {}
+                                if (d.get("content") or
+                                        d.get("reasoning_content") or
+                                        d.get("tool_calls")):
+                                    t_first_token = now
+                                    break
+                            if t_first_token is not None:
+                                break
+                    try:
+                        await resp.write(chunk)
+                    except (ConnectionResetError, aiohttp.ClientError):
+                        aborted = "client"
+                        break
+            except aiohttp.ClientPayloadError:
+                aborted = "upstream"
             finally:
                 if log_f:
                     log_f.close()
 
-            await resp.write_eof()
+            if aborted is None:
+                try:
+                    await resp.write_eof()
+                except (ConnectionResetError, aiohttp.ClientError):
+                    aborted = "client"
             elapsed = time.perf_counter() - t_start
 
             if is_chat:
@@ -111,6 +171,12 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                     "request_bytes": len(body_bytes),
                     "response_bytes": chunks_written,
                 }
+                if t_first_byte is not None:
+                    meta["tfb_s"] = round(t_first_byte - t_start, 4)
+                if t_first_token is not None:
+                    meta["ttft_s"] = round(t_first_token - t_start, 4)
+                if aborted is not None:
+                    meta["aborted"] = aborted
 
                 # ── Auth: capture a *masked* form of the client key for
                 # downstream user/key enrichment. The full token is NEVER
@@ -125,19 +191,53 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                     else:
                         meta["key_masked"] = "…"
                     meta["key_prefix"] = token[:8]
+
+                # Also dump every X-* and a few LiteLLM-relevant headers, so
+                # we can see what the upstream proxy is actually forwarding.
+                # If LiteLLM tags the call with x-litellm-key-name or similar,
+                # we'll catch it here.
+                meta["fwd_headers"] = {
+                    k: v for k, v in request.headers.items()
+                    if k.lower().startswith(("x-", "litellm-", "openai-"))
+                }
+                # Standard OpenAI `user` field from request body — many
+                # clients (incl. Pi) set it as their identity hint.
+                try:
+                    rb_peek = json.loads(body_bytes)
+                    if isinstance(rb_peek, dict) and rb_peek.get("user"):
+                        meta["body_user"] = rb_peek["user"]
+                    md = (rb_peek.get("metadata") or {}) if isinstance(rb_peek, dict) else {}
+                    for k in ("user_api_key", "user_api_key_alias",
+                              "user_api_key_user_id", "user_api_key_team_id"):
+                        if k in md:
+                            meta[f"body_{k}"] = md[k]
+                except (json.JSONDecodeError, TypeError):
+                    pass
                 # Pull a few notable fields out of the request body
                 try:
                     rb = json.loads(body_bytes)
                     meta["request_model"] = rb.get("model")
                     msgs = rb.get("messages") or []
                     meta["n_messages"] = len(msgs)
-                    meta["tools_count"] = len(rb.get("tools") or [])
+                    tools_list = rb.get("tools") or []
+                    meta["tools_count"] = len(tools_list)
+                    meta["tool_names"] = [
+                        (t.get("function") or {}).get("name")
+                        for t in tools_list if isinstance(t, dict)
+                    ]
+                    meta["tool_choice"] = rb.get("tool_choice")
                     meta["max_tokens"] = rb.get("max_tokens")
                     meta["stream"] = rb.get("stream", False)
                     last = msgs[-1] if msgs else {}
                     last_content = last.get("content") if isinstance(last, dict) else None
                     if isinstance(last_content, str):
                         meta["last_user_content_chars"] = len(last_content)
+                    # Count tool_result / tool messages already in conversation;
+                    # useful when chasing repeated tool-call failures across turns.
+                    meta["prior_tool_msgs"] = sum(
+                        1 for m in msgs
+                        if isinstance(m, dict) and m.get("role") == "tool"
+                    )
                 except (json.JSONDecodeError, ValueError, TypeError):
                     pass
                 # Inspect response for finish_reason if it's a non-streaming JSON
@@ -150,7 +250,9 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                         meta["finish_reason"] = ch.get("finish_reason")
                         msg = ch.get("message", {})
                         cstr = msg.get("content") or ""
+                        rstr = msg.get("reasoning_content") or ""
                         meta["completion_chars"] = len(cstr)
+                        meta["reasoning_chars"] = len(rstr)
                         meta["has_close_think"] = "</think>" in cstr
                         meta["has_open_think"] = "<think>" in cstr
                         post = cstr.split("</think>", 1)[1] if "</think>" in cstr else None
@@ -166,35 +268,86 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                         if meta.get("post_think_chars") is not None and \
                            meta["post_think_chars"] < 5:
                             meta["SUSPECT_TRUNC"] = True
+                        # Tool calls (non-stream): already assembled by server.
+                        tcs = msg.get("tool_calls") or []
+                        meta["tool_calls"] = tcs
+                        meta["tool_call_count"] = len(tcs)
+                        arg_errors = 0
+                        for tc in tcs:
+                            args = (tc.get("function") or {}).get("arguments", "")
+                            if args:
+                                try:
+                                    json.loads(args)
+                                except json.JSONDecodeError as e:
+                                    tc["_args_parse_error"] = str(e)
+                                    arg_errors += 1
+                        meta["tool_call_arg_errors"] = arg_errors
                     else:
-                        # SSE stream — pull response id from first chunk +
-                        # finish_reason from last meaningful chunk.
+                        # SSE stream — single full pass to assemble tool_calls,
+                        # split content vs reasoning_content, and pick up usage
+                        # if include_usage was set.
                         chunks = [l for l in txt.split(b"\n") if l.startswith(b"data: ")]
                         meta["sse_chunks"] = len(chunks)
+                        tool_buf = {}
+                        content_chars = 0
+                        reasoning_chars = 0
                         for c in chunks:
                             payload = c[6:].strip()
                             if payload in (b"[DONE]", b""):
                                 continue
                             try:
                                 cj = json.loads(payload)
-                                rid = cj.get("id")
-                                if rid:
-                                    meta["response_id"] = rid
-                                    break
                             except json.JSONDecodeError:
                                 continue
-                        for c in reversed(chunks):
-                            payload = c[6:].strip()
-                            if payload in (b"[DONE]", b""):
-                                continue
-                            try:
-                                cj = json.loads(payload)
-                                fr = (cj.get("choices") or [{}])[0].get("finish_reason")
-                                if fr:
-                                    meta["finish_reason"] = fr
-                                    break
-                            except json.JSONDecodeError:
-                                continue
+                            rid = cj.get("id")
+                            if rid and "response_id" not in meta:
+                                meta["response_id"] = rid
+                            u = cj.get("usage")
+                            if u:
+                                meta["prompt_tokens"] = (
+                                    u.get("prompt_tokens") or meta.get("prompt_tokens")
+                                )
+                                meta["completion_tokens"] = (
+                                    u.get("completion_tokens") or meta.get("completion_tokens")
+                                )
+                            for choice in cj.get("choices") or []:
+                                d = choice.get("delta") or {}
+                                if d.get("content"):
+                                    content_chars += len(d["content"])
+                                if d.get("reasoning_content"):
+                                    reasoning_chars += len(d["reasoning_content"])
+                                for tc in d.get("tool_calls") or []:
+                                    idx = tc.get("index", 0)
+                                    slot = tool_buf.setdefault(idx, {
+                                        "id": None, "type": "function",
+                                        "function": {"name": "", "arguments": ""},
+                                    })
+                                    if tc.get("id"):
+                                        slot["id"] = tc["id"]
+                                    if tc.get("type"):
+                                        slot["type"] = tc["type"]
+                                    fn = tc.get("function") or {}
+                                    if fn.get("name"):
+                                        slot["function"]["name"] += fn["name"]
+                                    if fn.get("arguments"):
+                                        slot["function"]["arguments"] += fn["arguments"]
+                                if choice.get("finish_reason"):
+                                    meta["finish_reason"] = choice["finish_reason"]
+                        meta["completion_chars"] = content_chars
+                        meta["reasoning_chars"] = reasoning_chars
+                        tcs = list(tool_buf.values())
+                        meta["tool_calls"] = tcs
+                        meta["tool_call_count"] = len(tcs)
+                        arg_errors = 0
+                        for tc in tcs:
+                            args = (tc.get("function") or {}).get("arguments", "")
+                            if args:
+                                try:
+                                    json.loads(args)
+                                except json.JSONDecodeError as e:
+                                    tc["_args_parse_error"] = str(e)
+                                    arg_errors += 1
+                        meta["tool_call_arg_errors"] = arg_errors
                 except (OSError, json.JSONDecodeError, KeyError, IndexError):
                     pass
 

@@ -1,0 +1,9 @@
+# Quantization-only image: aeon v4 (correct torch 2.11+cu130 / transformers 5.8
+# for GB10 sm121a) + auto_round 0.12.3 calibration toolchain. Used ONLY to run
+# AutoRound; serving still uses the pristine qwen36-v4 image.
+FROM ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v4
+# --no-deps protects the image's pinned torch/transformers; datasets brings its
+# own (multiprocess, dill, pyarrow, fsspec) which are quant-only.
+RUN pip install --no-deps auto_round==0.12.3 && \
+    pip install datasets && \
+    python3 -c "import auto_round, datasets; print('auto_round', auto_round.__version__, 'ok')"
