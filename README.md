@@ -16,10 +16,11 @@ Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`b
 | `qwopus3.6-27b-int4-dflash` | coding — Opus-distilled | 39 | 131 k | 102 GB | vLLM | `launch-vllm-qwopus-int4-dflash.sh` |
 | `qwen3.6-27b-fp8` | coding — quality baseline | 21 | 131 k | 91 GB | vLLM | `launch-vllm-27b-qwen-fp8.sh` |
 | `nemotron-3-nano-omni` | multimodal (image/audio/video) | 56 | 131 k | 91 GB | vLLM | `launch-vllm-nemotron-omni.sh` |
+| `cosmos3-nano-omni` 🆕 | image/video generation³ | — | — | ~30 GB | vLLM-Omni | `launch-vllm-cosmos3-nano-omni.sh` |
 | `diffusiongemma-26b` | speed / non-coding | 142 | 131 k | 50 GB | vLLM | `launch-vllm-diffusiongemma-nvfp4.sh` |
 | `deepseek-v4-flash-ds4` | long-context planner | 21 | 131 k | 22 GB | ds4 | `launch-ds4-server.sh` |
 
-¹ Ornith ctx is `ORNITH_CTX`/`ORNITH_PARALLEL`-tunable (now 3 slots × 131 k). &nbsp; ² **Thinking model** — output goes to `reasoning_content`; give generous `max_tokens` or `content` returns empty. &nbsp; tok/s / mem above are the 2026-06-27 single-stream sweep (pre-retune).
+¹ Ornith ctx is `ORNITH_CTX`/`ORNITH_PARALLEL`-tunable (now 3 slots × 131 k). &nbsp; ² **Thinking model** — output goes to `reasoning_content`; give generous `max_tokens` or `content` returns empty. &nbsp; ³ **Generation model, not chat** — call `POST /v1/videos` · `/v1/videos/sync` · `/v1/images/generations` (multipart), not `/v1/chat/completions`; tok/s and token-ctx don't apply. &nbsp; tok/s / mem above are the 2026-06-27 single-stream sweep (pre-retune).
 
 > **Concurrency (2026-06-27 retune):** every model **except `int4-dflash` and `ds4`** is now tuned to serve **c=1/2/3 at 131 k context** (`qwopus` is c=2 — its DFlash path forces heavier bf16 KV). `int4-dflash` stays single-stream (it's the prefill-bound coding default) and `ds4` stays single-stream (its decode doesn't scale with concurrency). See [decision #21](#decision-log).
 
@@ -32,6 +33,7 @@ Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`b
 - **`ornith-1.0-35b`** 🆕 — DeepReinforce's **Ornith-1.0** (MIT), a new agentic-coding MoE (35B/3B-active) that **writes its own RL training scaffold**; it scored **64.2 on Terminal-Bench 2.1, beating Qwen3.5-397B** (10× its size). Thinking model, and the fastest coding model here at 77 tok/s. The most interesting new model to pit against the Qwen incumbents on agentic/terminal tasks.
 - **`diffusiongemma-26b`** — Google DeepMind's first **diffusion LLM**, which denoises 256-token blocks instead of decoding token-by-token, hitting ~142 tok/s (fastest in the stack). Google notes quality is below autoregressive Gemma 4, so it's a **speed lane, not a coding lane**. Use it for fast non-coding work — summaries, drafts, classification — where latency beats peak quality.
 - **`nemotron-3-nano-omni`** — NVIDIA's **multimodal omni** model, a Mamba2-Transformer hybrid MoE with vision + audio encoders handling **text, image, audio, and video** in one model. It's the only multimodal option here — use it for anything the text-only coders can't see or hear.
+- **`cosmos3-nano-omni`** 🆕 — NVIDIA's **Cosmos3-Nano** world model (~15B omni), the *generation* counterpart to the analysers above: it **produces** images and video from text/image prompts via vLLM-Omni. Unlike everything else in this table it is **not a chat model** — call `/v1/videos`, `/v1/videos/sync`, or `/v1/images/generations` (see footnote ³). The 64B Cosmos3-Super needs multi-GPU and stays standalone in `~/cosmos3`; Nano is the variant that fits one GB10. Use it for text→image/video generation.
 - **`deepseek-v4-flash-ds4`** — DeepSeek's **V4-Flash**, whose multi-head-latent / compressed-KV attention scales to **256 k+ context cheaply**, run on the from-scratch antirez/ds4 C/CUDA engine with persistent disk-KV. Decode is slow (~21 tok/s) and doesn't parallelize, so it's a **planner, not a chat workhorse**. Use it for long-context planning/reasoning over whole codebases or long documents.
 
 ### Call it

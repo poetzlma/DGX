@@ -160,6 +160,21 @@ models:
     ttl: 3600
 
   # ─────────────────────────────────────────────────────────────────────
+  # Cosmos3-Nano (NVIDIA) omni world model via vLLM-Omni — EVAL slot 2026-06-27.
+  # ~15B omni (text/image/video/audio/action), fits unified mem (~30 GB BF16).
+  # NOT a chat model — generation endpoints: POST /v1/videos, /v1/videos/sync,
+  # /v1/images/generations. Image vllm/vllm-omni:cosmos3-aarch64 (GB10). Serves
+  # the local ~/cosmos3/models/Cosmos3-Nano copy. Cosmos3-Super (64B) stays
+  # standalone — multi-GPU only. Launcher: bin/launch-vllm-cosmos3-nano-omni.sh
+  # checkEndpoint /health (vLLM-Omni serves it). Port 9023 (next free).
+  # ─────────────────────────────────────────────────────────────────────
+  cosmos3-nano-omni:
+    cmd: /home/max/llm-stack/bin/launch-vllm-cosmos3-nano-omni.sh
+    proxy: http://127.0.0.1:9023
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
   # Qwopus3.6-27B-v2 (Jackrong) INT4 AutoRound + DFlash n=4 — EVAL slot 2026-05-27.
   # Claude-Opus-trace-distilled fine-tune of Qwen3.6-27B; same arch as prod
   # int4-dflash, quantized locally (RTN, Intel layer recipe: in_proj_a/b+mtp.fc
@@ -251,6 +266,7 @@ groups:
       - qwopus3.6-27b-int4-dflash # Qwopus Opus-distill fine-tune, INT4+DFlash
       - ornith-1.0-35b            # NEW 2026-06-27: DeepReinforce 35B-A3B MoE (GGUF/llama.cpp)
       - diffusiongemma-26b        # Google diffusion LLM, NVFP4
+      - cosmos3-nano-omni         # NEW 2026-06-27: NVIDIA Cosmos3-Nano omni world model (vLLM-Omni)
       - nemotron-3-nano-omni      # multimodal omni, NVFP4
       - deepseek-v4-flash-ds4     # antirez/ds4 native engine, long-ctx planner
       # ─── retired 2026-06-27 (rollback-slot cleanup) ────────────────────
