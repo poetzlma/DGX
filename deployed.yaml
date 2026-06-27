@@ -1,21 +1,20 @@
 # Deployed LLM stack manifest — source of truth for downstream proxies (LiteLLM, etc.)
 #
-# Updated: 2026-05-17
+# Updated: 2026-06-27
 # Gateway: http://192.168.1.12:8079/v1   (log-proxy → llama-swap, OpenAI-compatible)
 #                                         underlying engine gateway: :8080 (llama-swap)
 #
 # All models share the gateway URL — clients route by `model` field.
 #
-# 2026-05-17 routing change: the two production Qwen3.6 engines (dense
-# INT4+DFlash and MoE NVFP4) are now CO-RESIDENT, not swap-exclusive. Both
-# stay loaded on the GPU (~104 GB / 119 GB) and serve their own routes in
-# parallel. The rest of `main` (sakamaki / aeon / mtp rollbacks, nemotron,
-# both deepseek lanes) remain swap-exclusive with each other, but loading
-# any of them while the qwen pair is resident will OOM — only ~15 GB free.
-# Run `docker rm -f vllm-qwen-27b-int4-dflash` (or the MoE container) to
-# free memory before triggering a swap-exclusive engine.
+# 2026-06-27 phase change: EXPERIMENTATION — no fixed production model. Every
+# model is a swap-exclusive member of a single llama-swap `experiments` group,
+# so each loads ALONE with the full 119 GB (no co-resident pair anymore). The
+# first request for a route cold-swaps it in and evicts whatever was resident.
+# Contexts were retuned for c=1/2/3 @ 131k where the engine allows (verified
+# no-OOM), EXCEPT the two deliberately-narrow lanes: int4-dflash (120k/c=1,
+# the DFlash drafter lane) and ds4 (131k planner, decode-bound).
 #
-# Per-model internal ports (9008–9019) are internal-only while loaded.
+# Per-model internal ports (9010–9022) are internal-only while loaded.
 #
 # Cold-start budget: vLLM models ~2–6 min on first request after swap;
 # the ds4 native binary is ~104s cold / ~74s warm. Set request_timeout >=
@@ -27,21 +26,21 @@
 
 gateway:
   url: http://192.168.1.12:8079/v1
-  api_key: not-needed   # LAN-only, no auth
-  swap_mode: hybrid     # dense+MoE co-resident; rest swap-exclusive
+  api_key: not-needed   # LAN-only, no auth (authed edge is Cloudflare/LiteLLM on .7)
+  swap_mode: exclusive  # single `experiments` group; one model resident at a time
   request_timeout_min_s: 600
 
 deployed:
-  # ─── co-resident pair (both always loaded since 2026-05-17) ──────────
+  # All members of the single swap-exclusive `experiments` group (one resident
+  # at a time). config = what the launcher actually serves; verified no-OOM.
+
   - name: qwen3.6-27b-int4-dflash
-    role: production coding (default qwen3.6-27b route)
+    role: coding default (qwen3.6-27b / qwen3.6-35b-a3b aliases resolve here)
     method: Intel/Qwen3.6-27B-int4-AutoRound + z-lab DFlash drafter n=4
     image: ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v4
     aliases: [qwen3.6-27b, qwen3.6-35b-a3b]
     port_internal: 9018
-    promoted: 2026-05-17
-    coresident_group: qwen-coresident
-    config: max-model-len=120000 max-num-seqs=1 gpu-mem-util=0.50
+    config: max-model-len=120000 max-num-seqs=1 gpu-mem-util=0.50   # narrow by design (DFlash lane)
     measured_single_stream_tok_s: 29   # +80% over previous fp8+MTP n=3 prod
 
   - name: qwen3.6-35b-a3b-nvfp4
@@ -49,46 +48,58 @@ deployed:
     method: RedHatAI/Qwen3.6-35B-A3B-NVFP4 + native MTP n=1 (Scargall recipe)
     image: vllm/vllm-openai:cu130-nightly
     port_internal: 9019
-    added: 2026-05-17
-    coresident_group: qwen-coresident
-    config: max-model-len=80000 max-num-seqs=2 gpu-mem-util=0.40
+    config: max-model-len=131072 max-num-seqs=3 gpu-mem-util=0.70   # retuned 2026-06-27 (was 80k/2/0.40)
     measured_single_stream_tok_s: 56   # c=1 short input; 101 agg at c=2
-
-  # ─── swap-exclusive (main group; only one of these at a time, AND
-  # neither qwen-coresident member loaded) ─────────────────────────────
-  - name: diffusiongemma-26b
-    role: eval slot — non-coding / speed lane (Google dLLM, added 2026-06-11)
-    method: nvidia/diffusiongemma-26B-A4B-it-NVFP4 (ModelOpt NVFP4), diffusion runner-v2
-    image: vllm/vllm-openai:gemma-aarch64-cu130   # day-0 2026-06-10 gemma build
-    port_internal: 9021
-    added: 2026-06-11
-    config: max-model-len=131072 max-num-seqs=4 gpu-mem-util=0.30 attn=TRITON_ATTN
-    measured_single_stream_tok_s: 116   # short answer; 218 tok/s on long thinking-mode gen
-    note: quality < AR Gemma 4 per Google; speed/breadth lane, not coding-quality
 
   - name: qwen3.6-27b-fp8
     role: rollback (was prod 2026-05-08 → 2026-05-17)
     method: Qwen official FP8 + native MTP n=3 + --reasoning-parser qwen3
     port_internal: 9016
-    demoted: 2026-05-17
+    config: max-model-len=131072 max-num-seqs=3 gpu-mem-util=0.80   # retuned 2026-06-27 (was 200k/2/0.70)
 
-  # RETIRED 2026-06-27 (full rollback cleanup): qwen3.6-27b-int4-autoround,
-  # -sakamaki-mtp, -aeon-dflash, -mtp. Superseded 27B slots; NVFP4 weights
-  # evicted. qwen3.6-27b-fp8 kept above as the single rollback.
+  - name: qwopus3.6-27b-int4-dflash
+    role: eval — Opus-trace-distilled 27B coding fine-tune (Jackrong)
+    method: locally INT4 AutoRound-quantized Qwopus + z-lab DFlash drafter n=4
+    image: ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v4
+    port_internal: 9020
+    added: 2026-06-27
+    config: max-model-len=131072 max-num-seqs=2 gpu-mem-util=0.85   # c=2 (bf16 KV ceiling)
+
+  - name: ornith-1.0-35b
+    role: eval — DeepReinforce 35B-A3B MoE (qwen35moe arch, agentic coding, MIT)
+    method: Q4_K_M GGUF via mainline llama.cpp (CUDA, sm_121)
+    image: native (~/llama.cpp/build/bin/llama-server)
+    port_internal: 9022
+    added: 2026-06-27
+    config: ctx=393216 parallel=3   # 3 slots x 131072 = c=3 @ 131k
+
+  - name: diffusiongemma-26b
+    role: eval — non-coding / speed lane (Google dLLM, added 2026-06-11)
+    method: nvidia/diffusiongemma-26B-A4B-it-NVFP4 (ModelOpt NVFP4), diffusion runner-v2
+    image: vllm/vllm-openai:gemma-aarch64-cu130   # day-0 2026-06-10 gemma build
+    port_internal: 9021
+    config: max-model-len=131072 max-num-seqs=4 gpu-mem-util=0.30 attn=TRITON_ATTN
+    measured_single_stream_tok_s: 116   # short answer; 218 tok/s on long thinking-mode gen
+    note: quality < AR Gemma 4 per Google; speed/breadth lane, not coding-quality
 
   - name: nemotron-3-nano-omni
     role: multimodal omni (text/image/audio/video)
-    method: NVFP4
+    method: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 (Mamba2-Transformer hybrid MoE)
+    image: vllm/vllm-openai:cu130-nightly-omni
     port_internal: 9012
-
-  # RETIRED 2026-06-27: deepseek-v4-flash (old llama.cpp fork, port 9011).
-  # Superseded by -ds4 lane; 81 GB GGUF evicted (ds4 uses its own file).
+    config: max-model-len=131072 max-num-seqs=8 gpu-mem-util=0.72   # retuned 2026-06-27 (util 0.65→0.72)
+    measured_agg_tok_s: 383   # c=8 peak
 
   - name: deepseek-v4-flash-ds4
-    role: planner lane (long-ctx with persistent disk KV cache, decode ~10 t/s)
-    method: antirez/ds4 native C/CUDA, IQ2_XXS imatrix + MTP n=2
+    role: planner lane (long-ctx with persistent disk KV cache, decode-bound)
+    method: antirez/ds4 native C/CUDA (mainline-rebased 2026-06-27), IQ2_XXS imatrix + custom Q4 decode
     port_internal: 9010
     added: 2026-05-12
+    config: ctx=131072   # decode ~21 t/s (custom Q4 dense decode; MTP off)
+
+  # RETIRED 2026-06-27: qwen3.6-27b-{int4-autoround,sakamaki-mtp,aeon-dflash,mtp}
+  # (superseded 27B rollback slots, NVFP4 weights evicted) and deepseek-v4-flash
+  # (old llama.cpp fork :9011, 81 GB GGUF evicted — use -ds4).
 
 # ─── LiteLLM model_list (drop into proxy config) ───────────────────────────
 # api_base routes through log-proxy on :8079 (NOT :8080). The log-proxy
