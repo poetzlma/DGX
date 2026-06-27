@@ -28,7 +28,10 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8079
 LOG_DIR = "/tmp/log-proxy"
 
-os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+# Logs hold request bodies + masked client keys; keep them owner-only even if
+# the dir already existed (makedirs mode is a no-op on an existing dir).
+os.chmod(LOG_DIR, 0o700)
 
 
 def _ts():
@@ -109,13 +112,14 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                     "response_bytes": chunks_written,
                 }
 
-                # ── Auth: capture Authorization for downstream user/key
-                # enrichment. Stores prefix (display form) only; the full
-                # token is in /tmp/log-proxy and never leaves the host.
+                # ── Auth: capture a *masked* form of the client key for
+                # downstream user/key enrichment. The full token is NEVER
+                # written to disk — only a 6+4 masked form and an 8-char prefix
+                # for correlation. (Do not reintroduce key_full: these logs are
+                # for debugging, not a credential store.)
                 auth = request.headers.get("Authorization", "")
                 if auth.lower().startswith("bearer "):
                     token = auth[7:].strip()
-                    meta["key_full"] = token
                     if len(token) > 8:
                         meta["key_masked"] = f"{token[:6]}…{token[-4:]}"
                     else:
@@ -203,7 +207,11 @@ async def proxy(request: web.Request) -> web.StreamResponse:
 
 
 async def main():
-    app = web.Application(client_max_size=1024 * 1024 * 1024)  # 1 GB cap
+    # 64 MB cap: the proxy buffers the whole body in RAM before forwarding, so
+    # an unbounded cap let a few concurrent large POSTs exhaust memory. 64 MB
+    # still comfortably fits multimodal base64 image/short-audio bodies while
+    # killing the DoS amplification. Raise only if a real payload needs it.
+    app = web.Application(client_max_size=64 * 1024 * 1024)
     app.router.add_route("*", "/{tail:.*}", proxy)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
