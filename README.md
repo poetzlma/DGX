@@ -11,10 +11,10 @@ Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`b
 | Route (`model`) | Use it for | tok/s | Max ctx | Peak mem | Engine | Launcher (`bin/`) |
 |---|---|---:|---:|---:|---|---|
 | **`qwen3.6-27b-int4-dflash`** | **coding — default** | 41 | 120 k | 61 GB | vLLM | `launch-vllm-27b-int4-dflash.sh` |
-| `qwen3.6-35b-a3b-nvfp4` | coding, long-ctx throughput | 61 | 80 k | 53 GB | vLLM | `launch-vllm-35b-moe-nvfp4.sh` |
-| `ornith-1.0-35b` 🆕 | coding — agentic (thinking)² | 77 | 32 k¹ | 25 GB | llama.cpp | `launch-ornith.sh` |
-| `qwopus3.6-27b-int4-dflash` | coding — Opus-distilled | 39 | 128 k | 102 GB | vLLM | `launch-vllm-qwopus-int4-dflash.sh` |
-| `qwen3.6-27b-fp8` | coding — quality baseline | 21 | 200 k | 91 GB | vLLM | `launch-vllm-27b-qwen-fp8.sh` |
+| `qwen3.6-35b-a3b-nvfp4` | coding, long-ctx throughput | 61 | 131 k | 53 GB | vLLM | `launch-vllm-35b-moe-nvfp4.sh` |
+| `ornith-1.0-35b` 🆕 | coding — agentic (thinking)² | 77 | 131 k¹ | 25 GB | llama.cpp | `launch-ornith.sh` |
+| `qwopus3.6-27b-int4-dflash` | coding — Opus-distilled | 39 | 131 k | 102 GB | vLLM | `launch-vllm-qwopus-int4-dflash.sh` |
+| `qwen3.6-27b-fp8` | coding — quality baseline | 21 | 131 k | 91 GB | vLLM | `launch-vllm-27b-qwen-fp8.sh` |
 | `nemotron-3-nano-omni` | multimodal (image/audio/video) | 56 | 131 k | 91 GB | vLLM | `launch-vllm-nemotron-omni.sh` |
 | `diffusiongemma-26b` | speed / non-coding | 142 | 131 k | 50 GB | vLLM | `launch-vllm-diffusiongemma-nvfp4.sh` |
 | `deepseek-v4-flash-ds4` | long-context planner | 21 | 131 k | 22 GB | ds4 | `launch-ds4-server.sh` |
