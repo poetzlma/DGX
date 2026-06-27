@@ -39,14 +39,16 @@ exec docker run --name vllm-cosmos3-nano-omni \
   -p 0.0.0.0:9023:9023 \
   -v /home/max/.cache/huggingface:/root/.cache/huggingface \
   -v /home/max/cosmos3/models/Cosmos3-Nano:/models/Cosmos3-Nano:ro \
+  -v /home/max/llm-stack/config/cosmos3-no-guardrails.yaml:/config/cosmos3-no-guardrails.yaml:ro \
   -e HF_TOKEN_FILE=/root/.cache/huggingface/token \
   -e TORCH_CUDA_ARCH_LIST=12.1a \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e NVIDIA_FORWARD_COMPAT=1 \
   -e NVIDIA_DISABLE_REQUIRE=1 \
   vllm/vllm-omni:cosmos3-aarch64 \
-  /models/Cosmos3-Nano \
+  vllm serve /models/Cosmos3-Nano \
   --omni \
+  --deploy-config /config/cosmos3-no-guardrails.yaml \
   --served-model-name cosmos3-nano-omni \
   --host 0.0.0.0 --port 9023 \
   --trust-remote-code \
