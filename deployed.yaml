@@ -58,6 +58,16 @@ deployed:
     config: max-model-len=131072 max-num-seqs=3 gpu-mem-util=0.70   # retuned 2026-06-27 (was 80k/2/0.40)
     measured_single_stream_tok_s: 56   # c=1 short input; 101 agg at c=2
 
+  - name: qwen3.6-27b-nvfp4
+    role: eval — NVIDIA official NVFP4 (ModelOpt) hybrid Qwen3_5 27B, throughput lane
+    method: nvidia/Qwen3.6-27B-NVFP4 (qwen3_5 hybrid, W4A16-NVFP4) + z-lab DFlash drafter n=10
+    image: ghcr.io/aeon-7/aeon-vllm-ultimate:latest   # vLLM 0.23.0+aeon.sm121a.dflash — sm_121 CUTLASS NVFP4 (stock image gives Marlin garbage on GB10)
+    port_internal: 9024
+    added: 2026-06-30
+    context_window: 262144   # native 256k (max_position_embeddings=262144, NO RoPE scaling); 254k req verified HTTP 200 (2026-07-01)
+    config: max-model-len=262144 max-num-seqs=4 gpu-mem-util=0.85 kv=bf16 mamba-cache=fp32 VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass   # KV pool 674k tok = 2.57x concurrency @ full 256k; c=4 fine up to ~150k each (hybrid: only 16/64 layers carry growing KV)
+    measured_single_stream_tok_s: 31   # DFlash n=10 (MTP n=1 18.6); c2=56 c4=103 agg; decode falloff w/ ctx: 31 short / 26.8 @118k / 15.1 @254k; cold prefill ~144s @118k, ~438s @254k
+
   - name: qwen3.6-27b-fp8
     role: rollback (was prod 2026-05-08 → 2026-05-17)
     method: Qwen official FP8 + native MTP n=3 + --reasoning-parser qwen3
@@ -144,6 +154,12 @@ model_list:
   - model_name: qwen3.6-35b-a3b-nvfp4   # MoE throughput lane, co-resident with dense
     litellm_params:
       model: openai/qwen3.6-35b-a3b-nvfp4
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-27b-nvfp4       # eval 2026-06-30 (NVIDIA NVFP4, c=4, 256k native ctx as of 2026-07-01)
+    litellm_params:
+      model: openai/qwen3.6-27b-nvfp4
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 

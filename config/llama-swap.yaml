@@ -146,6 +146,22 @@ models:
     ttl: 3600
 
   # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.6-27B-NVFP4 (NVIDIA official ModelOpt quant) — EVAL slot 2026-06-30.
+  #
+  # NVIDIA's own NVFP4 of the DENSE 27B (nvidia/Qwen3.6-27B-NVFP4) — distinct
+  # from AlphaOxO community NVFP4 (dormant qwen3.6-27b-mtp) and Intel INT4 prod.
+  # Added at user request as a THROUGHPUT lane: max-num-seqs 4 (c=4) at full
+  # 131k context (> the 120k floor). Solo swap-exclusive → full 119 GB budget,
+  # bf16 KV (quality), MTP n=1 native draft. Launcher:
+  # bin/launch-vllm-27b-nvidia-nvfp4.sh. Port 9024 (next free).
+  # ─────────────────────────────────────────────────────────────────────
+  qwen3.6-27b-nvfp4:
+    cmd: /home/max/llm-stack/bin/launch-vllm-27b-nvidia-nvfp4.sh
+    proxy: http://127.0.0.1:9024
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
   # DiffusionGemma 26B-A4B-it NVFP4 — EVAL slot 2026-06-11. Google DeepMind's
   # first diffusion LLM (released 2026-06-10); NVIDIA quotes ~150 tok/s c=1 on
   # DGX Spark. Testing for NON-CODING tasks (quality < AR Gemma 4). Day-0
@@ -262,6 +278,7 @@ groups:
     members:
       - qwen3.6-27b-int4-dflash   # Intel INT4 + DFlash n=4
       - qwen3.6-35b-a3b-nvfp4     # RedHatAI MoE NVFP4 + MTP n=1
+      - qwen3.6-27b-nvfp4         # NEW 2026-06-30: NVIDIA dense NVFP4, c=4 @ 131k
       - qwen3.6-27b-fp8           # Qwen official FP8 + MTP n=3
       - qwopus3.6-27b-int4-dflash # Qwopus Opus-distill fine-tune, INT4+DFlash
       - ornith-1.0-35b            # NEW 2026-06-27: DeepReinforce 35B-A3B MoE (GGUF/llama.cpp)

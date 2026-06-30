@@ -12,6 +12,7 @@ Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`b
 |---|---|---:|---:|---:|---|---|
 | **`qwen3.6-27b-int4-dflash`** | **coding — default** | 41 | 120 k | 61 GB | vLLM | `launch-vllm-27b-int4-dflash.sh` |
 | `qwen3.6-35b-a3b-nvfp4` | coding, long-ctx throughput | 61 | 131 k | 53 GB | vLLM | `launch-vllm-35b-moe-nvfp4.sh` |
+| `qwen3.6-27b-nvfp4` 🆕 | coding — NVIDIA NVFP4, **256 k ctx** | 31 | **256 k** | ~101 GB | vLLM | `launch-vllm-27b-nvidia-nvfp4.sh` |
 | `ornith-1.0-35b` 🆕 | coding — agentic (thinking)² | 77 | 131 k¹ | 25 GB | llama.cpp | `launch-ornith.sh` |
 | `qwopus3.6-27b-int4-dflash` | coding — Opus-distilled | 39 | 131 k | 102 GB | vLLM | `launch-vllm-qwopus-int4-dflash.sh` |
 | `qwen3.6-27b-fp8` | coding — quality baseline | 21 | 131 k | 91 GB | vLLM | `launch-vllm-27b-qwen-fp8.sh` |
@@ -28,6 +29,7 @@ Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`b
 
 - **`qwen3.6-27b-int4-dflash`** — Alibaba's **Qwen3.6-27B dense**, the coding workhorse; on our own evals it beat the 35B-A3B MoE by ≥4 pts SWE-bench, so it's the default. Intel's AutoRound **INT4** keeps quality within noise of FP8 while halving the weight bandwidth that bottlenecks GB10, and the z-lab **DFlash** speculative drafter pushes it to ~41 tok/s. Reach for it for everyday coding and agentic/tool-use work.
 - **`qwen3.6-35b-a3b-nvfp4`** — Qwen's **sparse MoE** (35B total, ~3B active/token), so it sidesteps the bandwidth wall and stays cheap under load. RedHat's NVFP4 quant + native MTP give 61 tok/s single-stream and the best concurrency/long-ctx throughput in the stack. Use it when you want speed and parallelism over the dense model's last few quality points.
+- **`qwen3.6-27b-nvfp4`** 🆕 — **NVIDIA's official ModelOpt NVFP4** build of the Qwen3.6-27B `qwen3_5` hybrid (48 Gated-DeltaNet + 16 full-attention layers, W4A16-NVFP4 MLPs). Its draw is **context**: `max_position_embeddings` is natively **262 144**, so it serves the **full 256 k window with no RoPE scaling and zero quality hit** — the longest-context coding lane in the stack. The hybrid layout means only 16/64 layers carry a growing KV cache, so 256 k is affordable on one GB10 (674 k-token KV pool). z-lab DFlash n=10 gives 31 tok/s single-stream. Needs the AEON `sm121a` engine + `VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass` — a **stock** vLLM image routes NVFP4 to a Marlin kernel that produces garbage on GB10/sm_121. Use it when you need a single request to span >130 k tokens.
 - **`qwen3.6-27b-fp8`** — the **official Qwen FP8** build, "near-lossless" per the card with no community-quant noise. It's the ground-truth reference: when an INT4/NVFP4 result looks off, A/B against this. Use it for quality baselining and canonical Qwen3.6 behavior.
 - **`qwopus3.6-27b-int4-dflash`** — Jackrong's **Qwopus**, a Qwen3.6-27B fine-tune **distilled on Claude-Opus reasoning traces**, so it keeps Qwen's coding base but reasons in a more Opus-like style. Same INT4+DFlash speed path as the default. Use it for coding/reasoning when you want Opus-flavored chains of thought.
 - **`ornith-1.0-35b`** 🆕 — DeepReinforce's **Ornith-1.0** (MIT), a new agentic-coding MoE (35B/3B-active) that **writes its own RL training scaffold**; it scored **64.2 on Terminal-Bench 2.1, beating Qwen3.5-397B** (10× its size). Thinking model, and the fastest coding model here at 77 tok/s. The most interesting new model to pit against the Qwen incumbents on agentic/terminal tasks.
@@ -127,6 +129,20 @@ Throughput: 56 tok/s c=1 / 101 c=2 / 169 c=4 (short input). Long context: 48 tok
 - **Image**: `vllm/vllm-openai:cu130-nightly` — Scargall's recommended image. Required for Blackwell NVFP4 + MoE routing.
 
 Known issue: `RedHatAI/Qwen3.6-35B-A3B-NVFP4` had a silent correctness bug with `--enable-prefix-caching + compressed-tensors` on older vLLM ([vllm#40252](https://github.com/vllm-project/vllm/issues/40252)). cu130-nightly as of 2026-04 is reportedly patched — verify on real traffic if it goes live for coding workloads. **The 2026-05-11 MoE-vs-dense quality A/B is the open question** — MoE lost coding by ≥4 pts SWE-bench / -15.5 SkillsBench. Today's re-eval was throughput-only.
+
+### NVFP4 long-ctx: `qwen3.6-27b-nvfp4` (launcher: `bin/launch-vllm-27b-nvidia-nvfp4.sh`)
+
+Added 2026-06-30; bumped to the full 256 k window 2026-07-01. **NVIDIA's official `nvidia/Qwen3.6-27B-NVFP4`** (ModelOpt, W4A16-NVFP4 MLPs + FP8 attention) on the `qwen3_5` hybrid architecture — 48 Gated-DeltaNet linear-attention layers + 16 full-attention layers (`full_attention_interval=4`), vision tower served text-only. Drafted by **z-lab/Qwen3.6-27B-DFlash** at `num_speculative_tokens=10`.
+
+Why it exists: it's the **longest-context lane in the stack**. `max_position_embeddings` is natively **262 144**, so it serves the full **256 k window with no RoPE scaling and no quality penalty**.
+
+- **The image is the whole story.** A stock vLLM image hardcodes the **Marlin** FP4 kernel for W4A16-NVFP4; Marlin's FP4 path is SM80-targeted and computes wrong logits on GB10/sm_121 → pure garbage output (`!!!!` / `d d d`), independent of KV dtype or graph mode. This is the documented DGX-Spark bug (vLLM [#37030](https://github.com/vllm-project/vllm/issues/37030), [#43906](https://github.com/vllm-project/vllm/issues/43906); fix [#38126](https://github.com/vllm-project/vllm/pull/38126)). The fix is `ghcr.io/aeon-7/aeon-vllm-ultimate:latest` (vLLM 0.23.0 built for sm_121a **with** CUTLASS NVFP4 kernels) + **`VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass`**, which routes W4A16 to the CUTLASS path that *is* supported here. Weights are NVIDIA's, unmodified.
+- **`--mamba-cache-dtype float32`** — the GDN recurrent-state cache must be fp32 for numerical stability (AEON recipe).
+- **`--kv-cache-dtype bfloat16`** — mandatory for the DFlash drafter path; this checkpoint ships no fp8 KV scales, so fp8 would be lossy anyway. KV is cheap here (only 16/64 layers grow with context), so bf16 is free.
+- **`--max-model-len 262144 --max-num-seqs 4 --gpu-memory-utilization 0.85`** — KV pool **674 k tokens** = **2.57× max-concurrency at full 256 k**. c=4 runs fine up to ~150 k each; you cannot run 4 simultaneous requests all at full 256 k (that needs ~1.05 M tokens of KV), but real traffic never does.
+- **`--speculative-config '{"method":"dflash","model":"z-lab/Qwen3.6-27B-DFlash","num_speculative_tokens":10}'`** — DFlash n=10 measured ~2–3× faster single-stream than native MTP n=1.
+
+Measured (2026-07-01, solo): decode **31 tok/s** short · 26.8 @118 k · **15.1 @254 k** (falls off attending over a longer KV); c=2 56 / c=4 103 tok/s aggregate (short). Cold prefill ~144 s @118 k, **~438 s (~7 min) @254 k** — a 256 k cold prefill is slow; warm decode is unaffected by the cap.
 
 ### Co-residence contention behavior (single GPU caveat)
 
