@@ -161,6 +161,19 @@ models:
     checkEndpoint: /health
     ttl: 3600
 
+  # VISION-enabled sibling of the 9024 lane — same NVIDIA NVFP4 weights, but the
+  # qwen3_5_vision encoder is LOADED (no --language-model-only) so image_url
+  # content blocks work. Verified 2026-07-05 on the AEON sm_121a image: shape/
+  # colour/spatial perception accurate (not NVFP4 garbage); OCR of stylised text
+  # is soft. Full 262144 ctx retained; --limit-mm-per-prompt image=4, video off.
+  # Thinking model → answer arrives in reasoning_content; give generous max_tokens.
+  # Launcher: bin/launch-vllm-27b-nvidia-nvfp4-vision.sh. Port 9025.
+  qwen3.6-27b-nvfp4-vision:
+    cmd: /home/max/llm-stack/bin/launch-vllm-27b-nvidia-nvfp4-vision.sh
+    proxy: http://127.0.0.1:9025
+    checkEndpoint: /health
+    ttl: 3600
+
   # ─────────────────────────────────────────────────────────────────────
   # DiffusionGemma 26B-A4B-it NVFP4 — EVAL slot 2026-06-11. Google DeepMind's
   # first diffusion LLM (released 2026-06-10); NVIDIA quotes ~150 tok/s c=1 on
@@ -279,6 +292,7 @@ groups:
       - qwen3.6-27b-int4-dflash   # Intel INT4 + DFlash n=4
       - qwen3.6-35b-a3b-nvfp4     # RedHatAI MoE NVFP4 + MTP n=1
       - qwen3.6-27b-nvfp4         # NEW 2026-06-30: NVIDIA dense NVFP4, c=4 @ 131k
+      - qwen3.6-27b-nvfp4-vision  # NEW 2026-07-05: same weights, vision encoder loaded (images)
       - qwen3.6-27b-fp8           # Qwen official FP8 + MTP n=3
       - qwopus3.6-27b-int4-dflash # Qwopus Opus-distill fine-tune, INT4+DFlash
       - ornith-1.0-35b            # NEW 2026-06-27: DeepReinforce 35B-A3B MoE (GGUF/llama.cpp)

@@ -68,6 +68,16 @@ deployed:
     config: max-model-len=262144 max-num-seqs=4 gpu-mem-util=0.85 kv=bf16 mamba-cache=fp32 VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass   # KV pool 674k tok = 2.57x concurrency @ full 256k; c=4 fine up to ~150k each (hybrid: only 16/64 layers carry growing KV)
     measured_single_stream_tok_s: 31   # DFlash n=10 (MTP n=1 18.6); c2=56 c4=103 agg; decode falloff w/ ctx: 31 short / 26.8 @118k / 15.1 @254k; cold prefill ~144s @118k, ~438s @254k
 
+  - name: qwen3.6-27b-nvfp4-vision
+    role: eval — VISION-enabled twin of qwen3.6-27b-nvfp4 (same NVFP4 weights, vision encoder loaded)
+    method: nvidia/Qwen3.6-27B-NVFP4 (qwen3_5 hybrid, W4A16-NVFP4, qwen3_5_vision encoder) + z-lab DFlash drafter n=10
+    image: ghcr.io/aeon-7/aeon-vllm-ultimate:latest   # same AEON sm_121a CUTLASS NVFP4 image; vision path verified working on GB10 2026-07-05
+    port_internal: 9025
+    added: 2026-07-05
+    context_window: 262144   # unchanged from text lane — vision encoder adds negligible footprint, no ctx reduction needed
+    config: max-model-len=262144 max-num-seqs=4 gpu-mem-util=0.85 kv=bf16 mamba-cache=fp32 limit-mm-per-prompt=image:4,video:0 VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass   # DELTA vs 9024: dropped --language-model-only, added --limit-mm-per-prompt
+    notes: accepts image_url content blocks; shape/colour/spatial perception accurate, OCR of stylised text soft; thinking model → answer in reasoning_content, use generous max_tokens
+
   - name: qwen3.6-27b-fp8
     role: rollback (was prod 2026-05-08 → 2026-05-17)
     method: Qwen official FP8 + native MTP n=3 + --reasoning-parser qwen3
@@ -160,6 +170,12 @@ model_list:
   - model_name: qwen3.6-27b-nvfp4       # eval 2026-06-30 (NVIDIA NVFP4, c=4, 256k native ctx as of 2026-07-01)
     litellm_params:
       model: openai/qwen3.6-27b-nvfp4
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-27b-nvfp4-vision  # eval 2026-07-05 (same NVFP4 weights, vision encoder loaded — accepts images)
+    litellm_params:
+      model: openai/qwen3.6-27b-nvfp4-vision
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
