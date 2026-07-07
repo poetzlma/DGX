@@ -1,6 +1,6 @@
 # Spark LLM Stack
 
-OpenAI-compatible LLM gateway on one **DGX Spark (GB10, 119 GB unified)**. Call it at **`http://192.168.1.12:8079/v1`** and route by the `model` field. **One model is resident at a time** — asking for a different `model` unloads the current one and cold-loads the next (1–10 min for vLLM engines, ~30–105 s for the ds4 / llama.cpp binaries).
+OpenAI-compatible LLM gateway on one **DGX Spark (GB10, 119 GB unified)**. Call it at **`http://192.168.1.12:8079/v1`** and route by the `model` field. **One model is resident at a time** — asking for a different `model` unloads the current one and cold-loads the next (1–10 min for vLLM engines, ~30 s–4.5 min for the ds4 / llama.cpp binaries).
 
 > **Phase (2026-06-27): experimentation — no fixed production model.** Every model is a swap-exclusive member of the single `experiments` group, so each loads alone with the full 119 GB. Pick the one you want from the table. The `qwen3.6-27b` / `qwen3.6-35b-a3b` aliases still resolve for legacy clients.
 
@@ -12,7 +12,9 @@ Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`b
 |---|---|---:|---:|---:|---|---|
 | **`qwen3.6-27b-int4-dflash`** | **coding — default** | 41 | 120 k | 61 GB | vLLM | `launch-vllm-27b-int4-dflash.sh` |
 | `qwen3.6-35b-a3b-nvfp4` | coding, long-ctx throughput | 61 | 131 k | 53 GB | vLLM | `launch-vllm-35b-moe-nvfp4.sh` |
+| `qwen3.6-35b-a3b-vision` 🆕 | **vision** (images) + fastest 35B c=1² | 69 | 131 k¹ | ~27 GB | llama.cpp | `launch-llamacpp-35b-moe-vision.sh` |
 | `qwen3.6-27b-nvfp4` 🆕 | coding — NVIDIA NVFP4, **256 k ctx** | 31 | **256 k** | ~101 GB | vLLM | `launch-vllm-27b-nvidia-nvfp4.sh` |
+| `qwen3.6-27b-nvfp4-vision` 🆕 | **vision** (images) at 256 k ctx² | 31 | **256 k** | ~101 GB | vLLM | `launch-vllm-27b-nvidia-nvfp4-vision.sh` |
 | `ornith-1.0-35b` 🆕 | coding — agentic (thinking)² | 77 | 131 k¹ | 25 GB | llama.cpp | `launch-ornith.sh` |
 | `qwopus3.6-27b-int4-dflash` | coding — Opus-distilled | 39 | 131 k | 102 GB | vLLM | `launch-vllm-qwopus-int4-dflash.sh` |
 | `qwen3.6-27b-fp8` | coding — quality baseline | 21 | 131 k | 91 GB | vLLM | `launch-vllm-27b-qwen-fp8.sh` |
@@ -21,7 +23,7 @@ Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`b
 | `diffusiongemma-26b` | speed / non-coding | 142 | 131 k | 50 GB | vLLM | `launch-vllm-diffusiongemma-nvfp4.sh` |
 | `deepseek-v4-flash-ds4` | long-context planner | 21 | 131 k | 22 GB | ds4 | `launch-ds4-server.sh` |
 
-¹ Ornith ctx is `ORNITH_CTX`/`ORNITH_PARALLEL`-tunable (now 3 slots × 131 k). &nbsp; ² **Thinking model** — output goes to `reasoning_content`; give generous `max_tokens` or `content` returns empty. &nbsp; ³ **Generation model, not chat** — call `POST /v1/videos` · `/v1/videos/sync` · `/v1/images/generations` (multipart), not `/v1/chat/completions`; tok/s and token-ctx don't apply. ~6 s/512² image warm; first cold-load ~3–4 min (166 s weights + warmup). **A `/v1/chat/completions` request returns an *image*, not text** — only the diffusion stage is loaded, so it can't emit text. &nbsp; tok/s / mem above are the 2026-06-27 single-stream sweep (pre-retune).
+¹ llama.cpp lanes split total engine ctx across parallel slots, env-tunable: Ornith `ORNITH_CTX`/`ORNITH_PARALLEL` (3 slots × 131 k), 35B-vision `QWEN35B_CTX`/`QWEN35B_PARALLEL` (2 slots × 131 k). &nbsp; ² **Thinking model** — output goes to `reasoning_content`; give generous `max_tokens` or `content` returns empty. &nbsp; ³ **Generation model, not chat** — call `POST /v1/videos` · `/v1/videos/sync` · `/v1/images/generations` (multipart), not `/v1/chat/completions`; tok/s and token-ctx don't apply. ~6 s/512² image warm; first cold-load ~3–4 min (166 s weights + warmup). **A `/v1/chat/completions` request returns an *image*, not text** — only the diffusion stage is loaded, so it can't emit text. &nbsp; tok/s / mem above are the 2026-06-27 single-stream sweep (pre-retune).
 
 > **Concurrency (2026-06-27 retune):** every model **except `int4-dflash` and `ds4`** is now tuned to serve **c=1/2/3 at 131 k context** (`qwopus` is c=2 — its DFlash path forces heavier bf16 KV). `int4-dflash` stays single-stream (it's the prefill-bound coding default) and `ds4` stays single-stream (its decode doesn't scale with concurrency). See [decision #21](#decision-log).
 
@@ -29,7 +31,9 @@ Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`b
 
 - **`qwen3.6-27b-int4-dflash`** — Alibaba's **Qwen3.6-27B dense**, the coding workhorse; on our own evals it beat the 35B-A3B MoE by ≥4 pts SWE-bench, so it's the default. Intel's AutoRound **INT4** keeps quality within noise of FP8 while halving the weight bandwidth that bottlenecks GB10, and the z-lab **DFlash** speculative drafter pushes it to ~41 tok/s. Reach for it for everyday coding and agentic/tool-use work.
 - **`qwen3.6-35b-a3b-nvfp4`** — Qwen's **sparse MoE** (35B total, ~3B active/token), so it sidesteps the bandwidth wall and stays cheap under load. RedHat's NVFP4 quant + native MTP give 61 tok/s single-stream and the best concurrency/long-ctx throughput in the stack. Use it when you want speed and parallelism over the dense model's last few quality points.
+- **`qwen3.6-35b-a3b-vision`** 🆕 — the **vision lane for the 35B MoE**: unsloth's dynamic-4-bit GGUF (`UD-Q4_K_XL`, 22.4 GB) plus the **mmproj-F16 vision encoder** the vLLM NVFP4 lane leaves unloaded, served by mainline llama.cpp. Accepts standard `image_url` content blocks (shape/colour/spatial recognition verified 2026-07-07). Surprise bonus: at **69 tok/s single-stream it's the fastest 35B config measured** — llama.cpp Q4_K_XL beats vLLM NVFP4 c=1 on GB10 — and the second-lightest lane at ~27 GB. Use it to analyse images, or as the quick 35B when you don't need vLLM's concurrency scaling.
 - **`qwen3.6-27b-nvfp4`** 🆕 — **NVIDIA's official ModelOpt NVFP4** build of the Qwen3.6-27B `qwen3_5` hybrid (48 Gated-DeltaNet + 16 full-attention layers, W4A16-NVFP4 MLPs). Its draw is **context**: `max_position_embeddings` is natively **262 144**, so it serves the **full 256 k window with no RoPE scaling and zero quality hit** — the longest-context coding lane in the stack. The hybrid layout means only 16/64 layers carry a growing KV cache, so 256 k is affordable on one GB10 (674 k-token KV pool). z-lab DFlash n=10 gives 31 tok/s single-stream. Needs the AEON `sm121a` engine + `VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass` — a **stock** vLLM image routes NVFP4 to a Marlin kernel that produces garbage on GB10/sm_121. Use it when you need a single request to span >130 k tokens.
+- **`qwen3.6-27b-nvfp4-vision`** 🆕 — the `qwen3.6-27b-nvfp4` lane **with the `qwen3_5_vision` encoder loaded** (`--language-model-only` dropped, `--limit-mm-per-prompt image=4`): same weights, image, config, and full 256 k window, but `image_url` content blocks work. Perception is accurate on shapes/colour/spatial layout; OCR of stylised text is soft. Thinking model — the answer often lands in `reasoning_content`, so give generous `max_tokens`. Use it when a vision task needs the dense 27B's quality or >131 k context; for quick image work the 35B vision lane is faster.
 - **`qwen3.6-27b-fp8`** — the **official Qwen FP8** build, "near-lossless" per the card with no community-quant noise. It's the ground-truth reference: when an INT4/NVFP4 result looks off, A/B against this. Use it for quality baselining and canonical Qwen3.6 behavior.
 - **`qwopus3.6-27b-int4-dflash`** — Jackrong's **Qwopus**, a Qwen3.6-27B fine-tune **distilled on Claude-Opus reasoning traces**, so it keeps Qwen's coding base but reasons in a more Opus-like style. Same INT4+DFlash speed path as the default. Use it for coding/reasoning when you want Opus-flavored chains of thought.
 - **`ornith-1.0-35b`** 🆕 — DeepReinforce's **Ornith-1.0** (MIT), a new agentic-coding MoE (35B/3B-active) that **writes its own RL training scaffold**; it scored **64.2 on Terminal-Bench 2.1, beating Qwen3.5-397B** (10× its size). Thinking model, and the fastest coding model here at 77 tok/s. The most interesting new model to pit against the Qwen incumbents on agentic/terminal tasks.
@@ -130,6 +134,18 @@ Throughput: 56 tok/s c=1 / 101 c=2 / 169 c=4 (short input). Long context: 48 tok
 
 Known issue: `RedHatAI/Qwen3.6-35B-A3B-NVFP4` had a silent correctness bug with `--enable-prefix-caching + compressed-tensors` on older vLLM ([vllm#40252](https://github.com/vllm-project/vllm/issues/40252)). cu130-nightly as of 2026-04 is reportedly patched — verify on real traffic if it goes live for coding workloads. **The 2026-05-11 MoE-vs-dense quality A/B is the open question** — MoE lost coding by ≥4 pts SWE-bench / -15.5 SkillsBench. Today's re-eval was throughput-only.
 
+### MoE vision: `qwen3.6-35b-a3b-vision` (launcher: `bin/launch-llamacpp-35b-moe-vision.sh`)
+
+Added 2026-07-07. **unsloth/Qwen3.6-35B-A3B-GGUF `UD-Q4_K_XL`** (dynamic 4-bit, 22.4 GB) **+ `mmproj-F16.gguf`** (0.9 GB vision encoder) at `~/models/qwen3.6-35b-a3b-gguf/`, served by the same mainline llama.cpp CUDA build as ornith (`~/llama.cpp/build/bin/llama-server`). Port 9026.
+
+Why it exists: the vLLM `qwen3.6-35b-a3b-nvfp4` lane is text-only — llama.cpp's `--mmproj` path is what turns the 35B MoE's declared vision tower into working `image_url` support.
+
+- **`--mmproj mmproj-F16.gguf`** — loads the multimodal projector (~1.1 GB worst-case per the mtmd estimate). Standard OpenAI `image_url` content blocks (data-URL base64 verified).
+- **`--ctx-size 262144 --parallel 2`** — llama.cpp splits total ctx across slots → **c=2 @ 131 k per request** (`QWEN35B_CTX`/`QWEN35B_PARALLEL` env to retune). `context_window: 131072` in `deployed.yaml` — downstream harnesses must read that, not the engine total.
+- **`-fa on -b 2048 -ub 512 --no-mmap --jinja --reasoning-budget -1`** — same recipe as the ornith lane.
+
+Measured (2026-07-07, solo): **69.5 tok/s** text decode / **66.9 tok/s** on vision requests, image prefill ~670 tok/s — **faster single-stream than the vLLM NVFP4 lane (56)**, llama.cpp Q4_K_XL beats vLLM NVFP4 c=1 on GB10. Cold load ~4.5 min (22 GB weights + 262 k KV alloc). ~27 GB peak → second-lightest lane in the stack. Thinking model: pass `chat_template_kwargs: {"enable_thinking": false}` for terse answers. Quality caveat: the 2026-05-11 MoE-vs-dense coding rejection still applies — this is a **vision/speed lane, not a coding lane**.
+
 ### NVFP4 long-ctx: `qwen3.6-27b-nvfp4` (launcher: `bin/launch-vllm-27b-nvidia-nvfp4.sh`)
 
 Added 2026-06-30; bumped to the full 256 k window 2026-07-01. **NVIDIA's official `nvidia/Qwen3.6-27B-NVFP4`** (ModelOpt, W4A16-NVFP4 MLPs + FP8 attention) on the `qwen3_5` hybrid architecture — 48 Gated-DeltaNet linear-attention layers + 16 full-attention layers (`full_attention_interval=4`), vision tower served text-only. Drafted by **z-lab/Qwen3.6-27B-DFlash** at `num_speculative_tokens=10`.
@@ -143,6 +159,8 @@ Why it exists: it's the **longest-context lane in the stack**. `max_position_emb
 - **`--speculative-config '{"method":"dflash","model":"z-lab/Qwen3.6-27B-DFlash","num_speculative_tokens":10}'`** — DFlash n=10 measured ~2–3× faster single-stream than native MTP n=1.
 
 Measured (2026-07-01, solo): decode **31 tok/s** short · 26.8 @118 k · **15.1 @254 k** (falls off attending over a longer KV); c=2 56 / c=4 103 tok/s aggregate (short). Cold prefill ~144 s @118 k, **~438 s (~7 min) @254 k** — a 256 k cold prefill is slow; warm decode is unaffected by the cap.
+
+**Vision twin** (`qwen3.6-27b-nvfp4-vision`, `bin/launch-vllm-27b-nvidia-nvfp4-vision.sh`, port 9025, added 2026-07-05): identical weights/image/config, but `--language-model-only` is dropped and `--limit-mm-per-prompt '{"image":4,"video":0}'` added, so the `qwen3_5_vision` encoder loads and `image_url` blocks work at the full 256 k window. Verified on GB10: shape/colour/spatial perception accurate; stylised-text OCR soft.
 
 ### Co-residence contention behavior (single GPU caveat)
 
@@ -269,14 +287,21 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 │   └── llama-swap.yaml             # active config (single `experiments` swap group)
 ├── deployed.yaml                   # source-of-truth manifest for downstream (LiteLLM)
 ├── bin/
-│   ├── launch-vllm-27b-int4-dflash.sh   # ACTIVE — dense prod (Intel INT4 + DFlash n=4, v4 image)
-│   ├── launch-vllm-35b-moe-nvfp4.sh     # ACTIVE — MoE prod (RedHatAI NVFP4 + MTP n=1)
+│   ├── launch-vllm-27b-int4-dflash.sh   # ACTIVE — coding default (Intel INT4 + DFlash n=4, v4 image)
+│   ├── launch-vllm-35b-moe-nvfp4.sh     # ACTIVE — 35B MoE throughput (RedHatAI NVFP4 + MTP n=1)
+│   ├── launch-llamacpp-35b-moe-vision.sh # ACTIVE — 35B MoE VISION (unsloth GGUF + mmproj, llama.cpp)
+│   ├── launch-vllm-27b-nvidia-nvfp4.sh  # ACTIVE — NVIDIA NVFP4 256k lane (DFlash n=10)
+│   ├── launch-vllm-27b-nvidia-nvfp4-vision.sh # ACTIVE — 256k lane VISION twin (encoder loaded)
 │   ├── launch-vllm-27b-qwen-fp8.sh      # rollback — was prod 2026-05-08 → 2026-05-17
-│   ├── launch-vllm-27b-int4-autoround.sh # eval — Intel INT4 + native MTP (no DFlash)
-│   ├── launch-vllm-27b-sakamaki-mtp.sh  # rollback — NVFP4 + MTP graft
-│   ├── launch-vllm-27b-dflash.sh        # rollback — aeon NVFP4 + DFlash k=4
-│   ├── launch-vllm-27b-nvfp4.sh         # rollback — AlphaOxO NVFP4 + MTP-3
-│   ├── launch-vllm-27b-clean-dflash.sh  # eval — non-prod
+│   ├── launch-vllm-qwopus-int4-dflash.sh # eval — Opus-distilled 27B (INT4 + DFlash)
+│   ├── launch-ornith.sh                 # eval — Ornith-1.0-35B MoE (llama.cpp)
+│   ├── launch-vllm-diffusiongemma-nvfp4.sh # eval — Google diffusion LLM
+│   ├── launch-vllm-cosmos3-nano-omni.sh # eval — Cosmos3-Nano image/video generation
+│   ├── launch-vllm-27b-int4-autoround.sh # retired — Intel INT4 + native MTP (no DFlash)
+│   ├── launch-vllm-27b-sakamaki-mtp.sh  # retired — NVFP4 + MTP graft
+│   ├── launch-vllm-27b-dflash.sh        # retired — aeon NVFP4 + DFlash k=4
+│   ├── launch-vllm-27b-nvfp4.sh         # retired — AlphaOxO NVFP4 + MTP-3
+│   ├── launch-vllm-27b-clean-dflash.sh  # retired — eval, non-prod
 │   ├── launch-vllm-qwen.sh              # retired — real 35B-A3B MoE (alias-only)
 │   ├── launch-vllm-nemotron-omni.sh     # active — multimodal omni
 │   ├── launch-ds4-server.sh             # active — antirez ds4 planner lane
