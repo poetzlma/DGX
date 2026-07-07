@@ -231,6 +231,24 @@ models:
     ttl: 3600
 
   # ─────────────────────────────────────────────────────────────────────
+  # Qwen3.6-35B-A3B GGUF + VISION (unsloth) — added 2026-07-07.
+  #
+  # VISION lane for the 35B MoE: the vLLM NVFP4 lane (:9019) is text-only;
+  # this one loads unsloth's mmproj-F16 vision encoder so image_url content
+  # blocks work. UD-Q4_K_XL dynamic 4-bit (22.4 GB) via mainline llama.cpp
+  # (~/llama.cpp, same binary as ornith). Smoke-tested 2026-07-07: text 69.5
+  # tok/s decode, vision shape/colour recognition correct at 66.9 tok/s —
+  # FASTER than the vLLM NVFP4 lane (56 tok/s c=1).
+  # Engine ctx 262144 = 2 slots x 131072 (QWEN35B_CTX/QWEN35B_PARALLEL env
+  # to override). Thinking model → pass enable_thinking=false for terse use.
+  # ─────────────────────────────────────────────────────────────────────
+  qwen3.6-35b-a3b-vision:
+    cmd: /home/max/llm-stack/bin/launch-llamacpp-35b-moe-vision.sh
+    proxy: http://127.0.0.1:9026
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ─────────────────────────────────────────────────────────────────────
   # Nemotron-3-Nano-Omni-30B-A3B Reasoning NVFP4 (vLLM) — added 2026-04-29.
   #
   # NVIDIA's Mamba2-Transformer hybrid MoE with vision + audio encoders.
@@ -291,6 +309,7 @@ groups:
     members:
       - qwen3.6-27b-int4-dflash   # Intel INT4 + DFlash n=4
       - qwen3.6-35b-a3b-nvfp4     # RedHatAI MoE NVFP4 + MTP n=1
+      - qwen3.6-35b-a3b-vision    # NEW 2026-07-07: unsloth GGUF Q4_K_XL + mmproj (images, llama.cpp)
       - qwen3.6-27b-nvfp4         # NEW 2026-06-30: NVIDIA dense NVFP4, c=4 @ 131k
       - qwen3.6-27b-nvfp4-vision  # NEW 2026-07-05: same weights, vision encoder loaded (images)
       - qwen3.6-27b-fp8           # Qwen official FP8 + MTP n=3
