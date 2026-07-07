@@ -58,6 +58,17 @@ deployed:
     config: max-model-len=131072 max-num-seqs=3 gpu-mem-util=0.70   # retuned 2026-06-27 (was 80k/2/0.40)
     measured_single_stream_tok_s: 56   # c=1 short input; 101 agg at c=2
 
+  - name: qwen3.6-35b-a3b-vision
+    role: eval — VISION lane for the 35B MoE (the -nvfp4 lane is text-only); also fastest 35B c=1 measured
+    method: unsloth/Qwen3.6-35B-A3B-GGUF UD-Q4_K_XL (dynamic 4-bit, 22.4 GB) + mmproj-F16 vision encoder
+    image: native (~/llama.cpp/build/bin/llama-server, mainline CUDA sm_121 — same binary as ornith)
+    port_internal: 9026
+    added: 2026-07-07
+    context_window: 131072   # per-request window — NOT the 262144 engine total (llama.cpp splits ctx across the 2 parallel slots)
+    config: ctx=262144 parallel=2 mmproj=F16   # engine total: 2 slots x 131072 = c=2 @ 131k
+    measured_single_stream_tok_s: 69   # text decode; 67 tok/s on vision requests — beats the vLLM NVFP4 lane's 56
+    notes: accepts image_url content blocks; shape/colour recognition verified 2026-07-07; thinking model → pass chat_template_kwargs enable_thinking=false for terse replies, else give generous max_tokens
+
   - name: qwen3.6-27b-nvfp4
     role: eval — NVIDIA official NVFP4 (ModelOpt) hybrid Qwen3_5 27B, throughput lane
     method: nvidia/Qwen3.6-27B-NVFP4 (qwen3_5 hybrid, W4A16-NVFP4) + z-lab DFlash drafter n=10
@@ -164,6 +175,12 @@ model_list:
   - model_name: qwen3.6-35b-a3b-nvfp4   # MoE throughput lane, co-resident with dense
     litellm_params:
       model: openai/qwen3.6-35b-a3b-nvfp4
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-35b-a3b-vision  # eval 2026-07-07 (unsloth GGUF Q4_K_XL + mmproj — 35B MoE with images, llama.cpp)
+    litellm_params:
+      model: openai/qwen3.6-35b-a3b-vision
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
