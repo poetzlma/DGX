@@ -39,11 +39,22 @@ deployed:
   # All members of the single swap-exclusive `experiments` group (one resident
   # at a time). config = what the launcher actually serves; verified no-OOM.
 
+  - name: nemotron-3-puzzle-75b
+    role: coding DEFAULT under test (qwen3.6-27b / qwen3.6-35b-a3b aliases resolve here) — set 2026-07-08
+    method: nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4 (hybrid Mamba+MoE+Attn, 9.3B active) + native MTP n=1 + CUDA graphs
+    image: ghcr.io/aeon-7/aeon-vllm-ultimate:latest   # vLLM 0.23.0+aeon.sm121a.dflash — MTP+graphs work on sm_121 (Mamba #37431 eager-tax NOT binding here)
+    aliases: [qwen3.6-27b, qwen3.6-35b-a3b]
+    port_internal: 9027
+    added: 2026-07-08
+    context_window: 131072   # per-request window for the coding harness (engine max-model-len 131072; native 262144)
+    config: max-model-len=131072 max-num-seqs=8 gpu-mem-util=0.85 kv=bf16 mamba-cache=fp32 VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass speculative=mtp:n1
+    measured_single_stream_tok_s: 28   # MTP n=1 accept ~81%; agg short c4=81, 125k c1=20/c4=12. n=2 variant peaks 33 c1 single-stream
+    note: reasoning model — <think>…</think> currently leaks into content (no --reasoning-parser); beats dense 27B at long ctx, slower than 35B MoE (memory project_nemotron_puzzle_75b)
+
   - name: qwen3.6-27b-int4-dflash
-    role: coding default (qwen3.6-27b / qwen3.6-35b-a3b aliases resolve here)
+    role: former coding default — aliases moved to nemotron-3-puzzle-75b 2026-07-08 (ROLLBACK target)
     method: Intel/Qwen3.6-27B-int4-AutoRound + z-lab DFlash drafter n=4
     image: ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v4
-    aliases: [qwen3.6-27b, qwen3.6-35b-a3b]
     port_internal: 9018
     context_window: 120000   # per-request window for the coding harness
     config: max-model-len=120000 max-num-seqs=1 gpu-mem-util=0.50   # narrow by design (DFlash lane)
@@ -160,9 +171,21 @@ deployed:
 # transparently forwards to llama-swap and captures req+resp+meta per call.
 # Reverting any api_base to :8080 silently drops observability.
 model_list:
-  - model_name: qwen3.6-27b           # → int4-dflash (co-resident prod, 2026-05-17)
+  - model_name: nemotron-3-puzzle-75b   # NEW DEFAULT under test 2026-07-08 (also holds the qwen3.6-27b / -35b-a3b aliases)
     litellm_params:
-      model: openai/qwen3.6-27b
+      model: openai/nemotron-3-puzzle-75b
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-27b           # DEFAULT → nemotron-3-puzzle-75b 2026-07-08 (mapped at GATEWAY: llama-swap v201 -watch-config drops aliases, so forward the real name — see memory feedback_llama_swap_alias_reload)
+    litellm_params:
+      model: openai/nemotron-3-puzzle-75b
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+
+  - model_name: qwen3.6-35b-a3b       # DEFAULT → nemotron-3-puzzle-75b 2026-07-08 (gateway-level map, same reason)
+    litellm_params:
+      model: openai/nemotron-3-puzzle-75b
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
