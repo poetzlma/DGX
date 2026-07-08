@@ -123,9 +123,8 @@ models:
     proxy: http://127.0.0.1:9018
     checkEndpoint: /health
     ttl: 3600
-    aliases:
-      - qwen3.6-27b
-      - qwen3.6-35b-a3b
+    # ─── aliases qwen3.6-27b / qwen3.6-35b-a3b MOVED to nemotron-3-puzzle-75b
+    # 2026-07-08 (new default under test). ROLLBACK: move both aliases back here.
 
   # ─────────────────────────────────────────────────────────────────────
   # Qwen3.6-35B-A3B-NVFP4 MoE — re-eval slot 2026-05-17.
@@ -291,6 +290,32 @@ models:
     checkEndpoint: /v1/models
     ttl: 3600
 
+  # ─────────────────────────────────────────────────────────────────────
+  # Nemotron-3-Puzzle-75B-A9B NVFP4 — NEW DEFAULT (under test) 2026-07-08.
+  #
+  # NVIDIA "Iterative Puzzle" compression of Nemotron-3-Super-120B → 75.3B
+  # total / 9.3B active, hybrid Mamba+MoE+Attention (NemotronHPuzzle), 256k
+  # ctx, NVFP4, MTP baked in. Fits ONE GB10 (~50 GB). Holds the qwen3.6-27b /
+  # qwen3.6-35b-a3b default aliases (moved off int4-dflash) at user request.
+  #
+  # Config: MTP n=1 + CUDA graphs (launcher -mtp.sh). Both work on sm_121 via
+  # the AEON v0.23 sm121a image — the #37431 Mamba eager-only tax is NOT
+  # binding here (piecewise graph capture). MTP accept ~81%.
+  # Bench (agg tok/s): short c1/c4 = 28/81, 125k c1/c4 = 20/12. Beats dense
+  # 27B at long ctx; slower than the 35B MoE (eval finding, memory:
+  # project_nemotron_puzzle_75b). n=2 variant (best single-stream 33 tok/s c1)
+  # at scratchpad launch-mtp-n2.sh if a single-stream lane is wanted instead.
+  # Port 9027. Reasoning model: <think>…</think> leaks into content.
+  # ─────────────────────────────────────────────────────────────────────
+  nemotron-3-puzzle-75b:
+    cmd: /home/max/llm-stack/bin/launch-vllm-nemotron-puzzle-75b-mtp.sh
+    proxy: http://127.0.0.1:9027
+    checkEndpoint: /health
+    ttl: 3600
+    aliases:
+      - qwen3.6-27b
+      - qwen3.6-35b-a3b
+
 groups:
   # ─── EXPERIMENTATION PHASE (2026-06-27) ────────────────────────────────
   # No dedicated production model. Every model is a swap-exclusive member of
@@ -307,7 +332,8 @@ groups:
     swap: true
     exclusive: true
     members:
-      - qwen3.6-27b-int4-dflash   # Intel INT4 + DFlash n=4
+      - nemotron-3-puzzle-75b     # NEW DEFAULT 2026-07-08: holds qwen3.6-27b / -35b-a3b aliases (MTP n=1 + graphs)
+      - qwen3.6-27b-int4-dflash   # Intel INT4 + DFlash n=4 (former default; rollback target for the aliases)
       - qwen3.6-35b-a3b-nvfp4     # RedHatAI MoE NVFP4 + MTP n=1
       - qwen3.6-35b-a3b-vision    # NEW 2026-07-07: unsloth GGUF Q4_K_XL + mmproj (images, llama.cpp)
       - qwen3.6-27b-nvfp4         # NEW 2026-06-30: NVIDIA dense NVFP4, c=4 @ 131k
