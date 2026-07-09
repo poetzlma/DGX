@@ -38,9 +38,9 @@ exec docker run --name vllm-nemotron-puzzle-75b \
   --trust-remote-code \
   --mamba-cache-dtype float32 \
   --tensor-parallel-size 1 \
-  --gpu-memory-utilization 0.85 \
-  --max-model-len 131072 \
-  --max-num-seqs 8 \
+  --gpu-memory-utilization ${NEMO_UTIL:-0.85} \
+  --max-model-len ${NEMO_CTX:-131072} \
+  --max-num-seqs ${NEMO_SEQS:-8} \
   --max-num-batched-tokens 8192 \
   --kv-cache-dtype bfloat16 \
   --enable-chunked-prefill \
