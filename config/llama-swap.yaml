@@ -312,11 +312,30 @@ models:
     proxy: http://127.0.0.1:9027
     checkEndpoint: /health
     ttl: 3600
+    env:
+      # co-resident split (2026-07-08): leave room for the 35B vision lane
+      # (~27 GB llama.cpp) beside this one. 0.60*119 = ~71 GB for the 75B
+      # (~50 GB weights + KV/graphs). Rollback: delete env block -> full mem.
+      - "NEMO_UTIL=0.60"
+      - "NEMO_SEQS=4"
     aliases:
       - qwen3.6-27b
       - qwen3.6-35b-a3b
 
 groups:
+  # ─── CO-RESIDENT PAIR (2026-07-08, revived) ─────────────────────────────
+  # The Ink Console needs both at once: qwen vision reads handwriting every
+  # turn; the 75B is its on-demand deep reasoner (deep-think tool). persistent
+  # => experiments loads don't evict them; swap:false => they load side by side.
+  # Memory: ~27 GB (vision, llama.cpp) + ~71 GB (75B @ NEMO_UTIL=0.60) + OS.
+  resident:
+    swap: false
+    exclusive: false
+    persistent: true
+    members:
+      - qwen3.6-35b-a3b-vision
+      - nemotron-3-puzzle-75b
+
   # ─── EXPERIMENTATION PHASE (2026-06-27) ────────────────────────────────
   # No dedicated production model. Every model is a swap-exclusive member of
   # this one group: exactly ONE loads at a time, on demand, and is unloaded
@@ -332,10 +351,8 @@ groups:
     swap: true
     exclusive: true
     members:
-      - nemotron-3-puzzle-75b     # NEW DEFAULT 2026-07-08: holds qwen3.6-27b / -35b-a3b aliases (MTP n=1 + graphs)
       - qwen3.6-27b-int4-dflash   # Intel INT4 + DFlash n=4 (former default; rollback target for the aliases)
       - qwen3.6-35b-a3b-nvfp4     # RedHatAI MoE NVFP4 + MTP n=1
-      - qwen3.6-35b-a3b-vision    # NEW 2026-07-07: unsloth GGUF Q4_K_XL + mmproj (images, llama.cpp)
       - qwen3.6-27b-nvfp4         # NEW 2026-06-30: NVIDIA dense NVFP4, c=4 @ 131k
       - qwen3.6-27b-nvfp4-vision  # NEW 2026-07-05: same weights, vision encoder loaded (images)
       - qwen3.6-27b-fp8           # Qwen official FP8 + MTP n=3
