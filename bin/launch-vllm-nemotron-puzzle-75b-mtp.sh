@@ -47,6 +47,8 @@ exec docker run --name vllm-nemotron-puzzle-75b \
   --enable-prefix-caching \
   --generation-config vllm \
   --reasoning-parser nemotron_v3 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
   --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
   # --reasoning-parser nemotron_v3 (added 2026-07-08): splits <think>…</think>
   # into the OpenAI reasoning_content field so coding clients read a clean
