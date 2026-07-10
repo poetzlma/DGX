@@ -4,7 +4,7 @@
 # Phase-1 (launch-vllm-nemotron-puzzle-75b.sh) proved it loads & runs but was
 # eager-only (Mamba sm121 crash workaround) with MTP off -> 17.8/58.8 short,
 # 16.6/10.7 @125k: beaten by the 35B MoE lane. This variant chases the two levers:
-#   1. MTP: --speculative-config mtp n=1 (config declares num_nextn_predict_layers=1,
+#   1. MTP: --speculative-config mtp n=4 (config declares num_nextn_predict_layers=1,
 #      mtp.safetensors auto-loads; no num_nextn patch needed unlike Qwen).
 #   2. CUDA graphs: DROP --enforce-eager + --no-async-scheduling, betting AEON
 #      v0.23 sm121a fixed the Mamba graph-capture crash (#37431 / Nemotron #125)
@@ -49,7 +49,7 @@ exec docker run --name vllm-nemotron-puzzle-75b \
   --reasoning-parser nemotron_v3 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}'
   # --reasoning-parser nemotron_v3 (added 2026-07-08): splits <think>…</think>
   # into the OpenAI reasoning_content field so coding clients read a clean
   # `content`. Costs a few seconds of TTFT — it buffers the think block before

@@ -16,7 +16,7 @@ set -euo pipefail
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build/bin/llama-server}"
 MODEL="$HOME/models/qwen3.6-35b-a3b-gguf/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
 MMPROJ="$HOME/models/qwen3.6-35b-a3b-gguf/mmproj-F16.gguf"
-CTX="${QWEN35B_CTX:-262144}"
+CTX="${QWEN35B_CTX:-524288}"
 PARALLEL="${QWEN35B_PARALLEL:-2}"
 
 exec "$LLAMA_SERVER" \
