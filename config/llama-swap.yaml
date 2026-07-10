@@ -245,7 +245,7 @@ models:
     cmd: /home/max/llm-stack/bin/launch-llamacpp-35b-moe-vision.sh
     proxy: http://127.0.0.1:9026
     checkEndpoint: /health
-    ttl: 3600
+    ttl: 0
 
   # ─────────────────────────────────────────────────────────────────────
   # Nemotron-3-Nano-Omni-30B-A3B Reasoning NVFP4 (vLLM) — added 2026-04-29.
@@ -311,7 +311,7 @@ models:
     cmd: /home/max/llm-stack/bin/launch-vllm-nemotron-puzzle-75b-mtp.sh
     proxy: http://127.0.0.1:9027
     checkEndpoint: /health
-    ttl: 3600
+    ttl: 0
     env:
       # co-resident split (2026-07-08): leave room for the 35B vision lane
       # (~27 GB llama.cpp) beside this one. 0.60*119 = ~71 GB for the 75B
