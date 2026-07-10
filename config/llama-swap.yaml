@@ -5,7 +5,7 @@ healthCheckTimeout: 1200
 logLevel: info
 models:
   qwen3.6-35b-a3b-vision:
-    cmd: /home/max/llm-stack/bin/launch-llamacpp-35b-moe-vision.sh
+    cmd: /home/max/llm-stack/bin/launch-vllm-qwen-fast.sh
     proxy: http://127.0.0.1:9026
     checkEndpoint: /health
     ttl: 0
