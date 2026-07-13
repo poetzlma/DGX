@@ -1,0 +1,15 @@
+# Copy-back-managed model weight paths (one absolute local_path per line).
+# copyback-launch.sh evicts every path here EXCEPT the one being launched,
+# so at most one dormant model occupies local NVMe at a time.
+# KEEP-LOCAL models (puzzle-75b, unsloth-35b-vision, z-lab DFlash drafter)
+# are deliberately absent — they must never be evicted.
+~/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B-FP8
+~/.cache/huggingface/hub/models--Intel--Qwen3.6-27B-int4-AutoRound
+~/.cache/huggingface/hub/models--RedHatAI--Qwen3.6-35B-A3B-NVFP4
+~/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4
+~/.cache/huggingface/hub/models--nvidia--diffusiongemma-26B-A4B-it-NVFP4
+~/.cache/huggingface/hub/models--nvidia--Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
+~/llm-stack/models/Qwopus3.6-27B-v2-int4-AutoRound
+~/models/ornith-1.0-35b
+~/ds4/gguf
+~/cosmos3/models/Cosmos3-Nano
