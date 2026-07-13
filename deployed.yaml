@@ -1,29 +1,31 @@
 # Deployed LLM stack manifest — source of truth for downstream proxies (LiteLLM, etc.)
 #
-# Updated: 2026-06-27
+# Updated: 2026-07-13
 # Gateway: http://192.168.1.12:8079/v1   (log-proxy → llama-swap, OpenAI-compatible)
 #                                         underlying engine gateway: :8080 (llama-swap)
 #
 # All models share the gateway URL — clients route by `model` field.
 #
-# 2026-06-27 phase change: EXPERIMENTATION — no fixed production model. Every
-# model is a swap-exclusive member of a single llama-swap `experiments` group,
-# so each loads ALONE with the full 119 GB (no co-resident pair anymore). The
-# first request for a route cold-swaps it in and evicts whatever was resident.
-# Contexts were retuned for c=1/2/3 @ 131k where the engine allows (verified
-# no-OOM), EXCEPT the two deliberately-narrow lanes: int4-dflash (120k/c=1,
-# the DFlash drafter lane) and ds4 (131k planner, decode-bound).
+# 2026-07-13 topology: TWO TIERS.
+#  - RESIDENT (always loaded, co-resident): nemotron-3-puzzle-75b (coding default;
+#    qwen3.6-27b / qwen3.6-35b-a3b aliases resolve here) + qwen3.6-35b-a3b-vision.
+#  - DORMANT (swap-exclusive `experiments` group): weights offloaded to codeserver
+#    and copy-back-pulled on demand (bin/copyback-launch.sh). One resident at a time.
+# NOTE: the LIVE llama-swap config is in LOCKED MODE (residents only). Restore
+# config/llama-swap.full.bak to make the dormant routes below loadable again.
+# Dormant contexts are tuned c=1/2/3 @ 131k EXCEPT int4-dflash (120k/c=1, DFlash
+# drafter lane) and ds4 (131k planner, decode-bound).
 #
 # CODING-HARNESS CONTRACT: each engine below carries `context_window:` — the
 # per-request token window the downstream coding server must configure. Read
 # THAT field, not `config:`. For llama.cpp engines (ornith) it already accounts
 # for the --parallel slot split, so context_window != the engine's total ctx.
 #
-# Per-model internal ports (9010–9022) are internal-only while loaded.
+# Per-model internal ports (9010–9027) are internal-only while loaded.
 #
-# Cold-start budget: vLLM models ~2–6 min on first request after swap;
-# the ds4 native binary is ~104s cold / ~74s warm. Set request_timeout >=
-# 600s on any client to avoid timing out a cold load.
+# Cold-start budget: residents answer immediately. A DORMANT model first rsyncs
+# its weights from codeserver (~1–3 min; ~13 min for ds4's 85 GB GGUF) THEN
+# cold-loads the engine (~2–6 min vLLM). Set request_timeout >= 1200s.
 #
 # `model_list` block below is drop-in for LiteLLM proxy config. All routes
 # go through log-proxy on :8079 so each request is captured to
@@ -32,24 +34,26 @@
 gateway:
   url: http://192.168.1.12:8079/v1
   api_key: not-needed   # LAN-only, no auth (authed edge is Cloudflare/LiteLLM on .7)
-  swap_mode: exclusive  # single `experiments` group; one model resident at a time
-  request_timeout_min_s: 600
+  swap_mode: two-tier   # resident pair (persistent) + swap-exclusive `experiments` (dormant, copy-back)
+  request_timeout_min_s: 1200
 
 deployed:
-  # All members of the single swap-exclusive `experiments` group (one resident
-  # at a time). config = what the launcher actually serves; verified no-OOM.
+  # Two tiers: nemotron-3-puzzle-75b + qwen3.6-35b-a3b-vision are the persistent
+  # RESIDENT pair; the rest are the swap-exclusive `experiments` pool (one loaded
+  # at a time, weights copy-back from codeserver). config = what the launcher
+  # actually serves; verified no-OOM.
 
   - name: nemotron-3-puzzle-75b
     role: coding DEFAULT under test (qwen3.6-27b / qwen3.6-35b-a3b aliases resolve here) — set 2026-07-08
-    method: nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4 (hybrid Mamba+MoE+Attn, 9.3B active) + native MTP n=1 + CUDA graphs
+    method: nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4 (hybrid Mamba+MoE+Attn, 9.3B active) + MTP n=4 + CUDA graphs
     image: ghcr.io/aeon-7/aeon-vllm-ultimate:latest   # vLLM 0.23.0+aeon.sm121a.dflash — MTP+graphs work on sm_121 (Mamba #37431 eager-tax NOT binding here)
     aliases: [qwen3.6-27b, qwen3.6-35b-a3b]
     port_internal: 9027
     added: 2026-07-08
     context_window: 131072   # per-request window for the coding harness (engine max-model-len 131072; native 262144)
-    config: max-model-len=131072 max-num-seqs=8 gpu-mem-util=0.85 kv=bf16 mamba-cache=fp32 VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass speculative=mtp:n1
-    measured_single_stream_tok_s: 28   # MTP n=1 accept ~81%; agg short c4=81, 125k c1=20/c4=12. n=2 variant peaks 33 c1 single-stream
-    note: reasoning model — <think>…</think> currently leaks into content (no --reasoning-parser); beats dense 27B at long ctx, slower than 35B MoE (memory project_nemotron_puzzle_75b)
+    config: max-model-len=131072 max-num-seqs=8 gpu-mem-util=0.85 kv=bf16 mamba-cache=fp32 VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass speculative=mtp:n4   # co-resident override in llama-swap.yaml: NEMO_UTIL=0.55 NEMO_SEQS=4
+    measured_single_stream_tok_s: 28   # MTP accept ~81%; agg short c4=81, 125k c1=20/c4=12. n=2 variant peaks 33 c1 single-stream
+    note: reasoning model — --reasoning-parser nemotron_v3 splits <think>…</think> into reasoning_content (added 2026-07-08); beats dense 27B at long ctx, slower than 35B MoE (memory project_nemotron_puzzle_75b)
 
   - name: qwen3.6-27b-int4-dflash
     role: former coding default — aliases moved to nemotron-3-puzzle-75b 2026-07-08 (ROLLBACK target)
@@ -268,7 +272,7 @@ model_list:
       api_key: not-needed
 
 litellm_settings:
-  request_timeout: 900   # cold-start headroom; do not lower below 600
+  request_timeout: 1200   # cold-start + copy-back pull headroom; do not lower below 900
 
 # ─── Removed / archived (do NOT route to these) ────────────────────────────
 # 2026-05-17: qwen3.6-27b alias moved from -fp8 to -int4-dflash (Intel INT4 + DFlash n=4)

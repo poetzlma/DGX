@@ -1,37 +1,44 @@
 # Spark LLM Stack
 
-OpenAI-compatible LLM gateway on one **DGX Spark (GB10, 119 GB unified)**. Call it at **`http://192.168.1.12:8079/v1`** and route by the `model` field. **One model is resident at a time** — asking for a different `model` unloads the current one and cold-loads the next (1–10 min for vLLM engines, ~30 s–4.5 min for the ds4 / llama.cpp binaries).
+OpenAI-compatible LLM gateway on one **DGX Spark (GB10, 119 GB unified)**. Call it at **`http://192.168.1.12:8079/v1`** and route by the `model` field.
 
-> **Phase (2026-06-27): experimentation — no fixed production model.** Every model is a swap-exclusive member of the single `experiments` group, so each loads alone with the full 119 GB. Pick the one you want from the table. The `qwen3.6-27b` / `qwen3.6-35b-a3b` aliases still resolve for legacy clients.
+The stack runs in **two tiers**:
+
+- **Resident tier** — two models stay loaded side-by-side and are never evicted: **`nemotron-3-puzzle-75b`** (the coding default; `qwen3.6-27b` / `qwen3.6-35b-a3b` aliases resolve here) and **`qwen3.6-35b-a3b-vision`** (images). This is the [`resident` group](#groups-resident--experiments) — the pair the Ink Console needs at once (vision reads handwriting every turn; the 75B is its on-demand deep reasoner).
+- **Dormant tier** — ~11 eval/rollback models. Their weights live **off-box on codeserver** (`192.168.1.16`) to keep the Spark's NVMe from filling; requesting one **rsyncs its weights back on demand** (1–3 min for most, ~13 min for ds4's 85 GB GGUF), then serves it swap-exclusively. See [Weight offload](#weight-offload--codeserver-copy-back). One dormant model is loaded at a time.
+
+> **Request path:** client → **LiteLLM** (authed edge, `192.168.1.7`) → **log-proxy** (`192.168.1.12:8079`, logs every request) → **llama-swap** (`:8080`, routes by `model`, hot-swaps backends) → **engine** (`:90xx`). On the LAN you can skip LiteLLM and hit `:8079` directly.
 
 ## Models
 
-Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`bin/bench-models.py`, single-stream, each cold-loaded alone; raw in `logs/bench-results.json`). **Settings for each model live in its launcher** (`bin/<launcher>`) and are explained in [Per-launcher details](#per-launcher-details).
+Pick by `Route` (the `model` value). The **Tier** column says whether the model is always loaded (`resident`) or pulled from codeserver on demand (`copy-back`, +1–3 min first-load / ~13 min for ds4 — see [Weight offload](#weight-offload--codeserver-copy-back)). Speed/mem are single-stream figures from prior sweeps (`bin/bench-models.py`; raw in `logs/`). **Settings for each model live in its launcher** (`bin/<launcher>`) and are explained in [Per-launcher details](#per-launcher-details).
 
-| Route (`model`) | Use it for | tok/s | Max ctx | Peak mem | Engine | Launcher (`bin/`) |
-|---|---|---:|---:|---:|---|---|
-| **`qwen3.6-27b-int4-dflash`** | **coding — default** | 41 | 120 k | 61 GB | vLLM | `launch-vllm-27b-int4-dflash.sh` |
-| `qwen3.6-35b-a3b-nvfp4` | coding, long-ctx throughput | 61 | 131 k | 53 GB | vLLM | `launch-vllm-35b-moe-nvfp4.sh` |
-| `qwen3.6-35b-a3b-vision` 🆕 | **vision** (images) + fastest 35B c=1² | 69 | 131 k¹ | ~27 GB | llama.cpp | `launch-llamacpp-35b-moe-vision.sh` |
-| `qwen3.6-27b-nvfp4` 🆕 | coding — NVIDIA NVFP4, **256 k ctx** | 31 | **256 k** | ~101 GB | vLLM | `launch-vllm-27b-nvidia-nvfp4.sh` |
-| `qwen3.6-27b-nvfp4-vision` 🆕 | **vision** (images) at 256 k ctx² | 31 | **256 k** | ~101 GB | vLLM | `launch-vllm-27b-nvidia-nvfp4-vision.sh` |
-| `ornith-1.0-35b` 🆕 | coding — agentic (thinking)² | 77 | 131 k¹ | 25 GB | llama.cpp | `launch-ornith.sh` |
-| `qwopus3.6-27b-int4-dflash` | coding — Opus-distilled | 39 | 131 k | 102 GB | vLLM | `launch-vllm-qwopus-int4-dflash.sh` |
-| `qwen3.6-27b-fp8` | coding — quality baseline | 21 | 131 k | 91 GB | vLLM | `launch-vllm-27b-qwen-fp8.sh` |
-| `nemotron-3-nano-omni` | multimodal (image/audio/video) | 56 | 131 k | 91 GB | vLLM | `launch-vllm-nemotron-omni.sh` |
-| `cosmos3-nano-omni` 🆕 | image/video generation³ | ~6 s/img | — | ~30 GB | vLLM-Omni | `launch-vllm-cosmos3-nano-omni.sh` |
-| `diffusiongemma-26b` | speed / non-coding | 142 | 131 k | 50 GB | vLLM | `launch-vllm-diffusiongemma-nvfp4.sh` |
-| `deepseek-v4-flash-ds4` | long-context planner | 21 | 131 k | 22 GB | ds4 | `launch-ds4-server.sh` |
+| Route (`model`) | Tier | Use it for | tok/s | Max ctx | Peak mem | Engine | Launcher (`bin/`) |
+|---|---|---|---:|---:|---:|---|---|
+| **`nemotron-3-puzzle-75b`** ⟵ aliases `qwen3.6-27b`, `qwen3.6-35b-a3b` | **resident** | **coding — default** | 28 | 131 k⁵ | ~65 GB | vLLM | `launch-vllm-nemotron-puzzle-75b-mtp.sh` |
+| **`qwen3.6-35b-a3b-vision`** | **resident** | **vision** (images) | 56 | 131 k | ~34 GB | vLLM⁴ | `launch-vllm-qwen-fast.sh` |
+| `qwen3.6-27b-int4-dflash` | copy-back | coding — **rollback** target for the default | 29 | 120 k | 61 GB | vLLM | `launch-vllm-27b-int4-dflash.sh` |
+| `qwen3.6-35b-a3b-nvfp4` | copy-back | coding, long-ctx throughput | 56 | 131 k | 53 GB | vLLM | `launch-vllm-35b-moe-nvfp4.sh` |
+| `qwen3.6-27b-nvfp4` | copy-back | coding — NVIDIA NVFP4, **256 k ctx** | 31 | **256 k** | ~101 GB | vLLM | `launch-vllm-27b-nvidia-nvfp4.sh` |
+| `qwen3.6-27b-nvfp4-vision` | copy-back | **vision** (images) at 256 k ctx² | 31 | **256 k** | ~101 GB | vLLM | `launch-vllm-27b-nvidia-nvfp4-vision.sh` |
+| `ornith-1.0-35b` | copy-back | coding — agentic (thinking)² | 77 | 131 k¹ | 25 GB | llama.cpp | `launch-ornith.sh` |
+| `qwopus3.6-27b-int4-dflash` | copy-back | coding — Opus-distilled | 39 | 131 k | 102 GB | vLLM | `launch-vllm-qwopus-int4-dflash.sh` |
+| `qwen3.6-27b-fp8` | copy-back | coding — quality baseline | 21 | 131 k | 91 GB | vLLM | `launch-vllm-27b-qwen-fp8.sh` |
+| `nemotron-3-nano-omni` | copy-back | multimodal (image/audio/video) | 56 | 131 k | 91 GB | vLLM | `launch-vllm-nemotron-omni.sh` |
+| `cosmos3-nano-omni` | copy-back | image/video generation³ | ~6 s/img | — | ~30 GB | vLLM-Omni | `launch-vllm-cosmos3-nano-omni.sh` |
+| `diffusiongemma-26b` | copy-back | speed / non-coding | 116 | 131 k | 50 GB | vLLM | `launch-vllm-diffusiongemma-nvfp4.sh` |
+| `deepseek-v4-flash-ds4` | copy-back | long-context planner | 21 | 131 k | 22 GB | ds4 | `launch-ds4-server.sh` |
 
-¹ llama.cpp lanes split total engine ctx across parallel slots, env-tunable: Ornith `ORNITH_CTX`/`ORNITH_PARALLEL` (3 slots × 131 k), 35B-vision `QWEN35B_CTX`/`QWEN35B_PARALLEL` (2 slots × 131 k). &nbsp; ² **Thinking model** — output goes to `reasoning_content`; give generous `max_tokens` or `content` returns empty. &nbsp; ³ **Generation model, not chat** — call `POST /v1/videos` · `/v1/videos/sync` · `/v1/images/generations` (multipart), not `/v1/chat/completions`; tok/s and token-ctx don't apply. ~6 s/512² image warm; first cold-load ~3–4 min (166 s weights + warmup). **A `/v1/chat/completions` request returns an *image*, not text** — only the diffusion stage is loaded, so it can't emit text. &nbsp; tok/s / mem above are the 2026-06-27 single-stream sweep (pre-retune).
+¹ llama.cpp lanes split total engine ctx across parallel slots, env-tunable: Ornith `ORNITH_CTX`/`ORNITH_PARALLEL` (3 slots × 131 k), 35B-vision `QWEN35B_CTX`/`QWEN35B_PARALLEL` (2 slots × 131 k). &nbsp; ² **Thinking model** — output goes to `reasoning_content`; give generous `max_tokens` or `content` returns empty. &nbsp; ³ **Generation model, not chat** — call `POST /v1/videos` · `/v1/videos/sync` · `/v1/images/generations` (multipart), not `/v1/chat/completions`; tok/s and token-ctx don't apply. ~6 s/512² image warm; first cold-load ~3–4 min (166 s weights + warmup). **A `/v1/chat/completions` request returns an *image*, not text** — only the diffusion stage is loaded, so it can't emit text. &nbsp; ⁴ **Vision resident** currently runs the vLLM `unsloth/Qwen3.6-35B-A3B-NVFP4-Fast` lane (NVFP4 + MTP n=2, `launch-vllm-qwen-fast.sh`). A llama.cpp GGUF variant (`launch-llamacpp-35b-moe-vision.sh`, UD-Q4_K_XL + mmproj, 69 tok/s) is the documented alternative in `llama-swap.full.bak` — swap the `cmd:` to switch. &nbsp; ⁵ **`nemotron-3-puzzle-75b`** is served at 131 k (native 262 k); it's a reasoning model — `--reasoning-parser nemotron_v3` splits `<think>` into `message.reasoning_content` (added 2026-07-08). Peak mem ~65 GB at the co-resident `NEMO_UTIL=0.55` split. &nbsp; tok/s / mem above are single-stream sweep figures; treat as ballpark.
 
-> **Concurrency (2026-06-27 retune):** every model **except `int4-dflash` and `ds4`** is now tuned to serve **c=1/2/3 at 131 k context** (`qwopus` is c=2 — its DFlash path forces heavier bf16 KV). `int4-dflash` stays single-stream (it's the prefill-bound coding default) and `ds4` stays single-stream (its decode doesn't scale with concurrency). See [decision #21](#decision-log).
+> **Concurrency (2026-06-27 retune, applies to the copy-back lanes):** every model **except `int4-dflash` and `ds4`** is tuned to serve **c=1/2/3 at 131 k context** (`qwopus` is c=2 — its DFlash path forces heavier bf16 KV). `int4-dflash` stays single-stream (prefill-bound) and `ds4` stays single-stream (its decode doesn't scale with concurrency). See [decision §31](#31-concurrency-retune--c123--131-k-for-the-swap-models-2026-06-27).
 
 ### What each model is for
 
-- **`qwen3.6-27b-int4-dflash`** — Alibaba's **Qwen3.6-27B dense**, the coding workhorse; on our own evals it beat the 35B-A3B MoE by ≥4 pts SWE-bench, so it's the default. Intel's AutoRound **INT4** keeps quality within noise of FP8 while halving the weight bandwidth that bottlenecks GB10, and the z-lab **DFlash** speculative drafter pushes it to ~41 tok/s. Reach for it for everyday coding and agentic/tool-use work.
-- **`qwen3.6-35b-a3b-nvfp4`** — Qwen's **sparse MoE** (35B total, ~3B active/token), so it sidesteps the bandwidth wall and stays cheap under load. RedHat's NVFP4 quant + native MTP give 61 tok/s single-stream and the best concurrency/long-ctx throughput in the stack. Use it when you want speed and parallelism over the dense model's last few quality points.
-- **`qwen3.6-35b-a3b-vision`** 🆕 — the **vision lane for the 35B MoE**: unsloth's dynamic-4-bit GGUF (`UD-Q4_K_XL`, 22.4 GB) plus the **mmproj-F16 vision encoder** the vLLM NVFP4 lane leaves unloaded, served by mainline llama.cpp. Accepts standard `image_url` content blocks (shape/colour/spatial recognition verified 2026-07-07). Surprise bonus: at **69 tok/s single-stream it's the fastest 35B config measured** — llama.cpp Q4_K_XL beats vLLM NVFP4 c=1 on GB10 — and the second-lightest lane at ~27 GB. Use it to analyse images, or as the quick 35B when you don't need vLLM's concurrency scaling.
+- **`nemotron-3-puzzle-75b`** 🟢 **(resident, coding default)** — NVIDIA's "Iterative Puzzle" compression of Nemotron-3-Super-120B down to **75.3 B total / 9.3 B active**, a hybrid **Mamba + MoE + Attention** stack (`NemotronHPuzzle`) with 256 k native context, NVFP4 weights, and MTP baked in — it fits one GB10 in ~50 GB of weights. Promoted to coding default under test 2026-07-08; the `qwen3.6-27b` / `qwen3.6-35b-a3b` aliases resolve here. It wins at **long context** (beats the dense 27B past ~125 k) and **concurrency** (9× at 131 k), at the cost of lower single-stream speed than the Qwen lanes. Reach for it as the everyday coding/agent model; if it misbehaves, roll the aliases back to `qwen3.6-27b-int4-dflash`.
+- **`qwen3.6-27b-int4-dflash`** — Alibaba's **Qwen3.6-27B dense**, the previous coding default and now the **rollback target** for the aliases; on our own evals it beat the 35B-A3B MoE by ≥4 pts SWE-bench. Intel's AutoRound **INT4** keeps quality within noise of FP8 while halving the weight bandwidth that bottlenecks GB10, and the z-lab **DFlash** speculative drafter pushes it to ~41 tok/s. Reach for it (or roll the default back to it) for prefill-light everyday coding and agentic/tool-use work.
+- **`qwen3.6-35b-a3b-nvfp4`** — Qwen's **sparse MoE** (35B total, ~3B active/token), so it sidesteps the bandwidth wall and stays cheap under load. RedHat's NVFP4 quant + native MTP give ~56 tok/s single-stream and the best concurrency/long-ctx throughput in the stack. Use it when you want speed and parallelism over the dense model's last few quality points.
+- **`qwen3.6-35b-a3b-vision`** 🟢 **(resident)** — the always-on **vision lane** for the 35B MoE, co-resident with the 75B. Currently runs unsloth's **`Qwen3.6-35B-A3B-NVFP4-Fast`** under vLLM (NVFP4 + MTP n=2, `qwen3_5_vision` encoder loaded, ~34 GB, 56 tok/s), so standard `image_url` content blocks work with vLLM's concurrency. A llama.cpp GGUF variant (`UD-Q4_K_XL` + `mmproj-F16`, 69 tok/s / ~27 GB — the fastest 35B c=1 measured) is the documented drop-in alternative; swap the launcher `cmd:` to switch. Use this lane to analyse images.
 - **`qwen3.6-27b-nvfp4`** 🆕 — **NVIDIA's official ModelOpt NVFP4** build of the Qwen3.6-27B `qwen3_5` hybrid (48 Gated-DeltaNet + 16 full-attention layers, W4A16-NVFP4 MLPs). Its draw is **context**: `max_position_embeddings` is natively **262 144**, so it serves the **full 256 k window with no RoPE scaling and zero quality hit** — the longest-context coding lane in the stack. The hybrid layout means only 16/64 layers carry a growing KV cache, so 256 k is affordable on one GB10 (674 k-token KV pool). z-lab DFlash n=10 gives 31 tok/s single-stream. Needs the AEON `sm121a` engine + `VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass` — a **stock** vLLM image routes NVFP4 to a Marlin kernel that produces garbage on GB10/sm_121. Use it when you need a single request to span >130 k tokens.
 - **`qwen3.6-27b-nvfp4-vision`** 🆕 — the `qwen3.6-27b-nvfp4` lane **with the `qwen3_5_vision` encoder loaded** (`--language-model-only` dropped, `--limit-mm-per-prompt image=4`): same weights, image, config, and full 256 k window, but `image_url` content blocks work. Perception is accurate on shapes/colour/spatial layout; OCR of stylised text is soft. Thinking model — the answer often lands in `reasoning_content`, so give generous `max_tokens`. Use it when a vision task needs the dense 27B's quality or >131 k context; for quick image work the 35B vision lane is faster.
 - **`qwen3.6-27b-fp8`** — the **official Qwen FP8** build, "near-lossless" per the card with no community-quant noise. It's the ground-truth reference: when an INT4/NVFP4 result looks off, A/B against this. Use it for quality baselining and canonical Qwen3.6 behavior.
@@ -46,20 +53,24 @@ Pick by `Route` (the `model` value). Speed/mem are from the 2026-06-27 sweep (`b
 
 ```sh
 curl http://192.168.1.12:8079/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "qwen3.6-27b-int4-dflash",
+  "model": "qwen3.6-27b",
   "messages": [{"role": "user", "content": "hi"}]
 }'
-# Set client timeout ≥ 900s — a cold swap can take up to 10 min.
+# "qwen3.6-27b" / "qwen3.6-35b-a3b" are aliases → the resident nemotron-3-puzzle-75b default.
+# Resident models answer immediately. A copy-back (dormant) model first rsyncs its weights
+# from codeserver, so set client timeout ≥ 1200s (matches llama-swap healthCheckTimeout).
 # :8079 is the logged path (log-proxy → llama-swap); :8080 is the direct gateway.
 ```
 
-### Operate
+### Quick commands
+
+(full runbook — logs, rollback, copy-back inspection — under [Operations](#operations).)
 
 ```sh
 curl -s http://192.168.1.12:8080/v1/models | jq -r '.data[].id'   # list routes
 curl -s http://192.168.1.12:8080/running                          # which model is hot
 sudo systemctl status llama-swap                                  # service health
-curl -X POST http://192.168.1.12:8080/unload                      # free the resident model
+curl -X POST http://192.168.1.12:8080/unload                      # unload the current dormant model (residents unaffected)
 docker ps --filter name=vllm- --filter name=llama-                # running engine container
 ```
 
@@ -89,14 +100,71 @@ Re-run the full characterisation sweep (speed + cold-load + peak mem for every m
 | Web UI | `http://192.168.1.12:8080/ui` |
 | Hot config reload | `-watch-config` enabled — yaml edits apply in ~1 s, no restart |
 
-### Group semantics
+### Groups: `resident` + `experiments`
 
-- **`experiments`** (`swap: true, exclusive: true`) — the only group. At most one model resident at a time; requesting a different model unloads the current one and cold-loads the next. Cold-swap latency 1–10 min for vLLM engines, ~30–105 s for the llama.cpp (Ornith) and ds4 native binaries. Each loads alone with the full 119 GB available.
-- *(historical: the `qwen-coresident` + `main` split was retired 2026-06-27 when we dropped the dedicated-prod model. See [decision log](#decision-log).)*
+Two llama-swap groups (`config/llama-swap.full.bak`):
+
+- **`resident`** (`swap: false, exclusive: false, persistent: true`) — the two always-on models, `nemotron-3-puzzle-75b` + `qwen3.6-35b-a3b-vision`. They load **side-by-side** and are **never evicted** by other loads. GPU split via env on the 75B: `NEMO_UTIL=0.55` (~65 GB) leaves room for the ~34 GB vision lane (~99 GB of 119 GB, plus OS headroom). `ttl: 0` — no idle unload.
+- **`experiments`** (`swap: true, exclusive: true`) — the dormant pool. **At most one** member loads at a time; requesting a different one unloads the current and cold-loads the next. Each is a [copy-back model](#weight-offload--codeserver-copy-back): its weights rsync from codeserver first (+1–3 min, ~13 min for ds4), then the engine cold-loads (1–10 min vLLM, ~30–105 s for llama.cpp/ds4 binaries). `ttl: 3600`.
+
+> **⚠️ Swap-exclusive vs. itself, not vs. residents.** The `experiments` group only unloads *other experiments members* — it never evicts the ~99 GB resident pair. So a dormant model larger than the free headroom (~20 GB) — notably the ~101 GB NVFP4 256 k lanes and `qwopus` — **cannot load beside the residents**; free a resident first (`docker rm -f vllm-nemotron-puzzle-75b vllm-qwen-fast`) or lower `NEMO_UTIL`. See [Troubleshooting](#troubleshooting).
+
+> **⚠️ Active config is in LOCKED MODE.** `config/llama-swap.yaml` (the live config) currently exposes **only the two residents** — the dormant pool is not loadable from it. The full roster lives in `config/llama-swap.full.bak`; restore it (`cp config/llama-swap.full.bak config/llama-swap.yaml`, `-watch-config` picks it up) to re-enable the copy-back models.
+
+---
+
+## Weight offload — codeserver copy-back
+
+The Spark's 916 GB NVMe was filling (95%). Dormant model weights now live **off-box on codeserver** (`192.168.1.16`, a 1.9 TB LAN host reached over 2.5 GbE) under `~/llm-weights-archive/` (~409 GB), and are **pulled back on demand** the moment llama-swap starts that slot — dropping the Spark to **~48% used**. Only the two residents (plus the small shared DFlash drafter) stay permanently local.
+
+**How a dormant model loads.** Each `experiments` slot's `cmd:` in `llama-swap.full.bak` is wrapped by [`bin/copyback-launch.sh`](bin/copyback-launch.sh):
+
+```
+copyback-launch.sh <local_path> <remote_relpath> <real_launch_script>
+```
+
+On start it (1) **evicts every other managed model** listed in `etc/copyback-models.txt` — enforcing *one dormant model on NVMe at a time* and self-healing if a prior slot was SIGKILL'd before it could clean up; (2) **rsyncs** the weights from `codeserver:~/llm-weights-archive/<remote_relpath>` if they aren't already local (`--partial` resumes an interrupted pull; a failed pull is removed, not left corrupt); (3) runs the real launcher with `TERM`/`INT` forwarded; (4) on stop, **evicts** the weights again (evict-immediately-after-use — leanest disk, re-pulls each cold start).
+
+**The manifest** `etc/copyback-models.txt` is the eviction guard: one absolute weight path per line. **Keep-local models are deliberately absent** so they can never be evicted — `nemotron-3-puzzle-75b`, the `qwen3.6-35b-a3b-vision` weights, and the z-lab DFlash drafter.
+
+**Archive layout** (`codeserver:~/llm-weights-archive/`):
+
+```
+hub/models--<org>--<name>   # HF-cache models → restore to ~/.cache/huggingface/hub/
+qwopus/Qwopus3.6-27B-v2-int4-AutoRound
+ornith/ornith-1.0-35b
+ds4/gguf                    # ~85 GB — the longest pull (~13 min)
+cosmos3-models/Cosmos3-Nano
+```
+
+**Operational notes:**
+
+- `healthCheckTimeout: 1200` (20 min) in `llama-swap.yaml` **must exceed** the pull+load time, or llama-swap kills the slot mid-download.
+- **New dependency:** dormant models require **codeserver online** to load — a failed pull exits non-zero and the slot won't start. The two residents have no such dependency. Weights exist *only* on codeserver now (local copies were deleted after verification).
+- The pull path uses SSH key auth to a bare host (no credentials in-repo). The codeserver address defaults to the LAN IP but is overridable via the **`COPYBACK_REMOTE`** env var (and `COPYBACK_ARCHIVE_ROOT` for the archive path) in `bin/copyback-launch.sh` — set it in the systemd env or launcher if you'd rather not hardcode internal topology.
 
 ---
 
 ## Per-launcher details
+
+> The first two subsections are the **resident pair** (always loaded); the next few are the highest-traffic **copy-back** lanes. Lanes not detailed here (`qwopus`, `qwen3.6-27b-fp8`, `cosmos3-nano-omni`, `diffusiongemma-26b`, `ornith-1.0-35b`, `deepseek-v4-flash-ds4`) are covered in the [Decision log](#decision-log) (§29–§32) and their launcher scripts. Every copy-back lane pulls its weights from codeserver on first load (see [Weight offload](#weight-offload--codeserver-copy-back)); the configs below otherwise apply unchanged.
+
+### Resident coding default: `nemotron-3-puzzle-75b` (launcher: `bin/launch-vllm-nemotron-puzzle-75b-mtp.sh`)
+
+Promoted to coding default under test 2026-07-08. **`nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4`** — NVIDIA's "Iterative Puzzle" compression of Nemotron-3-Super-120B into a **75.3 B-total / 9.3 B-active** hybrid `NemotronHPuzzle` stack (interleaved Mamba-2 + MoE + full-attention layers), NVFP4 weights (~50 GB), 256 k native context, MTP head baked in. Holds the `qwen3.6-27b` / `qwen3.6-35b-a3b` default aliases. Port 9027.
+
+- **Image**: `ghcr.io/aeon-7/aeon-vllm-ultimate:latest` (AEON sm_121a / GB10 build) — same image as the vision resident.
+- **`--speculative-config '{"method":"mtp","num_speculative_tokens":4}'` (MTP n=4) + CUDA graphs** (the `-mtp.sh` launcher). Both work on sm_121 via the AEON image: the vLLM #37431 Mamba "eager-only" tax is **not** binding here because graph capture is piecewise. MTP acceptance ~81 %.
+- **Co-residence env** (set in `llama-swap.yaml`): `NEMO_UTIL=0.55` (~65 GB, leaves room for the vision lane) and `NEMO_SEQS=4`. Launcher solo defaults are `NEMO_UTIL=0.85 / NEMO_SEQS=8 / NEMO_CTX=131072`. (`llama-swap.full.bak` sets `0.60` — reconcile if you restore it.)
+- **`--tool-call-parser qwen3_coder` + `--reasoning-parser nemotron_v3`** (parser added 2026-07-08) — splits `<think>…</think>` into `message.reasoning_content`, so clients read clean `content`. Still a reasoning model: give it generous `max_tokens`.
+
+Measured (agg tok/s): short c1/c4 = **28 / 81**; 125 k c1/c4 = **20 / 12**. It **beats the dense 27B past ~125 k context** and scales ~9× under concurrency at 131 k, but is slower single-stream than the Qwen lanes and the 35B MoE (eval finding). An n=2 single-stream variant (~33 tok/s c=1) sits at `scratchpad/launch-mtp-n2.sh` if you want peak single-stream over concurrency. Deep writeup: `memory project_nemotron_puzzle_75b`.
+
+### Resident vision: `qwen3.6-35b-a3b-vision` (launcher: `bin/launch-vllm-qwen-fast.sh`)
+
+The always-on **vision** lane (images), co-resident with the 75B. Currently runs **`unsloth/Qwen3.6-35B-A3B-NVFP4-Fast`** under vLLM (NVFP4 + MTP n=2, `qwen3_5_vision` encoder loaded), port 9026, `QWENFAST_UTIL=0.28` (~34 GB), `QWENFAST_CTX=262144`, `QWENFAST_SEQS=2`, `--reasoning-parser qwen3`, same AEON image as the 75B. Accepts standard `image_url` content blocks. 56 tok/s single-stream.
+
+> **Alternate implementation.** `llama-swap.full.bak` defines this same route via **llama.cpp** instead — `bin/launch-llamacpp-35b-moe-vision.sh` serving unsloth's `UD-Q4_K_XL` GGUF + `mmproj-F16` (69 tok/s, ~27 GB, the fastest 35B c=1 measured). The two are interchangeable; swap the `cmd:` to switch engines. The llama.cpp variant's full write-up is preserved below under [MoE vision](#moe-vision-qwen36-35b-a3b-vision-launcher-binlaunch-llamacpp-35b-moe-visionsh).
 
 ### Dense: `qwen3.6-27b-int4-dflash` (launcher: `bin/launch-vllm-27b-int4-dflash.sh`)
 
@@ -164,13 +232,15 @@ Measured (2026-07-01, solo): decode **31 tok/s** short · 26.8 @118 k · **15.1 
 
 ### Co-residence contention behavior (single GPU caveat)
 
+> Measured on the *retired* dense-27B + 35B-MoE co-resident pair, but the lesson applies unchanged to the current `nemotron-3-puzzle-75b` + `qwen3.6-35b-a3b-vision` residents — any two engines sharing GB10 contend for SM cycles.
+
 | Scenario | Dense | MoE |
 |---|---:|---:|
 | Dense fires alone (MoE resident-idle) | 31.2 tok/s | (idle) |
 | MoE fires alone (dense resident-idle) | (idle) | 101.3 tok/s |
 | Both decode simultaneously | 17.3 | 39.4 |
 
-Memory is partitioned cleanly. Compute isn't — GB10 is one physical GPU, and two vLLM containers competing for SM cycles halves each engine's throughput. Co-residence wins for **bursty / sequential** mixed traffic (one busy at a time); it loses for **sustained concurrent** dual-engine load.
+Memory is partitioned cleanly. Compute isn't — GB10 is one physical GPU, and two engines competing for SM cycles halves each one's throughput. Co-residence wins for **bursty / sequential** mixed traffic (one busy at a time); it loses for **sustained concurrent** dual-engine load. For the current pair this is by design: the vision lane answers short handwriting-OCR turns while the 75B does occasional deep reasoning — rarely both flat-out at once.
 
 ---
 
@@ -184,44 +254,43 @@ sudo systemctl start|stop|restart|status llama-swap
 tail -f ~/llm-stack/logs/llama-swap.log
 tail -f ~/llm-stack/logs/llama-swap.err
 
-# Active container logs (production)
-docker logs -f vllm-qwen-27b-int4-dflash   # qwen3.6-27b (dense, prod)
-docker logs -f vllm-qwen-35b-moe-nvfp4     # qwen3.6-35b-a3b-nvfp4 (MoE)
+# Resident container logs (always loaded)
+docker logs -f vllm-nemotron-puzzle-75b    # nemotron-3-puzzle-75b (coding default)
+docker logs -f vllm-qwen-fast              # qwen3.6-35b-a3b-vision (vision)
 
-# Rollback / specialty containers
-docker logs -f vllm-qwen-27b-fp8           # qwen3.6-27b-fp8 (demoted prod 2026-05-17)
-docker logs -f vllm-qwen-27b-int4-autoround # qwen3.6-27b-int4-autoround
-docker logs -f vllm-qwen-27b-sakamaki-mtp  # sakamaki rollback
-docker logs -f vllm-qwen-27b-dflash        # aeon-dflash rollback
-docker logs -f vllm-qwen-27b               # mtp rollback (oldest)
-docker logs -f vllm-qwen-27b-clean-dflash  # eval slot
-docker logs -f vllm-nemotron-omni          # multimodal omni
-docker logs -f ds4-server                  # deepseek-v4-flash-ds4 (planner)
+# Dormant (copy-back) engines — a container exists only while that model is loaded.
+# Names follow each launcher's --name (vllm-qwen-27b-int4-dflash, vllm-qwen-27b-fp8,
+# vllm-nemotron-omni, ds4-server, …). List whatever is live with `docker ps`.
 
 # State inspection
 curl http://192.168.1.12:8080/running
 curl http://192.168.1.12:8080/v1/models
-docker ps --filter name=vllm- --filter name=llama-
+docker ps --filter name=vllm- --filter name=llama- --filter name=ds4-
 
-# Force an unload
+# Force-unload the current experiments-group model (residents are unaffected)
 curl -X POST http://192.168.1.12:8080/unload
 
-# Kill a co-resident engine to free memory for a swap-exclusive heavy
-docker rm -f vllm-qwen-35b-moe-nvfp4   # frees ~49 GB
-docker rm -f vllm-qwen-27b-int4-dflash # frees ~55 GB
+# Copy-back inspection: archive contents + which dormant weights are staged locally now
+ssh 192.168.1.16 'du -sh ~/llm-weights-archive/*'
+cat etc/copyback-models.txt   # the managed paths (at most one exists locally at a time)
 ```
 
-### Rollback to FP8 prod
+### Roll the coding default back to the dense 27B
 
 ```sh
-# Edit config/llama-swap.yaml — move these aliases:
-#   from qwen3.6-27b-int4-dflash entry
-#   to   qwen3.6-27b-fp8 entry
+# qwen3.6-27b / qwen3.6-35b-a3b currently resolve to nemotron-3-puzzle-75b.
+# To fall back to the dense Qwen 27B, repoint the aliases from
+#   nemotron-3-puzzle-75b  →  qwen3.6-27b-int4-dflash:
 #     aliases:
 #       - qwen3.6-27b
 #       - qwen3.6-35b-a3b
-# Save. -watch-config picks it up in ~1 s. Next request triggers swap-in of fp8.
-# Optional: docker rm -f vllm-qwen-27b-int4-dflash to free its 55 GB now.
+#
+# WHERE to change it: llama-swap v201 drops yaml aliases on -watch-config reload,
+# so the authoritative alias→model map lives at the LiteLLM gateway (deployed.yaml
+# on cockroach / 192.168.1.7), NOT only in config/llama-swap.yaml. Update it there.
+#
+# int4-dflash is a copy-back model — its first load after rollback pulls ~18 GB from
+# codeserver (~2 min) before it serves. Pre-stage by hitting it once to warm the pull.
 ```
 
 ---
@@ -250,10 +319,11 @@ Results go to `logs/bench-*.json` and `logs/bench-*.log` with timestamped names.
 3. **Add a `models:` block** in `config/llama-swap.yaml`:
    - safetensors (BF16, FP8, NVFP4, INT4-AutoRound): use a vLLM launcher pattern (see `bin/launch-vllm-27b-int4-dflash.sh` as template).
    - GGUF: use a llama.cpp launcher pattern (see `bin/launch-vllm-qwen.sh` historical pattern).
-4. **Append the new key** to the `experiments` group members list.
-5. **Validate**: `python3 -c "import yaml; yaml.safe_load(open('config/llama-swap.yaml'))"`.
-6. **Save** — `-watch-config` reloads within ~1 s (see decision log §27). Verify via `curl -s http://localhost:8080/v1/models`.
-7. **Smoke test** by sending a 5-token completion — first request is the cold load.
+4. **Pick a group** (`config/llama-swap.full.bak`): add the key to `experiments` (swap-exclusive, one-at-a-time) for an eval/rollback model, or to `resident` (persistent, co-resident — mind the GPU-memory split) for an always-on model.
+5. **(Optional) offload the weights** to codeserver so they don't sit on local NVMe. Move them to `codeserver:~/llm-weights-archive/<area>/`, add the local path to `etc/copyback-models.txt`, and wrap the slot's `cmd:` with `bin/copyback-launch.sh <local_path> <remote_relpath> <real_launcher>`. Do **not** offload a `resident` model. See [Weight offload](#weight-offload--codeserver-copy-back).
+6. **Validate**: `python3 -c "import yaml; yaml.safe_load(open('config/llama-swap.yaml'))"`.
+7. **Save** — `-watch-config` reloads within ~1 s (see decision log §27). Verify via `curl -s http://localhost:8080/v1/models`.
+8. **Smoke test** by sending a 5-token completion — first request is the cold load (plus the copy-back pull, if offloaded).
 
 Fallback for binary / unit changes: `pkill -9 llama-swap` (SIGKILL → systemd respawn; SIGTERM does not — `Restart=on-failure`).
 
@@ -265,17 +335,17 @@ Points at the log-proxy on `:8079` so every request lands in `~/llm-stack/logs/p
 
 ```yaml
 model_list:
-  - model_name: qwen3.6-27b              # what clients call
+  - model_name: qwen3.6-27b                      # what clients call (legacy alias)
     litellm_params:
-      model: openai/qwen3.6-27b          # must match the llama-swap map key
+      model: openai/nemotron-3-puzzle-75b        # resolve the alias to the real key HERE
       api_base: http://192.168.1.12:8079/v1
       api_key: none
-      timeout: 900                       # ≥ cold-load time
+      timeout: 1200                              # ≥ cold-load + copy-back pull
 litellm_settings:
-  request_timeout: 900
+  request_timeout: 1200
 ```
 
-The `openai/<key>` string in `litellm_params.model` must exactly match the key under `models:` in the active llama-swap config — that's how llama-swap routes and decides which backend to swap in.
+The `openai/<key>` string in `litellm_params.model` must exactly match the key under `models:` in the active llama-swap config — that's how llama-swap routes and decides which backend to swap in. **Resolve aliases at this gateway layer** (map `qwen3.6-27b` → the real model name): llama-swap v201 drops yaml `aliases:` on `-watch-config` reload, so the LiteLLM `model_list` is the reliable place to pin them.
 
 ---
 
@@ -284,14 +354,18 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 ```
 ~/llm-stack/
 ├── config/
-│   └── llama-swap.yaml             # active config (single `experiments` swap group)
-├── deployed.yaml                   # source-of-truth manifest for downstream (LiteLLM)
+│   ├── llama-swap.yaml             # ACTIVE config — LOCKED MODE (2 residents only)
+│   └── llama-swap.full.bak         # full roster (resident + experiments groups) — restore to unlock
+├── deployed.yaml                   # LiteLLM model_list for downstream (two-tier framing, updated 2026-07-13)
 ├── bin/
-│   ├── launch-vllm-27b-int4-dflash.sh   # ACTIVE — coding default (Intel INT4 + DFlash n=4, v4 image)
-│   ├── launch-vllm-35b-moe-nvfp4.sh     # ACTIVE — 35B MoE throughput (RedHatAI NVFP4 + MTP n=1)
-│   ├── launch-llamacpp-35b-moe-vision.sh # ACTIVE — 35B MoE VISION (unsloth GGUF + mmproj, llama.cpp)
-│   ├── launch-vllm-27b-nvidia-nvfp4.sh  # ACTIVE — NVIDIA NVFP4 256k lane (DFlash n=10)
-│   ├── launch-vllm-27b-nvidia-nvfp4-vision.sh # ACTIVE — 256k lane VISION twin (encoder loaded)
+│   ├── copyback-launch.sh              # copy-back/dormant-tier wrapper: rsync weights from codeserver, run, evict
+│   ├── launch-vllm-nemotron-puzzle-75b-mtp.sh # RESIDENT — coding default (NVFP4 75B hybrid, MTP n=4)
+│   ├── launch-vllm-qwen-fast.sh        # RESIDENT — 35B vision (unsloth NVFP4-Fast, MTP n=2, vLLM)
+│   ├── launch-vllm-27b-int4-dflash.sh   # copy-back — rollback default (Intel INT4 + DFlash n=4)
+│   ├── launch-vllm-35b-moe-nvfp4.sh     # copy-back — 35B MoE throughput (RedHatAI NVFP4 + MTP n=1)
+│   ├── launch-llamacpp-35b-moe-vision.sh # alt vision impl (unsloth GGUF + mmproj, llama.cpp)
+│   ├── launch-vllm-27b-nvidia-nvfp4.sh  # copy-back — NVIDIA NVFP4 256k lane (DFlash n=10)
+│   ├── launch-vllm-27b-nvidia-nvfp4-vision.sh # copy-back — 256k lane VISION twin (encoder loaded)
 │   ├── launch-vllm-27b-qwen-fp8.sh      # rollback — was prod 2026-05-08 → 2026-05-17
 │   ├── launch-vllm-qwopus-int4-dflash.sh # eval — Opus-distilled 27B (INT4 + DFlash)
 │   ├── launch-ornith.sh                 # eval — Ornith-1.0-35B MoE (llama.cpp)
@@ -325,7 +399,8 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 │   ├── log-proxy.service                # systemd-managed log-proxy
 │   └── stack-api.service                # systemd-managed stack-api
 ├── etc/
-│   └── qwen3.6-chat-template-froggeric.jinja  # chat template used by Qwen3.6 entries
+│   ├── qwen3.6-chat-template-froggeric.jinja  # chat template used by Qwen3.6 entries
+│   └── copyback-models.txt                    # copy-back eviction manifest (dormant weight paths)
 ├── docs/
 │   ├── qwen3.6-27b-dflash.md            # deep DFlash writeup
 │   └── deepseek-v4-flash.md             # ds4 deep writeup
@@ -379,7 +454,10 @@ PYEOF
 |---|---|---|
 | Gateway down after reboot | Service not enabled | `sudo systemctl enable llama-swap` |
 | Co-resident engines won't both load | Insufficient GPU memory | Lower `--gpu-memory-utilization` on one engine; verify with `nvidia-smi --query-compute-apps` |
-| `nemotron` or `ds4` OOMs on cold start | Qwen co-resident pair holding ~104 GB | `docker rm -f vllm-qwen-{27b-int4-dflash,35b-moe-nvfp4}` first |
+| A heavy dormant model OOMs on cold start | Resident pair holding ~99 GB (75B + vision) | The `experiments` group is swap-exclusive vs itself but **not** vs residents — a >20 GB dormant model may not fit beside them. `docker rm -f vllm-nemotron-puzzle-75b vllm-qwen-fast` to free the residents, or lower `NEMO_UTIL` |
+| Dormant model won't load, `pull failed` in logs | codeserver (`192.168.1.16`) unreachable, or SSH key not loaded | `ssh 192.168.1.16 true` to check; dormant models require codeserver online. Residents are unaffected |
+| Dormant model load times out (>20 min) | Pull + engine load exceeded `healthCheckTimeout` | Raise `healthCheckTimeout` in `llama-swap.yaml`; ds4's 85 GB pull alone is ~13 min |
+| Local disk fills despite offload | A SIGKILL'd dormant model left stale weights | Next managed launch self-evicts them; or `rm -rf` the stale path from `etc/copyback-models.txt` manually |
 | Both engines decode at half-speed | Single-GPU SM contention from concurrent compute | Expected — serialize the workload if sustained dual-engine load matters |
 | `kv_cache_dtype not supported` on FLASH_ATTN | Backend doesn't support fp8 KV in this image | Use `--kv-cache-dtype auto` (bf16) — or switch to FLASHINFER backend |
 | INT4+DFlash hangs at CUDA-graph capture | FULL graph mode + INT4-GPTQ + DFlash | Force `--compilation-config '{"cudagraph_mode":"PIECEWISE"}'` |
@@ -618,6 +696,15 @@ The launcher contexts/concurrency were co-resident-era fossils (`gpu-util 0.40�
 | `diffusiongemma-26b` | unchanged (131 k / 4 / 0.30) | — | diffusion | c=4 (seqs=4 card-mandatory) |
 
 Excluded by design: **`int4-dflash`** stays single-stream — it's the prefill-bound coding default, and a 131 k prompt already costs ~150 s TTFT, so concurrency would compound that. **`ds4`** stays single-stream — its decode is bandwidth-bound and does **not** scale with concurrency (measured: flat aggregate at c=1/2/4, see §30). **`qwopus` is c=2 only**: its DFlash path forces FLASH_ATTN, which can't do fp8 KV, so each stream's bf16 KV is ~2× heavier and c=3 wouldn't fit. Values are KV-math estimates (±10 % vs vLLM's real block accounting) — verify each loads at the target before trusting c=3 under load.
+
+### 32. Two-tier residents + codeserver copy-back offload *(2026-07-13)*
+
+The Spark's 916 GB NVMe hit 95 %. Rather than delete any of the ~11 dormant eval/rollback models, their weights were moved to **codeserver** (`192.168.1.16`, 1.9 TB, 2.5 GbE) and are pulled back on demand — dropping local usage to ~48 % (**~408 GB freed, nothing deleted**). This also formalized the **two-tier** split implicit since the 2026-07-08 resident-pair revival:
+
+- **Resident tier** (`resident` group, `persistent: true`, co-resident): `nemotron-3-puzzle-75b` + `qwen3.6-35b-a3b-vision` — always local, always loaded. Supersedes the "every model loads solo with the full 119 GB" framing of §1/§31 (which still holds for the dormant pool).
+- **Dormant tier** (`experiments` group): weights on codeserver, each slot's `cmd:` wrapped by `bin/copyback-launch.sh` (pull-on-start, evict-on-stop, one-at-a-time via `etc/copyback-models.txt`).
+
+Design choices worth recording: **evict-immediately-after-use** (leanest disk; re-pulls each cold start) was chosen over LRU retention — dormant models are rarely hit, so paying the pull each time beats holding tens of GB resident. **`healthCheckTimeout` raised to 1200 s** so a pull can't trip the health check mid-download (ds4's 85 GB GGUF is a ~13 min pull). **HF-cache blobs are root-owned** (docker populates the cache as root), so `rm` as `max` can't remove them — delete via a throwaway `docker run --rm -v ~/.cache/huggingface:/hf alpine rm -rf /hf/hub/models--…` (no sudo; `max` is in the `docker` group). **New dependency:** dormant models require codeserver online to load; the residents do not. Full writeup: `memory project_weights_offload_codeserver`.
 
 ---
 
