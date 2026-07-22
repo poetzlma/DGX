@@ -22,3 +22,8 @@ groups:
     persistent: true
     members:
     - laguna-s-2.1
+
+hooks:
+  on_startup:
+    preload:
+    - laguna-s-2.1
