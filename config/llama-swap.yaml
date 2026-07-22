@@ -1,30 +1,24 @@
-# LOCKED MODE: only the two residents are loadable (qwen-vision + nemotron-puzzle).
-# Full roster backed up at llama-swap.full.bak — restore to re-enable others.
+# LOCKED MODE: Laguna S-2.1 sole resident — PROD cutover 2026-07-22.
+# Exclusive occupancy (~92 GB at util 0.85): KV pool 858k tokens = 3.28x
+# concurrent full-256k sessions. Nothing else fits alongside; vision lane is
+# DARK while this config is live (restore llama-swap.yaml.bak.20260722-prelaguna
+# for the nemotron+vision resident pair, llama-swap.full.bak for full roster).
+# Old prod names (qwen3.6-27b, qwen3.6-35b-a3b, nemotron-3-puzzle-75b) are
+# remapped to laguna at the LiteLLM GATEWAY (llama-swap aliases don't route —
+# see memory feedback_llama_swap_alias_reload).
 
 healthCheckTimeout: 1200
 logLevel: info
 models:
-  qwen3.6-35b-a3b-vision:
-    cmd: /home/max/llm-stack/bin/launch-vllm-qwen-fast.sh
-    proxy: http://127.0.0.1:9026
+  laguna-s-2.1:
+    cmd: /home/max/llm-stack/bin/launch-vllm-laguna-s21-nvfp4.sh
+    proxy: http://127.0.0.1:9030
     checkEndpoint: /health
     ttl: 0
-  nemotron-3-puzzle-75b:
-    cmd: /home/max/llm-stack/bin/launch-vllm-nemotron-puzzle-75b-mtp.sh
-    proxy: http://127.0.0.1:9027
-    checkEndpoint: /health
-    ttl: 0
-    env:
-    - NEMO_UTIL=0.55
-    - NEMO_SEQS=4
-    aliases:
-    - qwen3.6-27b
-    - qwen3.6-35b-a3b
 groups:
   resident:
     swap: false
     exclusive: false
     persistent: true
     members:
-    - qwen3.6-35b-a3b-vision
-    - nemotron-3-puzzle-75b
+    - laguna-s-2.1

@@ -1,17 +1,21 @@
 # Deployed LLM stack manifest — source of truth for downstream proxies (LiteLLM, etc.)
 #
-# Updated: 2026-07-13
+# Updated: 2026-07-22
 # Gateway: http://192.168.1.12:8079/v1   (log-proxy → llama-swap, OpenAI-compatible)
 #                                         underlying engine gateway: :8080 (llama-swap)
 #
 # All models share the gateway URL — clients route by `model` field.
 #
-# 2026-07-13 topology: TWO TIERS.
-#  - RESIDENT (always loaded, co-resident): nemotron-3-puzzle-75b (coding default;
-#    qwen3.6-27b / qwen3.6-35b-a3b aliases resolve here) + qwen3.6-35b-a3b-vision.
+# 2026-07-22 topology: SINGLE RESIDENT — laguna-s-2.1 (coding default; the
+# qwen3.6-27b / qwen3.6-35b-a3b / nemotron-3-puzzle-75b names all resolve here
+# at the GATEWAY). Exclusive occupancy: ~92 GB, KV pool 858k tokens = 3.28
+# concurrent full-256k sessions. VISION LANES ARE DARK in this topology —
+# qwen3.6-35b-a3b-vision has no co-resident headroom; restore
+# config/llama-swap.yaml.bak.20260722-prelaguna for the previous
+# nemotron+vision resident pair (= instant rollback path).
 #  - DORMANT (swap-exclusive `experiments` group): weights offloaded to codeserver
 #    and copy-back-pulled on demand (bin/copyback-launch.sh). One resident at a time.
-# NOTE: the LIVE llama-swap config is in LOCKED MODE (residents only). Restore
+# NOTE: the LIVE llama-swap config is in LOCKED MODE (laguna only). Restore
 # config/llama-swap.full.bak to make the dormant routes below loadable again.
 # Dormant contexts are tuned c=1/2/3 @ 131k EXCEPT int4-dflash (120k/c=1, DFlash
 # drafter lane) and ds4 (131k planner, decode-bound).
@@ -38,13 +42,26 @@ gateway:
   request_timeout_min_s: 1200
 
 deployed:
-  # Two tiers: nemotron-3-puzzle-75b + qwen3.6-35b-a3b-vision are the persistent
-  # RESIDENT pair; the rest are the swap-exclusive `experiments` pool (one loaded
-  # at a time, weights copy-back from codeserver). config = what the launcher
-  # actually serves; verified no-OOM.
+  # Single resident: laguna-s-2.1 (exclusive). Everything else is the
+  # swap-exclusive `experiments` pool (one loaded at a time, weights copy-back
+  # from codeserver) or parked. config = what the launcher actually serves;
+  # verified no-OOM.
+
+  - name: laguna-s-2.1
+    role: coding DEFAULT (qwen3.6-27b / qwen3.6-35b-a3b / nemotron-3-puzzle-75b names resolve here at the gateway) — set 2026-07-22
+    method: poolside/Laguna-S-2.1-NVFP4 (117.6B MoE, 8.5B active, 36/48 SWA-512 layers) + DFlash drafter poolside/Laguna-S-2.1-DFlash-NVFP4 n=15
+    image: vllm/vllm-openai:v0.25.1-aarch64-ubuntu2404   # upstream has native Laguna + dflash method (PR #46853); AEON image not needed
+    aliases: [qwen3.6-27b, qwen3.6-35b-a3b, nemotron-3-puzzle-75b]   # mapped at GATEWAY, not llama-swap
+    port_internal: 9030
+    added: 2026-07-22
+    context_window: 262144   # native 256k, no RoPE scaling; KV pool 858,606 tok = 3.28x concurrency at full 256k (fp8 KV + SWA)
+    config: max-model-len=262144 max-num-seqs=4 gpu-mem-util=0.85 kv=fp8 spec=dflash:n15 tool-call-parser=poolside_v1 reasoning-parser=poolside_v1 enable_thinking=true
+    sampling_defaults: temperature=0.7 top_p=0.95   # poolside recommendation, set in gateway litellm_params
+    measured_single_stream_tok_s: 33   # @100k realistic code ctx (26-37 range, fresh-engine variance); 17-18 @13k (drafter wash there); agg peaks c=2 (41.5 @60k); c=4 per-req drops to 9.4 — sweet spot c<=2
+    note: thinking model (interleaved reasoning between tool calls) — reasoning_content split by poolside_v1 parser, streams incrementally (no TTFT buffering); give generous max_tokens or thinking eats the budget. SWE-bench Multilingual 78.5 / Terminal-Bench 2.1 70.2 per poolside card — quality under real-traffic validation now.
 
   - name: nemotron-3-puzzle-75b
-    role: coding DEFAULT under test (qwen3.6-27b / qwen3.6-35b-a3b aliases resolve here) — set 2026-07-08
+    role: ROLLBACK (was coding default 2026-07-08 → 2026-07-22; restore llama-swap.yaml.bak.20260722-prelaguna to reactivate with vision pair)
     method: nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4 (hybrid Mamba+MoE+Attn, 9.3B active) + MTP n=4 + CUDA graphs
     image: ghcr.io/aeon-7/aeon-vllm-ultimate:latest   # vLLM 0.23.0+aeon.sm121a.dflash — MTP+graphs work on sm_121 (Mamba #37431 eager-tax NOT binding here)
     aliases: [qwen3.6-27b, qwen3.6-35b-a3b]
@@ -74,7 +91,7 @@ deployed:
     measured_single_stream_tok_s: 56   # c=1 short input; 101 agg at c=2
 
   - name: qwen3.6-35b-a3b-vision
-    role: eval — VISION lane for the 35B MoE (the -nvfp4 lane is text-only); also fastest 35B c=1 measured
+    role: DARK since 2026-07-22 (no headroom beside laguna) — was resident VISION lane; also fastest 35B c=1 measured
     method: unsloth/Qwen3.6-35B-A3B-GGUF UD-Q4_K_XL (dynamic 4-bit, 22.4 GB) + mmproj-F16 vision encoder
     image: native (~/llama.cpp/build/bin/llama-server, mainline CUDA sm_121 — same binary as ornith)
     port_internal: 9026
@@ -175,23 +192,37 @@ deployed:
 # transparently forwards to llama-swap and captures req+resp+meta per call.
 # Reverting any api_base to :8080 silently drops observability.
 model_list:
-  - model_name: nemotron-3-puzzle-75b   # NEW DEFAULT under test 2026-07-08 (also holds the qwen3.6-27b / -35b-a3b aliases)
+  - model_name: laguna-s-2.1            # PROD coding default 2026-07-22 (also holds qwen3.6-27b / -35b-a3b / nemotron-3-puzzle-75b names)
     litellm_params:
-      model: openai/nemotron-3-puzzle-75b
+      model: openai/laguna-s-2.1
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      temperature: 0.7                  # poolside recommended defaults; client-specified values override
+      top_p: 0.95
 
-  - model_name: qwen3.6-27b           # DEFAULT → nemotron-3-puzzle-75b 2026-07-08 (mapped at GATEWAY: llama-swap v201 -watch-config drops aliases, so forward the real name — see memory feedback_llama_swap_alias_reload)
+  - model_name: nemotron-3-puzzle-75b   # DEFAULT → laguna-s-2.1 2026-07-22 (engine parked; gateway-level map keeps old clients working)
     litellm_params:
-      model: openai/nemotron-3-puzzle-75b
+      model: openai/laguna-s-2.1
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      temperature: 0.7
+      top_p: 0.95
 
-  - model_name: qwen3.6-35b-a3b       # DEFAULT → nemotron-3-puzzle-75b 2026-07-08 (gateway-level map, same reason)
+  - model_name: qwen3.6-27b           # DEFAULT → laguna-s-2.1 2026-07-22 (mapped at GATEWAY: llama-swap v201 -watch-config drops aliases, so forward the real name — see memory feedback_llama_swap_alias_reload)
     litellm_params:
-      model: openai/nemotron-3-puzzle-75b
+      model: openai/laguna-s-2.1
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      temperature: 0.7
+      top_p: 0.95
+
+  - model_name: qwen3.6-35b-a3b       # DEFAULT → laguna-s-2.1 2026-07-22 (gateway-level map, same reason)
+    litellm_params:
+      model: openai/laguna-s-2.1
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+      temperature: 0.7
+      top_p: 0.95
 
   - model_name: qwen3.6-27b-int4-dflash
     litellm_params:
@@ -205,7 +236,7 @@ model_list:
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
 
-  - model_name: qwen3.6-35b-a3b-vision  # eval 2026-07-07 (unsloth GGUF Q4_K_XL + mmproj — 35B MoE with images, llama.cpp)
+  - model_name: qwen3.6-35b-a3b-vision  # DARK 2026-07-22 (engine parked, no headroom beside laguna — requests will fail; kept for when topology changes)
     litellm_params:
       model: openai/qwen3.6-35b-a3b-vision
       api_base: http://192.168.1.12:8079/v1

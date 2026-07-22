@@ -4,6 +4,7 @@
 import concurrent.futures
 import http.client
 import json
+import os
 import statistics
 import sys
 import threading
@@ -13,8 +14,8 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
-GATEWAY_HOST = "192.168.1.12"
-GATEWAY_PORT = 8080
+GATEWAY_HOST = os.environ.get("BENCH_GATEWAY_HOST", "192.168.1.12")
+GATEWAY_PORT = int(os.environ.get("BENCH_GATEWAY_PORT", "8080"))
 GATEWAY = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}"
 
 MODELS = [
