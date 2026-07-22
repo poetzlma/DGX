@@ -20,9 +20,23 @@
 #   LAG_UTIL     -> --gpu-memory-utilization (default 0.85)
 #   LAG_SEQS     -> --max-num-seqs (default 8; need >=4 for the concurrency bench)
 #   LAG_IMAGE    -> container image (default upstream v0.25.1 aarch64)
+#   LAG_MOE      -> --moe-backend override. LEAVE UNSET on GB10: A/B'd 2026-07-22,
+#                   flashinfer_cutlass (auto) is the ONLY NVFP4 MoE backend that
+#                   starts on sm_121 — triton is "not supported for NvFP4 MoE",
+#                   flashinfer_trtllm/cutedsl have no sm_121 kernels (all three
+#                   hard-error at startup -> llama-swap crash-loops prod). Knob
+#                   kept for future images/backends only.
 #   LAG_SPEC_N   -> num_speculative_tokens when LAG_SPEC=1 (default 15; measured
 #                   2026-07-22: n=15 beats n=7 at 100k ctx (33.3 vs 25.9 tok/s)
 #                   with no TTFT penalty vs baseline)
+#
+# GENERATION CONFIG (2026-07-22): model's generation_config.json now APPLIES
+# (keeps poolside's eval-certified top_k=20 — the old `--generation-config vllm`
+# flag discarded it). The max_new_tokens override sets the DEFAULT output budget
+# when a client omits max_tokens: THINKING NEEDS HEADROOM or it eats the whole
+# budget and content comes back null. Explicit client max_tokens still wins.
+# Upstream ships no max_new_tokens cap (verified both poolside repos) — the
+# override is insurance against one appearing in a future snapshot.
 set -e
 
 SPEC_ARGS=()
@@ -36,6 +50,7 @@ exec docker run --name vllm-laguna-s21 \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -p 0.0.0.0:9030:9030 \
   -v /home/max/.cache/huggingface:/root/.cache/huggingface \
+  -v /home/max/.cache/vllm-laguna:/root/.cache/vllm \
   -v /home/max/llm-stack/etc:/llm-stack-etc:ro \
   -e HF_TOKEN_FILE=/root/.cache/huggingface/token \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
@@ -55,6 +70,7 @@ exec docker run --name vllm-laguna-s21 \
   --host 0.0.0.0 --port 9030 \
   --quantization compressed-tensors \
   --kv-cache-dtype fp8 \
+  ${LAG_MOE:+--moe-backend ${LAG_MOE}} \
   --trust-remote-code \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization ${LAG_UTIL:-0.85} \
@@ -67,5 +83,5 @@ exec docker run --name vllm-laguna-s21 \
   --enable-auto-tool-choice \
   --reasoning-parser poolside_v1 \
   --default-chat-template-kwargs '{"enable_thinking": true}' \
-  --generation-config vllm \
+  --override-generation-config '{"max_new_tokens": 131072}' \
   "${SPEC_ARGS[@]}"
