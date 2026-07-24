@@ -1,17 +1,28 @@
-# LOCKED MODE: Laguna S-2.1 sole resident — PROD cutover 2026-07-22.
-# Exclusive occupancy (~92 GB at util 0.85): KV pool 858k tokens = 3.28x
-# concurrent full-256k sessions. Nothing else fits alongside; vision lane is
-# DARK while this config is live (restore llama-swap.yaml.bak.20260722-prelaguna
-# for the nemotron+vision resident pair, llama-swap.full.bak for full roster).
-# Old prod names (qwen3.6-27b, qwen3.6-35b-a3b, nemotron-3-puzzle-75b) are
-# remapped to laguna at the LiteLLM GATEWAY (llama-swap aliases don't route —
-# see memory feedback_llama_swap_alias_reload).
+# SOLO MODE (again): Laguna S-2.1 sole resident — restored 2026-07-24 evening.
+# Config: seqs=4 + DFlash n=15 + util 0.85 + ctx 262144 = the proven 2026-07-22
+# prod cutover values (KV pool ~855k tokens, 3.28x full-256k sessions).
+#
+# Today's seqs-8 saga (DGX issue #2), permanent conclusions:
+#   - max-num-seqs 8 + DFlash DEADLOCKS the engine under real traffic (2x).
+#   - seqs 8 drafterless works but is 19 tok/s single-stream. Not worth it.
+#   - Qwen 35B-A3B NVFP4 fast lane (launch-vllm-35b-moe-nvfp4-colag.sh) ran
+#     at 70 tok/s but its vLLM LOAD TRANSIENT trips the host-OOM floor next
+#     to resident laguna (MemAvailable hit 1 GB; GB10 hard-hangs on OOM, no
+#     remote recovery). PARKED — entry removed so nothing can launch it by
+#     name. To revive: llama.cpp/GGUF route or sudo drop_caches pre-launch,
+#     AND re-shrink laguna to util 0.66 / ctx 131072 first (memory
+#     project-coresident-split-20260724 has the measured math).
+#
+# Old prod names (qwen3.6-27b, qwen3.6-35b-a3b, nemotron-3-puzzle-75b) remain
+# remapped to laguna at the LiteLLM GATEWAY (llama-swap aliases don't route).
+# Backups: llama-swap.yaml.bak.20260724-presplit (this morning's seqs-8 state),
+# llama-swap.yaml.bak.20260722-prelaguna, llama-swap.full.bak (full roster).
 
 healthCheckTimeout: 1200
 logLevel: info
 models:
   laguna-s-2.1:
-    cmd: /home/max/llm-stack/bin/launch-vllm-laguna-s21-nvfp4.sh
+    cmd: /home/max/llm-stack/bin/launch-vllm-laguna-s21-nvfp4-v2.sh
     proxy: http://127.0.0.1:9030
     checkEndpoint: /health
     ttl: 0

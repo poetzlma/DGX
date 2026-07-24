@@ -37,6 +37,11 @@
 # budget and content comes back null. Explicit client max_tokens still wins.
 # Upstream ships no max_new_tokens cap (verified both poolside repos) — the
 # override is insurance against one appearing in a future snapshot.
+#
+# REVISION PINNED (2026-07-23): b482b5d = original SpinQuant+rotate weights.
+# Upstream re-uploaded "spinquantless norot" weights (0761412) as apparent
+# looping fix; unpinned serve would silently pull them on next cold start.
+# The v2 script (launch-vllm-laguna-s21-nvfp4-v2.sh) serves the new snapshot.
 set -e
 
 SPEC_ARGS=()
@@ -66,6 +71,7 @@ exec docker run --name vllm-laguna-s21 \
   --entrypoint vllm \
   "${LAG_IMAGE:-vllm/vllm-openai:v0.25.1-aarch64-ubuntu2404}" \
   serve poolside/Laguna-S-2.1-NVFP4 \
+  --revision b482b5d57fda6e4e562a652869bde24ba2a57c92 \
   --served-model-name laguna-s-2.1 \
   --host 0.0.0.0 --port 9030 \
   --quantization compressed-tensors \
