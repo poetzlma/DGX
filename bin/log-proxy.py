@@ -118,7 +118,14 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                     if log_f:
                         log_f.write(chunk)
                     # First-content detection: scan SSE deltas until a
-                    # content / reasoning_content / tool_calls field appears.
+                    # content / reasoning / reasoning_content / tool_calls
+                    # field appears.
+                    # 2026-07-30: laguna (--reasoning-parser poolside_v1) names
+                    # the thinking delta "reasoning", not "reasoning_content".
+                    # Matching only the latter skipped the ENTIRE think block,
+                    # so ttft_s started at the first *content* token — often
+                    # thousands of tokens late — and reasoning_chars stayed 0.
+                    # Accept both spellings.
                     if t_first_token is None and is_chat:
                         for line in chunk.split(b"\n"):
                             if not line.startswith(b"data: "):
@@ -133,6 +140,7 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                             for choice in obj.get("choices") or []:
                                 d = choice.get("delta") or {}
                                 if (d.get("content") or
+                                        d.get("reasoning") or
                                         d.get("reasoning_content") or
                                         d.get("tool_calls")):
                                     t_first_token = now
@@ -250,7 +258,9 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                         meta["finish_reason"] = ch.get("finish_reason")
                         msg = ch.get("message", {})
                         cstr = msg.get("content") or ""
-                        rstr = msg.get("reasoning_content") or ""
+                        # "reasoning" is laguna/poolside_v1's spelling; keep the
+                        # older "reasoning_content" as fallback (see ttft note).
+                        rstr = msg.get("reasoning") or msg.get("reasoning_content") or ""
                         meta["completion_chars"] = len(cstr)
                         meta["reasoning_chars"] = len(rstr)
                         meta["has_close_think"] = "</think>" in cstr
@@ -314,8 +324,11 @@ async def proxy(request: web.Request) -> web.StreamResponse:
                                 d = choice.get("delta") or {}
                                 if d.get("content"):
                                     content_chars += len(d["content"])
-                                if d.get("reasoning_content"):
-                                    reasoning_chars += len(d["reasoning_content"])
+                                # laguna streams "reasoning"; older engines used
+                                # "reasoning_content". Count whichever appears.
+                                _r = d.get("reasoning") or d.get("reasoning_content")
+                                if _r:
+                                    reasoning_chars += len(_r)
                                 for tc in d.get("tool_calls") or []:
                                     idx = tc.get("index", 0)
                                     slot = tool_buf.setdefault(idx, {

@@ -22,6 +22,27 @@ healthCheckTimeout: 1200
 logLevel: info
 models:
   laguna-s-2.1:
+    # vLLM 0.26.0 TRIAL 2026-07-30 — RUN, MEASURED, REVERTED. Stay on 0.25.1.
+    # Thesis was prefill: decode is already healthy (accept_len 4.31, above
+    # poolside's ~3.1 reference) while 100k prefill eats half the wall clock
+    # (64s TTFT, ~1560 tok/s), so 0.26.0's MoE kernel work (fused_topk_bias
+    # 1.5-2x) was the target. It did NOT land:
+    #   TTFT 13k 5587->6753ms, 60k 30762->30935, 100k 64034->64577  (no gain)
+    #   accept_len 4.31 -> 3.70
+    #   KV pool 821,116 -> 810,622 tokens (both MEASURED today; the "~855k" in
+    #     the header comment above predates this and is stale — the version
+    #     difference here is only 1.3%, i.e. NOT a real cost of 0.26.0)
+    #   cudagraph_mode forced FULL_AND_PIECEWISE -> PIECEWISE (spec-decode +
+    #     FlashInferBackend only supports UNIFORM_SINGLE_TOKEN_DECODE)
+    # Then LAG_SPEC_KV=auto (#48787, drafter KV off the global fp8) — the only
+    # lever that exists solely on 0.26.0 — was CATASTROPHIC: 6 accepted tokens
+    # out of 51,030 drafted (0.01%, accept_len 1.002 vs 4.31). DFlash needs its
+    # KV dtype to MATCH the target's fp8; give the drafter bf16 and every draft
+    # is rejected, leaving spec-decode as pure overhead. It also cost 22.7% of
+    # the KV pool (810k -> 626k) because the drafter cache stops being half-size.
+    # DO NOT set LAG_SPEC_KV. DO NOT re-run this trial without a new upstream
+    # reason. sm_121 itself was fine (FlashInfer resolved arch=sm121, ~10 min
+    # cold start), so the image is usable — it just is not better.
     cmd: /home/max/llm-stack/bin/launch-vllm-laguna-s21-nvfp4-v2.sh
     proxy: http://127.0.0.1:9030
     checkEndpoint: /health

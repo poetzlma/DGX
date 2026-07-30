@@ -31,12 +31,15 @@
 #   LAG_IMAGE    -> container image (default upstream v0.25.1 aarch64)
 #   LAG_MOE      -> --moe-backend override; LEAVE UNSET on GB10 (see v1 header)
 #   LAG_SPEC_N   -> num_speculative_tokens (default 15)
-#                   PENDING A/B (2026-07-24): try 7. NVIDIA-forum user measured
-#                   draft positions 6-15 at ~0% acceptance on natural text and
-#                   the MiaAI-Lab stack pins n=7. Expectation: small delta on
-#                   GB10 (bandwidth-bound verify makes tail positions ~free,
-#                   and acceptance is higher on our code-heavy traffic) — but
-#                   never measured here. Costs one ~12-min bounce to test.
+#                   A/B RESOLVED 2026-07-30: KEEP 15. The NVIDIA-forum claim
+#                   that draft positions 6-15 accept ~0% does NOT hold on our
+#                   traffic — measured per-position acceptance at 100k decays
+#                   smoothly 76.9% (pos 0) -> 2.5% (pos 14), and positions
+#                   7-14 supply 17.3% of ALL accepted tokens. Tail positions
+#                   only collapse to exactly 0.0 at 13k (start-of-session);
+#                   the 60-100k bell curve is where n=15 earns its keep, and
+#                   the 07-22 n=7 A/B already lost there (25.9 vs 33.3 tok/s).
+#                   MiaAI-Lab pins n=7 — that is their config, not a fix.
 #   LAG_THINK    -> NEW: 0 drops --default-chat-template-kwargs enable_thinking
 set -e
 
@@ -63,9 +66,58 @@ set -e
 #   qwen lane takes 0.25 (~30 GB); sum ~109 GB, ~10 GB host headroom.
 # GB10 hard-hangs on host OOM: do not raise either util unilaterally, and
 # 256k ctx (LAG_CTX=262144) is SOLO-MODE ONLY (needs KV >= 9.6 GB + margin).
+# DRAFTER REVISION IS PINNED (2026-07-30). It was NOT before, and that bit us
+# silently: the target carries --revision but speculative_config named the
+# drafter with no revision, so it resolved `main` on every start. poolside
+# pushed drafter 4cdcc6e "Spinquant removal adaptation (#6)" on 2026-07-27 and
+# the 07-28 11:44 UTC bounce swallowed it with no config change and no record
+# (engine log: 73s re-download of the DFlash weights).
+#
+# That commit's ONLY substantive change is rope_theta 10000.0 -> 500000.0,
+# matching the target (configuration_laguna.py defaults rope_theta=500000.0).
+# So the drafter shipped a 50x-wrong RoPE base from initial release 07-21 until
+# 07-27 — its positional encoding never matched the model it drafted for.
+# MEASURED IMPACT (2026-07-30, bench-coding-realistic vs the 07-22 runs):
+# smaller than the bug sounds. accept_len 13k 2.50->2.40, 60k 3.26->4.54,
+# 100k 4.60->4.50; decode 100k 33.1->32.5 t/s. The 60k gain is inside the
+# noise envelope of a single-fire bucket (5-8 samples; mean 23.6% vs median
+# 30.0% acceptance). Verdict: keep the fixed drafter because the config is now
+# internally consistent, but do NOT credit it with a throughput win.
+# Bounded by design: the drafter is 6x sliding_attention/512, so it never
+# attends past 512 tokens and the rope error was bounded by that window —
+# which is why the damage was roughly context-independent, not long-ctx-only.
+# LAG_DRAFT_REV overrides the pin (use to A/B a new upstream drafter).
+DRAFT_REV="${LAG_DRAFT_REV:-4cdcc6e9b29105e8ff5790885cadccbeb4f33f54}"
+
+# LAG_SPEC_KV: drafter KV dtype, vLLM >= 0.26.0 ONLY (PR #48787). Unset = the
+# field is omitted, which defaults to None = INHERIT the target's --kv-cache-dtype
+# (fp8 here) — i.e. exactly the pre-0.26.0 behaviour, so leaving it unset keeps
+# an image swap a single variable. The BF16 drafter having its KV forced to fp8
+# is the last untested acceptance lever; "auto" gives it bf16 KV instead.
+# Costs KV pool: the drafter's cache stops being half-size. Valid values incl.
+# auto|bfloat16|float16|fp8|fp8_e4m3. On vLLM 0.25.1 this key is REJECTED, so
+# it must stay unset whenever LAG_IMAGE points back at v0.25.1.
+# MEASURED 2026-07-30 — LAG_SPEC_KV=auto IS CATASTROPHIC. DO NOT SET IT.
+# On vLLM 0.26.0 the drafter got bf16 KV while the target stayed fp8, and
+# acceptance collapsed to 6 accepted tokens out of 51,030 drafted (0.01%,
+# accept_len 1.002 vs 4.31 normal). DFlash needs its KV dtype to MATCH the
+# target's; mismatch => every draft rejected and spec-decode becomes pure
+# overhead (the bench blew past a 10-min timeout it normally clears in ~4).
+# It also cost 22.7% of the KV pool (810k -> 626k) since the drafter cache
+# stops being half-size. Not documented in PR #48787 or the vLLM recipe.
+# Knob is kept ONLY so a future fp8-capable drafter can be A/B'd explicitly.
+#
+# KV-POOL CAVEAT for anyone comparing versions by pool size: the pool varies
+# run-to-run on IDENTICAL config — measured 821,116 and 858,126 tokens on two
+# consecutive v0.25.1 starts. v0.26.0's 810,622 is just below that spread, so
+# pool size does NOT discriminate between the versions. Use accept_len/TTFT.
+SPEC_KV_FIELD=""
+if [ -n "${LAG_SPEC_KV:-}" ]; then
+  SPEC_KV_FIELD=",\"kv_cache_dtype\":\"${LAG_SPEC_KV}\""
+fi
 SPEC_ARGS=()
 if [ "${LAG_SPEC:-1}" = "1" ]; then
-  SPEC_ARGS=(--speculative-config "{\"method\":\"dflash\",\"model\":\"poolside/Laguna-S-2.1-DFlash-NVFP4\",\"num_speculative_tokens\":${LAG_SPEC_N:-15}}")
+  SPEC_ARGS=(--speculative-config "{\"method\":\"dflash\",\"model\":\"poolside/Laguna-S-2.1-DFlash-NVFP4\",\"revision\":\"${DRAFT_REV}\",\"num_speculative_tokens\":${LAG_SPEC_N:-15}${SPEC_KV_FIELD}}")
 fi
 
 THINK_ARGS=()
