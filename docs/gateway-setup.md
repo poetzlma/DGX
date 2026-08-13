@@ -9,11 +9,14 @@ operating the stack rather than calling it, see
 ## Connection
 
 ```
-Base URL   https://<gateway-host>/v1
+Base URL   https://<gateway-host>/v1          — host supplied with your key
 API        OpenAI-compatible (chat completions, streaming, tool calls)
 Auth       Authorization: Bearer <your key>   — issued per client by the operator
 Model      deepseek-v4-flash-0731
 ```
+
+`<gateway-host>` is not published here; you receive it together with your key.
+Everything below is independent of it.
 
 That model id is the one to put in new configs. Several older ids
 (`deepseek-v4-flash-ds4`, `laguna-s-2.1`, `nemotron-3-puzzle-75b`,
@@ -26,7 +29,10 @@ a reasoning model with a 131 072-token context window. Text only — there is no
 working image/vision route at present.
 
 ```sh
-curl https://<gateway-host>/v1/chat/completions \
+GATEWAY=https://<gateway-host>   # as supplied with your key
+KEY=<your key>
+
+curl "$GATEWAY/v1/chat/completions" \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d '{
     "model": "deepseek-v4-flash-0731",
     "messages": [{"role": "user", "content": "hi"}],

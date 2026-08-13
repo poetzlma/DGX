@@ -27,5 +27,10 @@ __pycache__/
 # Agent operational memory — not for public repo (commercial notes, topology, gateway domain)
 memory/
 
+# The gateway hostname is deliberately absent from this repo — docs use the
+# <gateway-host> placeholder and it is supplied to clients with their key.
+# History was rewritten on 2026-08-13 to remove three occurrences that had
+# leaked in; keep it out of new commits.
+
 # Local quantized model weights (18 GB+) — never commit
 models/
