@@ -1,6 +1,59 @@
 # DeepSeek-V4-Flash on DGX Spark (GB10) — Deployment Notes
 
-Last updated: 2026-04-29
+Last updated: 2026-08-13
+
+> **Status: V4-Flash is the production coding default** (since 2026-08-01), on the
+> **Entrpi/ds4 fork v0.5.6.2** at `ctx 131072`. Everything from "Historical" down
+> is the 2026-04 llama.cpp-fork era, preserved because its bandwidth analysis is
+> still the reason this lane behaves the way it does. Read
+> [Engine lineage](#engine-lineage-2026-05--2026-08) first — the 2026-04 numbers
+> (3 GEN tok/s, 64 k cap, "parked specialty model") were all superseded.
+
+## Engine lineage (2026-05 → 2026-08)
+
+The model never changed shape; the *engine* did, five times. Every number below is
+measured on this box, same GGUF family, coding-shaped prompts.
+
+| When | Engine | Prefill | Decode | Why it changed |
+|---|---|---:|---:|---|
+| 2026-04-29 | `phuongncn` llama.cpp fork | ~32 t/s | ~3 t/s | bandwidth wall, 64 k cap, parked specialty lane |
+| 2026-05-12 | antirez/ds4 (from-scratch C/CUDA) | ~96 t/s | ~13 t/s | purpose-built engine + persistent disk-KV; 131 k ctx |
+| 2026-05-18 | ngc-shj/ds4 fork (Q4 dp4a) | 396 t/s | 20.8 t/s | opt-in Q4 decode path; cost `--mtp` (Q4 gates on `n_tok == 1`) |
+| 2026-08-06 | antirez mainline `b030961` | **857 t/s** | 14.2 t/s | aligned-artifact repack kills the i-quant dequant wall (§39) |
+| 2026-08-10 | **Entrpi/ds4 v0.5.6.2** | (32.7 s TTFT @34.6 k) | **19.6 t/s** | best decode without speculation; current prod (§40) |
+
+Weights moved once in that span: the V4-Flash **preview** quant → the official
+**0731** release (2026-08-01), same recipe, imatrix recalibrated on 0731. Parity on
+speed, smoke 9/10, and it is what production serves today.
+
+**The load-bearing constraints, all still true:**
+
+- **The quant recipe is hard-pinned by the engine.** `ds4.c` accepts only
+  IQ2_XXS / Q2_K / Q4_K experts + Q8_0 shared-expert + F16 router. No unsloth
+  `UD-*` quant can ever load on ds4 — those must go to mainline llama.cpp, which
+  has had `deepseek4` support since 2026-06-29 (the old `~/llama.cpp-gx10-dsv4`
+  fork runs DSV4 ops CPU-only, ~10× slower). Measured there: UD-IQ3_XXS at
+  473 t/s prefill / 16.2 t/s decode @2 k.
+- **Prefill-bound, not decode-bound.** Traffic is ~100 k:4 k, so an engine that
+  trades 18 % decode for 2.33× prefill wins whenever `prompt/output > ~8.4`.
+- **The disk-KV prefix cache is load-bearing** (~6.3× TTFT on a warm prefix).
+  Each engine gets its own `--kv-disk-dir`; cross-engine format compatibility is
+  unverified.
+- **No concurrency.** c=4 aggregate is 0.92× of c=1, fully serialized
+  (`tok_per_step` 1.000). Upstream calls it planner-only for this reason.
+- **Context is capped at 131072 by an outage, not by the model.** 262144 grew
+  demand-mapped KV slabs until the memory floor refused every deep request — 33
+  refusals, zero completions, ~35 min, all health checks green (§41).
+- **Benchmark hygiene specific to this lane:** the disk-KV replay poisons prefill
+  benches (use a unique token-0 prefix per run), and GB10 decode is dominated
+  ~44× by allocator state (idle 2–3 min between runs, 3-run medians).
+
+Full reasoning for each step: [decisions §30, §36–§41](decisions.md#36-ds4-is-the-coding-default-laguna-pulled-2026-08-01).
+
+## Historical: the 2026-04 llama.cpp-fork era
+
+*Everything below is from 2026-04-29 and is kept for the bandwidth analysis and
+the NVFP4 watchlist. The deployment described here no longer exists.*
 
 ## TL;DR
 

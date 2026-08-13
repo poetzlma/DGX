@@ -258,3 +258,93 @@ An upstream-update sweep produced one config fix, two measured rejections, and a
 4. **`repetition_penalty=1.15` rejected as a looping mitigation.** HF #16 (runaway reasoning, upstream-open, reproduces with DFlash off) reports it as the strongest mitigation; A/B'd here with thinking on (`bin/ab-laguna-reppen.py`, 3 repro prompt classes × 2 penalties × 2 reps): rp=1.15 drove 5/6 runs into the length cap, produced the only genuine 12-gram loop of the day, and cost 32 % throughput. rp=1.0: 0/6 runaway, 0/6 looped. Community mitigations don't transfer — measure before adopting.
 5. **Instrumentation: laguna emits `reasoning`, not `reasoning_content`.** The poolside_v1 parser names the thinking field `reasoning` in both the final message and streaming deltas. `log-proxy` matched only `reasoning_content`, so `ttft_s` started at the first *content* token — thousands of tokens late on every thinking response — and `reasoning_chars` was always 0. Fixed (both spellings accepted); **`ttft_s`/`reasoning_chars` in proxy logs before 2026-07-30 are unusable for laguna.** Corollary: a `reasoning_chars=0` row is now meaningful — laguna genuinely skips thinking on some requests.
 6. **Bench-noise honesty:** single-fire buckets carry real variance — a "+43 % at 60 k" from the rope-fixed drafter evaporated on the next run, and the KV pool varies run-to-run on identical config (821,116 vs 858,126 tokens on consecutive v0.25.1 starts), so pool size does not discriminate between versions. Decision-grade comparisons need 3-run medians (same rule as the GB10 allocator confounder, §30).
+
+### 36. ds4 is the coding default; laguna pulled *(2026-08-01)*
+
+`deepseek-v4-flash-0731` replaced `laguna-s-2.1` as the **resident coding default** — user's call after judging laguna unacceptable in real use. The failure that ended it is not one the throughput benches could see: laguna **plans forever without committing to an action** (~2000 plans generated for a single task, never acting; the HF Laguna-S-2.1 "runaway reasoning" issue #16 that §35 already documents as upstream-open and drafter-independent). `bin/probe-commits-to-action.py` was written that day to make that behavior measurable rather than anecdotal.
+
+Not a co-residency split: laguna needs ~113 GB of the 121 GB unified pool and ds4 needs ~86 GB, so this is a **straight replacement**. Same day, the lane was promoted to the **official DeepSeek-V4-Flash-0731 weights** (antirez re-quant, imatrix recalibrated on 0731 — 202,100 chunks vs 90,042 for the preview) after verifying they load unmodified on the pinned binary: smoke 9/10, prefill/decode at parity with the preview (404 t/s @2 k, 19–20 t/s), disk-KV prefix hit worth **6.3× TTFT**. The `sm_121` rebuild of the binary was measured **worse** (−3…−6 % prefill, −2…−4 % decode) — it ships sm_75 cubins and runs via driver JIT, which is correct here.
+
+**What the swap costs, measured on this box** (`logs/ds4-0731-window-*`):
+
+| | laguna + DFlash | ds4 0731 |
+|---|---:|---:|
+| decode @100 k | 33 tok/s | 14.3 tok/s |
+| decode @2 k | ~45 tok/s | 19.4 tok/s |
+| TTFT @100 k | ~64 s | 370 s cold / ~60 s warm prefix |
+| concurrency | 3.28× KV pool at 256 k | **none** — prefills serialize |
+| max ctx | 262 144 | 131 072 |
+
+The concurrency line is the operational risk for resale traffic: ds4 is single-stream **by design** (upstream calls it planner-only for that reason) — measured c=4 aggregate is **0.92× of c=1**, fully serialized, `tok_per_step` 1.000. In exchange: no runaway-planning failure mode, a 304 B model instead of 118 B-A8.5 B, and a disk-KV prefix cache that survives restarts (load-bearing at ~100 k:4 k traffic).
+
+Mechanics of the cutover: all six ds4-backed route names (`laguna-s-2.1`, `qwen3.6-27b`, `qwen3.6-35b-a3b`, `nemotron-3-puzzle-75b`, `deepseek-v4-flash-ds4`, and the real key `deepseek-v4-flash-0731`) resolve to the one engine **at the LiteLLM gateway** — clients kept working unchanged. The keepalive cron switched `laguna-keepalive.sh` → `bin/ds4-keepalive.sh`. **Rollback is no longer one command:** `config/llama-swap.yaml.bak.20260801-prelaguna-swap` restores the config, but the laguna target weights were **deleted 2026-08-02** to reclaim disk (the 4.2 GB DFlash drafter is still cached), so a rollback re-downloads 67 GiB — budget ~1 h, not 10 min. `nemotron-3-puzzle-75b` (the §33 rollback) and the Hy3 295 B eval weights were deleted in the same pass.
+
+### 37. ds4 quant eval; the upstream host-registration OOM hard-hang *(2026-08-02)*
+
+Two higher-bpw candidates were evaluated against the IQ2_XXS production quant, and the box was hard-hung once in the process.
+
+1. **The ds4 engine's quant layout is hard-pinned, not a preference.** `ds4.c` accepts only IQ2_XXS / Q2_K / Q4_K experts + Q8_0 shared-expert + F16 router. **No unsloth `UD-*` quant can ever load on it** (bf16 router, q6_k shexp, iq3_xxs/iq2_xs experts are all rejected). So unsloth's `UD-IQ3_XXS` (104 GB, 3.06 bpw) had to be evaluated on **llama.cpp** instead — and mainline llama.cpp has had `deepseek4` support since 2026-06-29, which makes the old `~/llama.cpp-gx10-dsv4` fork obsolete for this: the fork runs DSV4 ops **CPU-only**, ~10× slower. On mainline it measured **473 t/s prefill / 16.2 t/s decode @2 k** — beats the then-prod prefill at +1 bpw, costs ~20 % decode. Not promoted (it cannot serve the ds4 lane at all), but it is the reference point that made §39's mainline cutover look worth trying.
+2. **Upstream antirez/ds4 `54b36ed` OOM'd the machine.** Its no-copy host registration of the 80 GiB model mmap **fails on this box**, and the fallback is a *device-side copy* — doubling real footprint against a *planned* 93.92 GiB. Result: host OOM, hard hang, **power cycle** (GB10 has no remote recovery from host OOM). `bin/launch-ds4-upstream-q4k.sh` is now guarded behind `ALLOW_OOM_RISK=1`.
+
+The eval machinery from that day is kept because it is what made the window safe: **`bin/park-prod-ds4.sh` / `restore-prod-ds4.sh`** (points the live model's `cmd:` at `bin/eval-window-blocked.sh` *and* clears the `on_startup` preload, so neither a stray request nor a llama-swap reload can spawn a second ~90 GB engine — this is what let the box come back cleanly from the power cycle), **`bin/mem-watchdog.sh`** (SIGKILLs a runaway engine before it hangs the host — contrast the *reload*-based §41 watchdog), and **`bin/pardl.py`** (HF CDN gives ~9–16 MB/s single-stream from here; 4 parallel ranges gets ~33 MB/s, and egress is a hard ~32 MB/s ceiling, so quant downloads are serialized, never concurrent).
+
+### 38. Gateway pricing for the ds4 lane; the silent zero-spend window *(2026-08-03)*
+
+ds4 is priced at **$0.10 / 1M input, $0.40 / 1M output** — cost recovery (roughly power + Spark amortization; DeepSeek's own flash tier is ~3× that). Everything else stays at $1.00 / $5.00.
+
+Two things worth keeping:
+
+- **Price every alias, not just the real key.** All six ds4-backed `model_name` entries carry the same rate. Pricing only `deepseek-v4-flash-ds4` would have reported **$0**, because live clients call `deepseek-v4-flash-0731` and `laguna-s-2.1`. Corollary hazard: a price left behind on a route that now points at a *different* engine bills the wrong rate silently — re-check `deployed.yaml` pricing whenever the resident changes.
+- **Pricing had silently vanished for two months.** Every request from 2026-06-01 to 08-03 recorded `spend=0` with non-zero `prompt_tokens`; the backfill was **+$60.04**. The check that catches it: after *any* gateway change, query for rows with `spend = 0 AND prompt_tokens > 0`. Note that ds4's disk-KV cache hits are **not** discounted — the engine does not report cached-token counts in `usage`, so LiteLLM cannot see them. Traffic is ~45:1 prefill-heavy, so input cost dominates revenue.
+
+### 39. ngc-shj fork to antirez mainline: 2.33x prefill for 18% less decode *(2026-08-06)*
+
+The lane moved off the ngc-shj Q4 fork (prod since §30/2026-05-18) onto **antirez/ds4 mainline `b030961`**. Mainline's aligned-artifact repack + vendored mmq prefill tier removes the i-quant dequant wall the lane had sat behind since May. Same GGUF, same prompts, `--temp 0`:
+
+| | ngc-shj fork | mainline b030961 |
+|---|---:|---:|
+| prefill @34.6 k coding ctx | 368 t/s | **857 t/s** (2.33×) |
+| prefill shape | decayed 401 → 349 | flat ~850 from 2 k to 32 k |
+| decode @34.6 k | 17.38 t/s | 14.18 t/s (−18 %) |
+
+Net win because the lane is prefill-bound: mainline wins whenever `prompt/output > ~8.4`, and our traffic is ~25:1. **Also gained:** §37's host-registration hard-hang is structurally gone — mainline leaves the model mmap unpinned, so there is no 80 GiB registration to be declined and no device-copy fallback.
+
+Consequences that bit or nearly bit:
+
+- **Two fork-only env vars are gone.** `DS4_CUDA_Q4_DECODE` (the whole source of the fork's decode advantage) and `DS4_CUDA_Q8_F16_CACHE_RESERVE_MB` do not exist upstream. The reserve override is *unnecessary* now: mainline special-cases hosts with ≥112 GiB total and defaults to a 512 MiB reserve, so the 5 %-of-total default that forced §30's override is gone.
+- **`--warm-weights` was removed** — the lane refuses to start if you re-add it. Obsolete anyway: mainline eagerly builds ~78.7 GiB of aligned CUDA artifacts at load (~22 s).
+- **Thinking moved to `reasoning_content`** (the fork emitted it inline in `content`). log-proxy already splits that field, but on a tight `max_tokens` the whole budget can go to thinking and `content` comes back **empty** — measured: `max_tokens=300` → 0 chars, `finish=length`; `max_tokens=2000` → real code. Same class of failure as the Qwen3.6 thinking issue, same fix (bigger client budget).
+- **The only local delta is the Prometheus `/metrics` endpoint** (187 additive lines, `~/ds4-metrics-endpoint-b030961.patch`), now under a neutral **`ds4:`** namespace instead of `vllm:` — upstream would not take a vllm-branded one. `bin/stack/engine.py` aliases `ds4:` → `vllm:` so every existing consumer keeps working. Re-apply the patch after any upstream pull.
+- **Disk-KV gets its own directory per engine.** On-disk KV format compatibility across engines is unverified, so each binary points at its own `--kv-disk-dir`; the previous engine's warm cache stays intact for rollback. Cost is a cold prefix cache after each cutover.
+
+DSpark speculative decode was rejected here: **23–24 % slower** at both context lengths on coding prompts, greedy-only, +6 GB. That rejection was **overturned four days later** — see §40.
+
+### 40. Entrpi/ds4 fork is production; DSpark measured twice *(2026-08-10)*
+
+Production is the **Entrpi/ds4 fork v0.5.6.2** (`~/entrpi-src`, launcher `bin/launch-ds4-entrpi.sh`). Measured against mainline `84cc882`, same GGUF (hard-linked, one inode — the fork's copy costs no disk), server harness, decode timed first→last token so prefill is excluded:
+
+| | mainline | Entrpi v0.5.6.2 |
+|---|---:|---:|
+| decode @34.6 k coding ctx | 14.10 t/s | **19.55 t/s** (1.39×) |
+| decode short | 17.95 t/s | 20.14 t/s (1.12×) |
+| TTFT @34.6 k | 40.2 s | 32.7 s (1.23×) |
+
+Quality gate: `bin/smoke-ds4-0731.py` scored **10/10** (prod scored 9/10). The weights are the only thing that did not change — kernels, sampling and tool-call handling are all fork code. Boot is ~90 s vs mainline's ~27 s (the fork builds its aligned artifacts in-process); the installer also produced a resident `ds4_weight_server` that could cut this to seconds over IPC — not wired up, worth doing if this lane persists. **Rollback is one line** in `llama-swap.yaml` back to `bin/launch-ds4-server.sh`; that script and the mainline binary are untouched.
+
+**`--no-spec` is deliberate.** The fork's own DSpark drafter is a **net loss at long context here**: 17.90 vs 19.55 plain (−8.4 %, reproduced), while winning +9.9 % on short prompts. Our traffic is ~100 k:4 k, so long-context behavior decides it. The counters were *healthy while losing* (accept_ratio 0.64–0.68, `tok_per_step` 2.5, 0 quench events) — a break-even/scheduling issue, not a broken drafter.
+
+**§39's DSpark rejection was wrong, and was reversed the same day.** Mainline `0e89a0e` fixed an accept-replay bug; re-tested on `~/ds4-mainline-0810`, the −23 % became **+11.5 % (server) / +14.8 % (CLI)** on long coding context. The lesson is about *when* a rejection expires: a measured "slower" verdict on a moving upstream is only valid against the commit it was measured on. It changes nothing operationally — fork-plain still beats mainline-with-DSpark — but the entry it invalidated was four days old.
+
+Still unproven under real traffic on this engine: disk-KV behavior at 131 k and opencode tool-call parsing.
+
+### 41. The 256 K context outage; a memory floor that refuses instead of shrinking *(2026-08-10)*
+
+Same day as §40, `--ctx` was raised 131072 → **262144** and it took the lane **hard-down for ~35 minutes**: 33 refusals, **zero completions**, ~50 ms HTTP 503 each, straight to the customer. Reverted to 131072; **do not re-apply**.
+
+The reasoning for the bump was that KV slabs are **demand-mapped** (boot log: *"comp/index slabs demand-mapped, virtual 2238 MiB/bank, floor 97.8 MiB/bank"*), so a deep budget is virtual and backed only as contexts actually grow — "nearly free." **The virtual budget is free; the backing is not, and nothing caps its growth.** Real traffic grew the slabs until the engine's 116.9 GiB allocation left `MemAvailable` at **1.7 GiB** against `--mem-floor-gb 8`. From there every deep admission was unfundable (`ds4.c:35841`), and each rejected job bounced to the serial path where the deep-serial guard (`ds4_server.c:15708`, `DS4_SERVER_SERIAL_MAX_TOKENS`, default 65536) refused it 503 — because our coding prompts are 65–100 k tokens.
+
+Three durable lessons:
+
+1. **`--mem-floor-gb` is enforced at admission, not by shrinking.** It correctly refused to fund work — the 503s *are* the floor working. It protects the box from the §37 host-OOM hard-hang; it does **not** protect the lane from becoming unservable. Both are true. And it does not self-recover: the guard's comment assumes a transient memory dip, but once the slabs have grown `MemAvailable` never climbs back.
+2. **Every health signal was green.** Process alive, `/v1/models` answering, no OOM, no kernel event, `ds4_cont_batch_failures_total` 0, `ds4_requests_inflight` 0 — while `ds4_requests_total{outcome="completed"}` sat frozen at 58 and `{outcome="refused_deep_serial"}` climbed 12 → 33. That signature — **refusals rising while completions stay flat** — is now the trigger for **`bin/ds4-degraded-watchdog.sh`** (cron `*/2`, two curls when healthy). Its action is a **reload, not a kill**: the floor breach is latched, not fatal, and unloading releases the grown slabs (measured 20 s to recover, artifacts already built, disk-KV prefix cache survives). Low `MemAvailable` alone is deliberately *not* a trigger — it dips legitimately under healthy load, and reloading then would destroy live work. `bin/ds4-keepalive.sh` cannot cover this: it only acts when the engine is **gone**.
+3. **Do not retry deep ctx without a cap on backed slab growth** (or a floor breach that *evicts* rather than refuses). Raising ctx alone just moves the cliff — at 131072 the live margin over the 8 GiB floor is only ~1.1–1.8 GiB, thinner than the slab growth observed that day (871 pages ≈ 5.2 GiB), so recurrence is possible; **140 k is not a safe intermediate step.** Concurrency is not a reason to want it either (c=4 measured 0.92× of c=1, §36), and upstream's own data near 248 k is ~146 ms/token (~7 t/s). Upstream ships `-c 262144` as the `ds4-serve` default and documents 524288 as deepest tested — neither on a 119 GiB box holding a 116 GiB resident.

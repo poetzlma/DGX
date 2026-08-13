@@ -7,6 +7,14 @@ collapses on noise — [decisions §33](decisions.md#33-laguna-s-21-is-the-codin
 are dominated ~44× by allocator state — idle 2–3 min between runs and use
 3-run medians or the numbers are noise.
 
+Three more, learned the hard way on the ds4 lane: **the disk-KV cache replays
+prefixes**, so a prefill bench repeats itself into fiction unless every run gets a
+unique token-0 prefix; **speed is the easy half** — an engine swap can be faster
+and *wrong*, so `bin/smoke-ds4-0731.py` gates every cutover (code-exec, exact
+arithmetic, needle, tool-calls); and **a rejection expires with the commit it was
+measured on** — DSpark measured −23 % on one mainline commit and +11.5 % on
+another four days later ([§40](decisions.md#40-entrpids4-fork-is-production-dspark-measured-twice-2026-08-10)).
+
 ## Bench tooling
 
 | Script | Purpose | Usage |
@@ -19,6 +27,10 @@ are dominated ~44× by allocator state — idle 2–3 min between runs and use
 | `bin/bench-models.py` | Quick cold/warm + tok/s sweep across all models | `python3 bin/bench-models.py` |
 | `bin/bench-concurrency-sweep.py` | Ad-hoc concurrency sweep on a warm model | inline |
 | `bin/bench-context-sweep.py` | Context-length sweep (TTFT, prefill, decode by ctx) | inline |
+| `bin/bench-ds4-0731.py` | ds4 prefill **and** decode, streaming, context-swept — real source text, unique prefix per run | `DS4_PORT=9010 python3 bin/bench-ds4-0731.py [--quick]` |
+| `bin/bench-concurrency.py` | Concurrency without assuming parallel prefill (ds4 serializes; an "aggregate" over serialized prefills is meaningless) | `python3 bin/bench-concurrency.py --port 9010 --levels 1,2,4 --model deepseek-v4-flash-0731` |
+| `bin/smoke-ds4-0731.py` | **Correctness** gate for a weights/engine swap: code-exec, exact arithmetic, needle @30 k, tool-calls | `DS4_PORT=9010 python3 bin/smoke-ds4-0731.py` |
+| `bin/probe-commits-to-action.py` | Does the lane commit to an action or plan forever? (the failure that ended the laguna era) | `MODEL=deepseek-v4-flash-0731 python3 bin/probe-commits-to-action.py` |
 
 Results go to `logs/bench-*.json` and `logs/bench-*.log` with timestamped names. `logs/bench-deep-latest.json` is the symlink to the most recent deep run.
 
@@ -80,7 +92,7 @@ Wins on short-context but acceptance collapsed on long-context coding (37 % @ 13
 
 Decode tok/s @100 k: 4.9 (DFlash) → 18.5 (MTP), +278 %. Acceptance @100 k: 6.0 % vs 66.2 %. Full report: `logs/bench-coding-AB-report-20260508.md`.
 
-### 2026-05-17 quant comparison (current era)
+### 2026-05-17 quant comparison (Qwen 27B era, prod 05-17 → 07-08)
 
 Configurations tested in a 4-hour optimization pass, single-stream prompt~200 / 1024 out:
 
@@ -97,3 +109,31 @@ Configurations tested in a 4-hour optimization pass, single-stream prompt~200 / 
 
 Long-context (125 k input, 1024 out, c=1): MoE 48.5 tok/s / 38 s TTFT; dense 18 tok/s / 151 s TTFT.
 
+### ds4 / V4-Flash era (2026-08-01 → current production)
+
+Engine A/Bs on the same 0731 IQ2_XXS GGUF, coding-shaped prompts, `--temp 0`,
+decode timed first→last token so prefill is excluded.
+
+| Engine | prefill @34.6 k | decode @34.6 k | decode short | TTFT @34.6 k |
+|---|---:|---:|---:|---:|
+| ngc-shj fork (prod 05-18 → 08-06) | 368 t/s | 17.38 | 17.95 | — |
+| antirez mainline `b030961` | **857 t/s** | 14.18 | — | 40.2 s |
+| mainline + DSpark, commit `84cc882` | — | 10.93–13.84 | — | — |
+| mainline + DSpark, commit `0e89a0e` | — | +11.5 % vs plain | — | — |
+| **Entrpi fork v0.5.6.2, `--no-spec` (prod)** | — | **19.55** | **20.14** | **32.7 s** |
+| Entrpi fork + DSpark | — | 17.90 (−8.4 %) | +9.9 % | — |
+
+At 100 k the production lane runs ~14.3 tok/s decode with ~60 s TTFT on a warm
+disk-KV prefix (~370 s cold). Concurrency: c=4 aggregate **0.92× of c=1**, fully
+serialized — at c=4 every stream's TTFT was 67 s on an 8 k prompt.
+
+Quant candidates evaluated 2026-08-02 (none promoted):
+
+| Quant | Size | Engine | Prefill @2 k | Decode @2 k | Verdict |
+|---|---:|---|---:|---:|---|
+| IQ2_XXS-0731 (prod) | 81 GB | ds4 | 404 t/s | 19–20 | incumbent |
+| Q4K-hybrid-0731 | 97.6 GB | ds4 | — | — | evaluated during the parked window; not promoted |
+| unsloth UD-IQ3_XXS | 104 GB | llama.cpp mainline | 473 t/s | 16.2 | **cannot load on ds4** — engine rejects the layout |
+
+For the pre-ds4 production eras (Qwen 27B, Nemotron 75B, Laguna) see the tables
+above; the coding default's full lineage is [decisions §26–§41](decisions.md).

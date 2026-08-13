@@ -21,18 +21,18 @@ day-2 runbook, rollback procedures, and troubleshooting. Model-level detail:
 
 Two llama-swap groups (`config/llama-swap.full.bak`):
 
-- **`resident`** (`swap: false, exclusive: false, persistent: true`) — since 2026-07-22 a **single** always-on model, `laguna-s-2.1`, holding the box at `util 0.85` (~101 GB). `ttl: 0` — no idle unload, plus an `on_startup` preload hook so it loads at service start. (The previous era's two-member pair — `nemotron-3-puzzle-75b` + `qwen3.6-35b-a3b-vision` split `0.55`/`0.28` — is preserved in `llama-swap.yaml.bak.20260722-prelaguna` and `llama-swap.full.bak`.)
+- **`resident`** (`swap: false, exclusive: false, persistent: true`) — since 2026-08-01 a **single** always-on model, `deepseek-v4-flash-0731` (~86 GB of the 121 GB pool, a native binary rather than a container). `ttl: 0` — no idle unload, plus an `on_startup` preload hook so it loads at service start. `healthCheckTimeout: 1800` covers its cold start. (Previous eras are preserved as config backups: `llama-swap.yaml.bak.20260801-prelaguna-swap` (solo laguna), `…20260722-prelaguna` (the `nemotron-3-puzzle-75b` + `qwen3.6-35b-a3b-vision` pair split `0.55`/`0.28`), and `llama-swap.full.bak` (full roster).)
 - **`experiments`** (`swap: true, exclusive: true`) — the dormant pool. **At most one** member loads at a time; requesting a different one unloads the current and cold-loads the next. Each is a [copy-back model](#weight-offload--codeserver-copy-back): its weights rsync from codeserver first (+1–3 min, ~13 min for ds4), then the engine cold-loads (1–10 min vLLM, ~30–105 s for llama.cpp/ds4 binaries). `ttl: 3600`.
 
-> **⚠️ Swap-exclusive vs. itself, not vs. residents.** The `experiments` group only unloads *other experiments members* — it never evicts the resident. Solo laguna at `util 0.85` (~101 GB) leaves **no headroom for any co-loaded model**: even the 23 GB qwen 35B fast lane trips the host-OOM floor during its vLLM load transient (decision §34), and **the GB10 hard-hangs on host OOM** with no remote recovery. Free the resident first (`docker rm -f vllm-laguna-s21`) or re-shrink it (`LAG_UTIL=0.66 LAG_CTX=131072`) before loading anything beside it. See [Troubleshooting](#troubleshooting).
+> **⚠️ Swap-exclusive vs. itself, not vs. residents.** The `experiments` group only unloads *other experiments members* — it never evicts the resident. The ds4 resident holds ~86 GB of 121 GB, so a >30 GB neighbour will not fit, and **the GB10 hard-hangs on host OOM** with no remote recovery (it has, twice). Do not co-load by hand: **park the resident** with `bin/park-prod-ds4.sh` (points the live `cmd:` at `bin/eval-window-blocked.sh` *and* clears the `on_startup` preload, so neither a stray request nor a config reload can spawn a second engine), run the eval, then `bin/restore-prod-ds4.sh`. See [decision §37](decisions.md#37-ds4-quant-eval-the-upstream-host-registration-oom-hard-hang-2026-08-02) and [Troubleshooting](#troubleshooting).
 
-> **⚠️ Active config is in LOCKED MODE.** `config/llama-swap.yaml` (the live config) currently exposes **only `laguna-s-2.1`** — the dormant pool is not loadable from it. The full roster lives in `config/llama-swap.full.bak`; restore it (`cp config/llama-swap.full.bak config/llama-swap.yaml`, `-watch-config` picks it up) to re-enable the copy-back models. **Editing the live yaml bounces the resident** (~10–12 min reload) — the preload hook + cron watchdog auto-recover, but treat any yaml write as a production restart.
+> **⚠️ Active config is in LOCKED MODE.** `config/llama-swap.yaml` (the live config) currently exposes **only `deepseek-v4-flash-0731`** — the dormant pool is not loadable from it. The full roster lives in `config/llama-swap.full.bak`; restore it (`cp config/llama-swap.full.bak config/llama-swap.yaml`, `-watch-config` picks it up) to re-enable the copy-back models — but note it still declares the **pre-laguna** resident pair (`qwen3.6-35b-a3b-vision` + `nemotron-3-puzzle-75b`), and the 75B's weights were deleted 2026-08-02, so restoring it wholesale would put a re-download in the startup path. **Editing the live yaml bounces the resident** (~10 min reload) — the preload hook + cron watchdogs auto-recover, but treat any yaml write as a production restart.
 
 ---
 
 ## Weight offload — codeserver copy-back
 
-The Spark's 916 GB NVMe was filling (95%). Dormant model weights now live **off-box on codeserver** (`192.168.1.16`, a 1.9 TB LAN host reached over 2.5 GbE) under `~/llm-weights-archive/` (~409 GB), and are **pulled back on demand** the moment llama-swap starts that slot — dropping the Spark to **~48% used**. Only the resident's weights (laguna + its DFlash drafter) plus the keep-local set stay permanently on NVMe.
+The Spark's 916 GB NVMe was filling (95%). Dormant model weights now live **off-box on codeserver** (`192.168.1.16`, a 1.9 TB LAN host reached over 2.5 GbE) under `~/llm-weights-archive/` (~409 GB), and are **pulled back on demand** the moment llama-swap starts that slot — dropping the Spark to **~48% used** at the time (85% today, after the 2026-08 ds4 quant evals staged ~170 GB of GGUFs locally). Only the resident's weights plus the keep-local set stay permanently on NVMe.
 
 **How a dormant model loads.** Each `experiments` slot's `cmd:` in `llama-swap.full.bak` is wrapped by [`bin/copyback-launch.sh`](../bin/copyback-launch.sh):
 
@@ -42,7 +42,7 @@ copyback-launch.sh <local_path> <remote_relpath> <real_launch_script>
 
 On start it (1) **evicts every other managed model** listed in `etc/copyback-models.txt` — enforcing *one dormant model on NVMe at a time* and self-healing if a prior slot was SIGKILL'd before it could clean up; (2) **rsyncs** the weights from `codeserver:~/llm-weights-archive/<remote_relpath>` if they aren't already local (`--partial` resumes an interrupted pull; a failed pull is removed, not left corrupt); (3) runs the real launcher with `TERM`/`INT` forwarded; (4) on stop, **evicts** the weights again (evict-immediately-after-use — leanest disk, re-pulls each cold start).
 
-**The manifest** `etc/copyback-models.txt` is the eviction guard: one absolute weight path per line. **Keep-local models are deliberately absent** so they can never be evicted — the `laguna-s-2.1` weights + its DFlash drafter, `nemotron-3-puzzle-75b`, the `qwen3.6-35b-a3b-vision` weights, and the z-lab DFlash drafter.
+**The manifest** `etc/copyback-models.txt` is the eviction guard: one absolute weight path per line. **Keep-local paths are deliberately absent** so they can never be evicted — the resident's GGUFs under `~/ds4/gguf` and `~/entrpi-gguf` (removed from the manifest 2026-08-13, when it became clear a copy-back launch would have evicted the engine-rollback weights), the `qwen3.6-35b-a3b-vision` weights, and the z-lab DFlash drafter. **Anything promoted to resident must be taken off this list in the same change.**
 
 **Archive layout** (`codeserver:~/llm-weights-archive/`):
 
@@ -50,13 +50,15 @@ On start it (1) **evicts every other managed model** listed in `etc/copyback-mod
 hub/models--<org>--<name>   # HF-cache models → restore to ~/.cache/huggingface/hub/
 qwopus/Qwopus3.6-27B-v2-int4-AutoRound
 ornith/ornith-1.0-35b
-ds4/gguf                    # ~85 GB — the longest pull (~13 min)
+ds4/gguf                    # ~85 GB — kept in the archive, but no longer
+                            # copy-back-managed: ds4 is the resident since
+                            # 2026-08-01 and its weights stay local
 cosmos3-models/Cosmos3-Nano
 ```
 
 **Operational notes:**
 
-- `healthCheckTimeout: 1200` (20 min) in `llama-swap.yaml` **must exceed** the pull+load time, or llama-swap kills the slot mid-download.
+- `healthCheckTimeout` **must exceed** the pull+load time, or llama-swap kills the slot mid-download. It is `1800` (30 min) in the live config — raised from 1200 for the ds4 resident's cold start; `llama-swap.full.bak` still says 1200, which is enough for every copy-back lane.
 - **New dependency:** dormant models require **codeserver online** to load — a failed pull exits non-zero and the slot won't start. The resident has no such dependency. Weights exist *only* on codeserver now (local copies were deleted after verification).
 - The pull path uses SSH key auth to a bare host (no credentials in-repo). The codeserver address defaults to the LAN IP but is overridable via the **`COPYBACK_REMOTE`** env var (and `COPYBACK_ARCHIVE_ROOT` for the archive path) in `bin/copyback-launch.sh` — set it in the systemd env or launcher if you'd rather not hardcode internal topology.
 
@@ -71,10 +73,15 @@ sudo systemctl start|stop|restart|status llama-swap
 tail -f ~/llm-stack/logs/llama-swap.log
 tail -f ~/llm-stack/logs/llama-swap.err
 
-# Resident container logs (always loaded)
-docker logs -f vllm-laguna-s21             # laguna-s-2.1 (coding default)
-# NOTE: llama-swap wipes the container on relaunch — to capture a crash loop,
-# stream to a file while it happens: docker logs -f vllm-laguna-s21 > /tmp/lag.log 2>&1 &
+# Resident engine (always loaded) — a NATIVE BINARY, not a container, so there
+# are no `docker logs` for it: its stdout/stderr land in the gateway log above.
+ps -eo pid,etime,cmd | grep '[d]s4-server --cuda'
+curl -s http://127.0.0.1:9010/v1/models          # readiness (ds4 has no /health)
+curl -s http://127.0.0.1:9010/metrics | grep -E 'ds4_requests_total|ds4_requests_inflight'
+
+# Watchdog state (both cron-installed; see Troubleshooting)
+tail -f ~/llm-stack/logs/ds4-keepalive.log           # engine GONE          (*/5)
+tail -f ~/llm-stack/logs/ds4-degraded-watchdog.log   # engine UP but REFUSING (*/2)
 
 # Dormant (copy-back) engines — a container exists only while that model is loaded.
 # Names follow each launcher's --name (vllm-qwen-27b-int4-dflash, vllm-qwen-27b-fp8,
@@ -93,31 +100,38 @@ ssh 192.168.1.16 'du -sh ~/llm-weights-archive/*'
 cat etc/copyback-models.txt   # the managed paths (at most one exists locally at a time)
 ```
 
-### Roll the coding default off laguna
+### Roll the coding default back
 
 ```sh
-# LAGUNA WEIGHTS ROLLBACK (looping or quality regression on the v2 weights):
-#   edit config/llama-swap.yaml line 25 — point cmd: back to
-#   bin/launch-vllm-laguna-s21-nvfp4.sh (v1, pinned to the original b482b5d
-#   rotate weights). The yaml edit IS the cutover (live-watched, ~10 min bounce).
+# TIER 1 — ENGINE ROLLBACK, one line, no download (Entrpi fork -> antirez mainline):
+#   in config/llama-swap.yaml point the deepseek-v4-flash-0731 cmd: at
+#   bin/launch-ds4-server.sh. Same weights (hard-linked GGUF), different binary.
+#   Costs ~28% decode, gains 2.33x prefill and ~27s boot. The yaml edit IS the
+#   cutover (live-watched, ~10 min bounce). See decisions §39/§40.
+#   Each engine keeps its OWN --kv-disk-dir, so the prefix cache goes cold on
+#   the switch and refills; that is expected, not a fault.
 #
-# FULL MODEL ROLLBACK (leave laguna entirely):
-#   restore config/llama-swap.yaml.bak.20260722-prelaguna to bring back the
-#   nemotron-3-puzzle-75b + vision resident pair, then repoint the gateway names.
+# TIER 2 — WEIGHTS ROLLBACK: bin/launch-ds4-server.sh.bak.20260801-preview
+#   restores the pre-0731 preview quant, BUT that GGUF was evicted on 2026-08-02
+#   — it is an ~87 GB re-download now, not a script swap.
 #
-# qwen3.6-27b / qwen3.6-35b-a3b / nemotron-3-puzzle-75b currently resolve to
-# laguna-s-2.1. To fall back further to the dense Qwen 27B, repoint the aliases
-# to qwen3.6-27b-int4-dflash:
-#     aliases:
-#       - qwen3.6-27b
-#       - qwen3.6-35b-a3b
+# TIER 3 — LEAVE ds4 ENTIRELY (back to laguna): restore
+#   config/llama-swap.yaml.bak.20260801-prelaguna-swap, swap the keepalive cron
+#   back to bin/laguna-keepalive.sh, AND re-download poolside/Laguna-S-2.1-NVFP4
+#   (67 GiB, revision 07614121 — deleted 2026-08-02). Budget ~1 h. The DFlash
+#   drafter (4.2 GiB) is still cached. Know why you are doing it: laguna was
+#   pulled for planning without committing to an action, not for speed (§36).
 #
-# WHERE to change it: llama-swap v201 drops yaml aliases on -watch-config reload,
-# so the authoritative alias→model map lives at the LiteLLM gateway (deployed.yaml
-# on cockroach / 192.168.1.7), NOT only in config/llama-swap.yaml. Update it there.
+# TIER 4 — further back (dense Qwen 27B): repoint the gateway names at
+#   qwen3.6-27b-int4-dflash. It is a copy-back model, so its first load pulls
+#   ~18 GB from codeserver (~2 min) — pre-stage by hitting it once.
 #
-# int4-dflash is a copy-back model — its first load after rollback pulls ~18 GB from
-# codeserver (~2 min) before it serves. Pre-stage by hitting it once to warm the pull.
+# WHERE to change route names: llama-swap v201 drops yaml aliases on
+# -watch-config reload, so the authoritative alias->model map lives at the
+# LiteLLM gateway (deployed.yaml on cockroach / 192.168.1.7), NOT in
+# config/llama-swap.yaml. All six ds4-backed names are mapped there, each with
+# its own price block — a route repointed at a different engine keeps the OLD
+# price until you fix it (§38).
 ```
 
 ## LiteLLM integration
@@ -126,15 +140,19 @@ Points at the log-proxy on `:8079` so every request lands in `~/llm-stack/logs/p
 
 ```yaml
 model_list:
-  - model_name: qwen3.6-27b                      # what clients call (legacy alias)
+  - model_name: qwen3.6-27b                       # what clients call (legacy alias)
     litellm_params:
-      model: openai/nemotron-3-puzzle-75b        # resolve the alias to the real key HERE
+      model: openai/deepseek-v4-flash-0731        # resolve the alias to the real key HERE
       api_base: http://192.168.1.12:8079/v1
       api_key: none
-      timeout: 1200                              # ≥ cold-load + copy-back pull
+      timeout: 1200                               # ≥ cold-load + copy-back pull
+      input_cost_per_token: 0.0000001             # price EVERY alias, not just the real key
+      output_cost_per_token: 0.0000004            #   (§38 — an unpriced route reports $0)
 litellm_settings:
   request_timeout: 1200
 ```
+
+**Billing check after any gateway change:** query for rows with `spend = 0 AND prompt_tokens > 0`. Pricing silently vanished for two months (2026-06-01 → 08-03, backfilled +$60.04), and because six route names resolve to one engine, pricing only the real key reports $0 for every alias clients actually call ([decision §38](decisions.md#38-gateway-pricing-for-the-ds4-lane-the-silent-zero-spend-window-2026-08-03)). Never `docker restart litellm` on cockroach — its baked `--apply-only` command crash-loops; use `docker compose up -d --force-recreate litellm`.
 
 The `openai/<key>` string in `litellm_params.model` must exactly match the key under `models:` in the active llama-swap config — that's how llama-swap routes and decides which backend to swap in. **Resolve aliases at this gateway layer** (map `qwen3.6-27b` → the real model name): llama-swap v201 drops yaml `aliases:` on `-watch-config` reload, so the LiteLLM `model_list` is the reliable place to pin them.
 
@@ -144,13 +162,35 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 ```
 ~/llm-stack/
 ├── config/
-│   ├── llama-swap.yaml             # ACTIVE config — LOCKED MODE (2 residents only)
+│   ├── llama-swap.yaml             # ACTIVE config — LOCKED MODE (resident only)
 │   └── llama-swap.full.bak         # full roster (resident + experiments groups) — restore to unlock
-├── deployed.yaml                   # LiteLLM model_list for downstream (two-tier framing, updated 2026-07-13)
+├── deployed.yaml                   # LiteLLM model_list for downstream (ds4 routes + pricing, updated 2026-08-03)
 ├── bin/
 │   ├── copyback-launch.sh              # copy-back/dormant-tier wrapper: rsync weights from codeserver, run, evict
-│   ├── launch-vllm-laguna-s21-nvfp4-v2.sh # RESIDENT — coding default (Laguna S-2.1 v2 spinquantless + DFlash n=15)
-│   ├── launch-vllm-laguna-s21-nvfp4.sh    # rollback — Laguna v1 (original rotate weights, pinned b482b5d)
+│   ├── launch-ds4-entrpi.sh            # RESIDENT — coding default (Entrpi/ds4 v0.5.6.2, 0731 IQ2_XXS, --no-spec)
+│   ├── launch-ds4-server.sh            # engine rollback — antirez mainline b030961, same weights (one-line swap)
+│   ├── ds4-keepalive.sh                # cron */5 — relaunch the resident if the engine is GONE
+│   ├── ds4-degraded-watchdog.sh        # cron */2 — reload it when UP but REFUSING (refusals up, completions flat)
+│   ├── mem-watchdog.sh                 # SIGKILL a runaway engine before it hard-hangs the box (manual/eval use)
+│   ├── park-prod-ds4.sh                # park the resident for an eval window (cmd -> blocked, preload cleared, cron off)
+│   ├── restore-prod-ds4.sh             # undo park-prod-ds4.sh and warm the lane back up
+│   ├── eval-window-blocked.sh          # placeholder cmd: a stray request cannot spawn a second ~90 GB engine
+│   ├── smoke-ds4-0731.py               # correctness smoke for the ds4 lane (10 checks; gate for engine cutovers)
+│   ├── bench-ds4-0731.py               # ds4 prefill+decode bench, streaming, context-swept
+│   ├── bench-concurrency.py            # concurrency harness that does NOT assume parallel prefill
+│   ├── probe-commits-to-action.py      # does the lane commit to an action, or plan forever? (why laguna was pulled)
+│   ├── gguf-head.py                    # dump GGUF metadata from a PARTIAL download (chat template, tokenizer, recipe)
+│   ├── pardl.py                        # resumable parallel-range downloader (~9-16 MB/s single -> ~33 MB/s)
+│   ├── dl-{antirez-ds4-q4k-hybrid,unsloth-ds4-iq3xxs}.sh  # quant candidate fetchers
+│   ├── dl-ds4-quants-chain.sh          # serialised fetch — egress is a hard ~32 MB/s ceiling, parallel just starves
+│   ├── launch-ds4-server-0731.sh       # eval — 0731 weights on the pinned ngc-shj fork (the 08-01 test twin)
+│   ├── launch-ds4-server-q4k-hybrid.sh # eval — Q4K-hybrid 0731 (97.6 GB), port 9099
+│   ├── launch-ds4-upstream-q4k.sh      # eval — antirez upstream 54b36ed; GUARDED (ALLOW_OOM_RISK=1) after the OOM
+│   ├── launch-llamacpp-ds4-unsloth-iq3xxs.sh # eval — unsloth UD-IQ3_XXS on llama.cpp (cannot load on ds4)
+│   ├── ds4-test-window.sh              # open/close a ds4 test window by parking the (then) laguna resident
+│   ├── run-ds4-0731-window.sh          # unattended window driver: load -> smoke -> bench -> stop
+│   ├── launch-vllm-laguna-s21-nvfp4-v2.sh # retired default — Laguna S-2.1 v2 (weights deleted 2026-08-02)
+│   ├── launch-vllm-laguna-s21-nvfp4.sh    # retired — Laguna v1 (original rotate weights, pinned b482b5d)
 │   ├── launch-vllm-35b-moe-nvfp4-colag.sh # PARKED — qwen 35B fast lane sized to co-reside with laguna (see §34)
 │   ├── smoke-laguna-v2.py                 # laguna smoke test (looping check + tok/s)
 │   ├── launch-vllm-nemotron-puzzle-75b-mtp.sh # parked rollback — coding default 07-08→07-22 (NVFP4 75B hybrid, MTP n=4)
@@ -172,7 +212,6 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 │   ├── launch-vllm-27b-clean-dflash.sh  # retired — eval, non-prod
 │   ├── launch-vllm-qwen.sh              # retired — real 35B-A3B MoE (alias-only)
 │   ├── launch-vllm-nemotron-omni.sh     # active — multimodal omni
-│   ├── launch-ds4-server.sh             # active — antirez ds4 planner lane
 │   ├── bench-parallel.py                # single-engine concurrent decode bench
 │   ├── bench-mixed.py                   # multi-engine parallel bench
 │   ├── bench-bigctx-concurrency.py      # long-context concurrency sweep (BENCH_OUT_TOKENS env)
@@ -198,13 +237,16 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 ├── docs/
 │   ├── models.md                        # full model matrix + per-launcher details
 │   ├── operations.md                    # this file
-│   ├── decisions.md                     # decision log (§1–§35)
+│   ├── decisions.md                     # decision log (§1–§41)
 │   ├── benchmarks.md                    # bench tooling + historical archive
 │   ├── qwen3.6-27b-dflash.md            # deep DFlash writeup
 │   └── deepseek-v4-flash.md             # ds4 deep writeup
 ├── venv/                                # python + huggingface_hub + hf_transfer
 ├── logs/
-│   ├── llama-swap.{log,err}             # gateway std{out,err}
+│   ├── llama-swap.{log,err}             # gateway std{out,err} (resident engine's stdout lands here too)
+│   ├── ds4-keepalive.log                # engine-gone watchdog
+│   ├── ds4-degraded-watchdog.{log,state} # up-but-refusing watchdog (state = last counter snapshot)
+│   ├── ds4-0731-window-<stamp>/         # unattended eval-window output (smoke + bench)
 │   ├── proxy/{date}/{model}/            # per-request triples from log-proxy
 │   ├── bench-deep-latest.json           # symlink to latest deep bench
 │   └── bench-*.json                     # timestamped runs
@@ -222,11 +264,15 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 | Symptom | Root cause | Fix |
 |---|---|---|
 | Gateway down after reboot | Service not enabled | `sudo systemctl enable llama-swap` |
+| **Resident answers `/v1/models` but every real request 503s in ~50 ms** | ds4 memory floor latched: demand-mapped KV slabs grew until `MemAvailable` fell under `--mem-floor-gb`, so deep admissions are unfundable and bounce to the 64 k deep-serial guard (§41) | `bin/ds4-degraded-watchdog.sh` (cron `*/2`) reloads the lane automatically — ~20 s, prefix cache survives. Confirm with `ds4_requests_total{outcome="refused_deep_serial"}` rising while `{outcome="completed"}` stays flat. **Never "fix" this by raising `--ctx`** |
+| Resident vanished (crash, power cycle) | Engine died; the `on_startup` preload only covers service start | `bin/ds4-keepalive.sh` (cron `*/5`) pokes llama-swap to relaunch. Cold start ~10 min — the keepalive request carries a 1500 s timeout so a real customer doesn't pay for it |
+| Box hard-hung, needs a power cycle | Host OOM — an engine's *real* footprint exceeded its planned one (§37: upstream ds4's host-registration fallback made a device-side copy and doubled a planned 93.9 GiB) | No remote recovery exists — prevention only. Keep `--mem-floor-gb`, run `bin/mem-watchdog.sh` during evals, and **park prod** (`bin/park-prod-ds4.sh`) before loading anything large: a cleared `on_startup` preload is why the box came back cleanly last time |
+| Resident has no `docker logs` | It's a native binary (ds4), not a container | Its stdout/stderr go to `logs/llama-swap.log`; state via `curl :9010/v1/models` and `:9010/metrics` |
 | Engine "up" but tokens frozen (`/health` still 200, requests hang) | vLLM engine-core deadlock — seen with DFlash drafter + `max-num-seqs 8` under real traffic (§34) | `docker rm -f vllm-laguna-s21` (llama-swap relaunches via preload/cron). Detect with a stall watchdog: `generation_tokens_total` unchanged for minutes while `num_requests_running > 0`. Keep `LAG_SEQS ≤ 4` with the drafter |
 | Co-resident engines won't both load | Insufficient GPU memory | Lower `--gpu-memory-utilization` on one engine; verify with `nvidia-smi --query-compute-apps` |
-| A heavy dormant model OOMs on cold start | Resident pair holding ~99 GB (75B + vision) | The `experiments` group is swap-exclusive vs itself but **not** vs residents — a >20 GB dormant model may not fit beside them. `docker rm -f vllm-nemotron-puzzle-75b vllm-qwen-fast` to free the residents, or lower `NEMO_UTIL` |
+| A heavy dormant model OOMs on cold start | The resident is holding ~86 GB of 121 GB | The `experiments` group is swap-exclusive vs itself but **not** vs the resident — anything over ~30 GB will not fit beside it. Park the resident (`bin/park-prod-ds4.sh`) rather than racing it; do **not** rely on the eval model's own guard |
 | Dormant model won't load, `pull failed` in logs | codeserver (`192.168.1.16`) unreachable, or SSH key not loaded | `ssh 192.168.1.16 true` to check; dormant models require codeserver online. Residents are unaffected |
-| Dormant model load times out (>20 min) | Pull + engine load exceeded `healthCheckTimeout` | Raise `healthCheckTimeout` in `llama-swap.yaml`; ds4's 85 GB pull alone is ~13 min |
+| Dormant model load times out | Pull + engine load exceeded `healthCheckTimeout` | Raise `healthCheckTimeout` in `llama-swap.yaml` (live config is 1800 s); the biggest copy-back pull is ~20 GB / ~3 min, but a cold vLLM load can add 10 min |
 | Local disk fills despite offload | A SIGKILL'd dormant model left stale weights | Next managed launch self-evicts them; or `rm -rf` the stale path from `etc/copyback-models.txt` manually |
 | Both engines decode at half-speed | Single-GPU SM contention from concurrent compute | Expected — serialize the workload if sustained dual-engine load matters |
 | `kv_cache_dtype not supported` on FLASH_ATTN | Backend doesn't support fp8 KV in this image | Use `--kv-cache-dtype auto` (bf16) — or switch to FLASHINFER backend |
