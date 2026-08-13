@@ -248,6 +248,7 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 │   ├── qwen3.6-chat-template-froggeric.jinja  # chat template used by Qwen3.6 entries
 │   └── copyback-models.txt                    # copy-back eviction manifest (dormant weight paths)
 ├── docs/
+│   ├── clients.md                       # client integration contract (route names, timeouts, ctx, symptoms)
 │   ├── models.md                        # full model matrix + per-launcher details
 │   ├── operations.md                    # this file
 │   ├── decisions.md                     # decision log (§1–§41)
@@ -263,6 +264,7 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 │   ├── proxy/{date}/{model}/            # per-request triples from log-proxy
 │   ├── bench-deep-latest.json           # symlink to latest deep bench
 │   └── bench-*.json                     # timestamped runs
+├── AGENTS.md                            # agent entry point — what to read per task, hard rules
 └── README.md                            # front door — architecture, highlights, quickstart
 
 ~/bin/llama-swap                                            # gateway binary
