@@ -3,6 +3,17 @@
 # so at most one dormant model occupies local NVMe at a time.
 # KEEP-LOCAL models (puzzle-75b, unsloth-35b-vision, z-lab DFlash drafter)
 # are deliberately absent — they must never be evicted.
+#
+# 2026-08-13: ~/ds4/gguf REMOVED from this list. It was a dormant copy-back
+# path until 2026-08-01, when ds4 became the RESIDENT coding default. It now
+# holds the mainline rollback engine's copy of the 0731 GGUF (81 GB, hard-linked
+# to ~/entrpi-gguf) plus the 91 GB Q4K-hybrid eval quant. Leaving it here meant
+# the next copy-back launch would evict the rollback weights — silently turning
+# the "one line, no download" engine rollback (docs/operations.md) into an 87 GB
+# re-download. Prod itself would have survived on the ~/entrpi-gguf link.
+# NOTE config/llama-swap.full.bak still wraps its ds4 entry in
+# copyback-launch.sh; if you ever restore that roster, drop the wrapper for the
+# resident lane too.
 ~/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B-FP8
 ~/.cache/huggingface/hub/models--Intel--Qwen3.6-27B-int4-AutoRound
 ~/.cache/huggingface/hub/models--RedHatAI--Qwen3.6-35B-A3B-NVFP4
@@ -11,5 +22,4 @@
 ~/.cache/huggingface/hub/models--nvidia--Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
 ~/llm-stack/models/Qwopus3.6-27B-v2-int4-AutoRound
 ~/models/ornith-1.0-35b
-~/ds4/gguf
 ~/cosmos3/models/Cosmos3-Nano

@@ -1,51 +1,62 @@
-# SOLO MODE (again): Laguna S-2.1 sole resident — restored 2026-07-24 evening.
-# Config: seqs=4 + DFlash n=15 + util 0.85 + ctx 262144 = the proven 2026-07-22
-# prod cutover values (KV pool ~855k tokens, 3.28x full-256k sessions).
+# DEFAULT CODING LANE = deepseek-v4-flash-0731  (cutover 2026-08-01, user's call
+# after judging laguna-s-2.1 unacceptable in real use).
 #
-# Today's seqs-8 saga (DGX issue #2), permanent conclusions:
-#   - max-num-seqs 8 + DFlash DEADLOCKS the engine under real traffic (2x).
-#   - seqs 8 drafterless works but is 19 tok/s single-stream. Not worth it.
-#   - Qwen 35B-A3B NVFP4 fast lane (launch-vllm-35b-moe-nvfp4-colag.sh) ran
-#     at 70 tok/s but its vLLM LOAD TRANSIENT trips the host-OOM floor next
-#     to resident laguna (MemAvailable hit 1 GB; GB10 hard-hangs on OOM, no
-#     remote recovery). PARKED — entry removed so nothing can launch it by
-#     name. To revive: llama.cpp/GGUF route or sudo drop_caches pre-launch,
-#     AND re-shrink laguna to util 0.66 / ctx 131072 first (memory
-#     project-coresident-split-20260724 has the measured math).
+# Laguna is NOT co-resident — it needs ~113 GB of the 121 GB unified pool and
+# ds4 needs ~86 GB, so this is a straight replacement, not a split.
 #
-# Old prod names (qwen3.6-27b, qwen3.6-35b-a3b, nemotron-3-puzzle-75b) remain
-# remapped to laguna at the LiteLLM GATEWAY (llama-swap aliases don't route).
-# Backups: llama-swap.yaml.bak.20260724-presplit (this morning's seqs-8 state),
-# llama-swap.yaml.bak.20260722-prelaguna, llama-swap.full.bak (full roster).
-
-healthCheckTimeout: 1200
+# ROLLBACK (NO LONGER ONE COMMAND — weights were deleted 2026-08-02):
+#   cp config/llama-swap.yaml.bak.20260801-prelaguna-swap config/llama-swap.yaml
+#   crontab: swap bin/ds4-keepalive.sh back to bin/laguna-keepalive.sh
+#   AND re-download poolside/Laguna-S-2.1-NVFP4 (67 GiB, rev 07614121) — the
+#   HF cache copy was deleted 2026-08-02 to reclaim disk (user's call; laguna
+#   had already been judged unacceptable in real use). Budget ~1 h, not 10 min.
+#   The DFlash drafter (4.2 GiB) is still cached.
+# Gateway backups on .7: *.bak-20260801-ds4.
+#
+# WHAT THIS COSTS, measured on this box today (see logs/ds4-0731-window-*):
+#   decode @100k   33 t/s (laguna+DFlash)  ->  14.3 t/s        2.3x slower
+#   decode @2k     ~45 t/s                 ->  19.4 t/s
+#   TTFT @100k     ~64 s                   ->  370 s COLD / ~60 s on a warm
+#                                             disk-KV prefix (6.3x hit, and
+#                                             this traffic is prefix-heavy)
+#   concurrency    3.28x full-256k KV pool ->  NONE. ds4 serializes prefills;
+#                                             at c=4 every stream's TTFT was
+#                                             67 s on an 8k prompt. Four
+#                                             simultaneous 100k requests will
+#                                             queue behind each other.
+#   ctx            262144                  ->  131072
+# The concurrency one is the operational risk for resale traffic: this lane is
+# single-stream by design (upstream calls it planner-only for that reason).
+# In exchange: no overthinking/runaway-reasoning failure mode, a 304B model
+# instead of 118B-A8.5B, and a persistent disk-KV cache that survives restarts.
+#
+# ds4 emits thinking INLINE in `content` (no reasoning_content split) and
+# silently ignores 0731's new `reasoning_effort` — this fork predates it.
+healthCheckTimeout: 1800
 logLevel: info
 models:
-  laguna-s-2.1:
-    # vLLM 0.26.0 TRIAL 2026-07-30 — RUN, MEASURED, REVERTED. Stay on 0.25.1.
-    # Thesis was prefill: decode is already healthy (accept_len 4.31, above
-    # poolside's ~3.1 reference) while 100k prefill eats half the wall clock
-    # (64s TTFT, ~1560 tok/s), so 0.26.0's MoE kernel work (fused_topk_bias
-    # 1.5-2x) was the target. It did NOT land:
-    #   TTFT 13k 5587->6753ms, 60k 30762->30935, 100k 64034->64577  (no gain)
-    #   accept_len 4.31 -> 3.70
-    #   KV pool 821,116 -> 810,622 tokens (both MEASURED today; the "~855k" in
-    #     the header comment above predates this and is stale — the version
-    #     difference here is only 1.3%, i.e. NOT a real cost of 0.26.0)
-    #   cudagraph_mode forced FULL_AND_PIECEWISE -> PIECEWISE (spec-decode +
-    #     FlashInferBackend only supports UNIFORM_SINGLE_TOKEN_DECODE)
-    # Then LAG_SPEC_KV=auto (#48787, drafter KV off the global fp8) — the only
-    # lever that exists solely on 0.26.0 — was CATASTROPHIC: 6 accepted tokens
-    # out of 51,030 drafted (0.01%, accept_len 1.002 vs 4.31). DFlash needs its
-    # KV dtype to MATCH the target's fp8; give the drafter bf16 and every draft
-    # is rejected, leaving spec-decode as pure overhead. It also cost 22.7% of
-    # the KV pool (810k -> 626k) because the drafter cache stops being half-size.
-    # DO NOT set LAG_SPEC_KV. DO NOT re-run this trial without a new upstream
-    # reason. sm_121 itself was fine (FlashInfer resolved arch=sm121, ~10 min
-    # cold start), so the image is usable — it just is not better.
-    cmd: /home/max/llm-stack/bin/launch-vllm-laguna-s21-nvfp4-v2.sh
-    proxy: http://127.0.0.1:9030
-    checkEndpoint: /health
+  deepseek-v4-flash-0731:
+    # Native binary, not docker. Port 9010. Weights + rationale documented in
+    # the launch script (which is NOT live-watched, so put notes there).
+    #
+    # 2026-08-10 CUTOVER: antirez mainline b030961 -> Entrpi/ds4 fork v0.5.6.2.
+    # 2026-08-10 ctx 131072 -> 262144 was tried and REVERTED the same day: the
+    # 256K bump took the lane hard-down for ~35 min (33 refusals, 0 completions,
+    # every health check green). ctx stays 131072 — do NOT re-raise it, and 140k
+    # is not a safe intermediate step. Full post-mortem in the launch script
+    # header and docs/decisions.md §41.
+    # Measured on this box, same GGUF, same prompts, server harness:
+    #   decode @34.6k coding ctx  14.10 -> 19.55 tok/s  (1.39x)
+    #   TTFT   @34.6k             40.2s -> 32.7s        (1.23x)
+    # Gate: smoke-ds4-0731.py scored 10/10 (prod scored 9/10). Speculation is
+    # OFF (--no-spec): the fork's DSpark is a net LOSS at long context here.
+    # ROLLBACK = restore the cmd line below to launch-ds4-server.sh; that script
+    # and the mainline binary are untouched. Config is live-watched, so the edit
+    # alone bounces the lane (~10 min).
+    cmd: /home/max/llm-stack/bin/launch-ds4-entrpi.sh
+    proxy: http://127.0.0.1:9010
+    # ds4 exposes no /health; /v1/models is the readiness signal.
+    checkEndpoint: /v1/models
     ttl: 0
 groups:
   resident:
@@ -53,9 +64,9 @@ groups:
     exclusive: false
     persistent: true
     members:
-    - laguna-s-2.1
+    - deepseek-v4-flash-0731
 
 hooks:
   on_startup:
     preload:
-    - laguna-s-2.1
+    - deepseek-v4-flash-0731

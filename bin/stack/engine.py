@@ -56,6 +56,13 @@ def parse_metrics(text: str) -> dict:
             continue
         labels = dict(_LABEL_RE.findall(labels_raw))
         out[name].append((labels, val))
+        # DwarfStar mainline exposes these counters under a neutral `ds4:`
+        # namespace — upstream would not take a vllm:-branded one. Alias them
+        # onto the vllm: names so every consumer here keeps working unchanged,
+        # and so the real vLLM engines (which still emit vllm:) and the ds4
+        # lane can be read by the same code during the cutover.
+        if name.startswith("ds4:"):
+            out["vllm:" + name[len("ds4:"):]].append((labels, val))
     return out
 
 
