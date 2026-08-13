@@ -12,7 +12,7 @@ is current.
 
 | Task | Read |
 |---|---|
-| Configure a client, pick a model name, debug a client-side failure | **[docs/clients.md](docs/clients.md)** |
+| Configure a **client**, pick a model id, debug a client-side failure | **[docs/gateway-setup.md](docs/gateway-setup.md)** — self-contained and safe to hand to an outside agent |
 | What the machine-readable contract says (routes, ctx, pricing, concurrency) | **[deployed.yaml](deployed.yaml)** |
 | Why anything is configured the way it is | [docs/decisions.md](docs/decisions.md) (§1–§41, numbering is stable and cross-referenced from launchers) |
 | Change/inspect the running stack, roll back, troubleshoot | [docs/operations.md](docs/operations.md) |

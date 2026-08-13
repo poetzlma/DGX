@@ -101,7 +101,7 @@ logs/       gateway logs, per-request proxy triples, timestamped bench JSON
 | Doc | Contents |
 |---|---|
 | [AGENTS.md](AGENTS.md) | Start here if you're an agent working on this repo — what to read per task, and the hard rules |
-| [docs/clients.md](docs/clients.md) | Client integration contract: route names, the five settings that matter, symptom → cause |
+| [docs/gateway-setup.md](docs/gateway-setup.md) | **Point clients here** — connection, model id, the five settings that matter, symptom → cause. Consumer-facing: no infrastructure detail |
 | [docs/models.md](docs/models.md) | Full model matrix, what each model is for, per-launcher configuration + why |
 | [docs/operations.md](docs/operations.md) | Gateway, two-tier groups, weight offload/copy-back, runbook, rollback, troubleshooting |
 | [docs/decisions.md](docs/decisions.md) | Decision log §1–§41 — every non-obvious choice, with the measurements behind it |

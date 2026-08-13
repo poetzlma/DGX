@@ -152,6 +152,8 @@ litellm_settings:
   request_timeout: 1200
 ```
 
+Client-side settings (context window, timeouts, in-flight limit, reasoning field, `max_tokens`) live in **[gateway-setup.md](gateway-setup.md)** — that page is written to be handed to an outside client or agent, so it carries no internal addresses, capacities, or procedures. Keep it that way when editing it. Internal callers use `http://192.168.1.12:8079/v1` directly; the same five settings apply.
+
 **Key scopes are part of the contract — and `/v1/models` lies about the roster.** LiteLLM filters `GET /v1/models` by the calling key's `models` allowlist, so a client (or an agent debugging one) sees *its own scope*, not what the gateway serves. A key scoped to two routes reports two models at `<gateway-host>` while the gateway is exposing 17 — which reads exactly like "the canonical route isn't published," and isn't. Probe with an unscoped key before concluding a route is missing.
 
 Consequently **every entry in a key's allowlist must be a route that can actually be served.** In locked mode that is only the six ds4-backed names (`deepseek-v4-flash-0731`, `deepseek-v4-flash-ds4`, `laguna-s-2.1`, `nemotron-3-puzzle-75b`, `qwen3.6-27b`, `qwen3.6-35b-a3b`) — anything else 404s at llama-swap even though the gateway accepts it, so a stale allowlist is a menu of failures. Audited and cleaned 2026-08-13: six keys carried dead routes (`qwen3.6-35b-a3b-vision`, dark since 07-22; `deepseek-v4-flash` retired 06-27; `deepseek-v4-pro`, which never existed; and the whole Qwen3.5/gemma/minimax generation), and none carried the canonical resident name. Audit with:
@@ -248,7 +250,7 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 │   ├── qwen3.6-chat-template-froggeric.jinja  # chat template used by Qwen3.6 entries
 │   └── copyback-models.txt                    # copy-back eviction manifest (dormant weight paths)
 ├── docs/
-│   ├── clients.md                       # client integration contract (route names, timeouts, ctx, symptoms)
+│   ├── gateway-setup.md                 # CONSUMER-FACING client setup (no infra detail — safe to share)
 │   ├── models.md                        # full model matrix + per-launcher details
 │   ├── operations.md                    # this file
 │   ├── decisions.md                     # decision log (§1–§41)
