@@ -152,6 +152,19 @@ litellm_settings:
   request_timeout: 1200
 ```
 
+**Key scopes are part of the contract — and `/v1/models` lies about the roster.** LiteLLM filters `GET /v1/models` by the calling key's `models` allowlist, so a client (or an agent debugging one) sees *its own scope*, not what the gateway serves. A key scoped to two routes reports two models at `<gateway-host>` while the gateway is exposing 17 — which reads exactly like "the canonical route isn't published," and isn't. Probe with an unscoped key before concluding a route is missing.
+
+Consequently **every entry in a key's allowlist must be a route that can actually be served.** In locked mode that is only the six ds4-backed names (`deepseek-v4-flash-0731`, `deepseek-v4-flash-ds4`, `laguna-s-2.1`, `nemotron-3-puzzle-75b`, `qwen3.6-27b`, `qwen3.6-35b-a3b`) — anything else 404s at llama-swap even though the gateway accepts it, so a stale allowlist is a menu of failures. Audited and cleaned 2026-08-13: six keys carried dead routes (`qwen3.6-35b-a3b-vision`, dark since 07-22; `deepseek-v4-flash` retired 06-27; `deepseek-v4-pro`, which never existed; and the whole Qwen3.5/gemma/minimax generation), and none carried the canonical resident name. Audit with:
+
+```sh
+# on cockroach (.7) — flags allowlist entries that are not servable
+curl -s -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  'http://127.0.0.1:4000/key/list?return_full_object=true&size=100' | jq -r \
+  '.keys[] | select((.models // []) - ["deepseek-v4-flash-0731","deepseek-v4-flash-ds4","laguna-s-2.1","nemotron-3-puzzle-75b","qwen3.6-27b","qwen3.6-35b-a3b","all-team-models"] | length > 0) | "\(.key_alias): \(.models)"'
+```
+
+Back up before editing (`/key/list` → `infra/backups/`, `chmod 600`); `POST /key/update` accepts the hashed token from that listing, and `models` is **replaced**, not merged. Verify with a throwaway scoped key (`/key/generate` with `duration`, then `/key/delete`) rather than by asking a paying client to retry.
+
 **Billing check after any gateway change:** query for rows with `spend = 0 AND prompt_tokens > 0`. Pricing silently vanished for two months (2026-06-01 → 08-03, backfilled +$60.04), and because six route names resolve to one engine, pricing only the real key reports $0 for every alias clients actually call ([decision §38](decisions.md#38-gateway-pricing-for-the-ds4-lane-the-silent-zero-spend-window-2026-08-03)). Never `docker restart litellm` on cockroach — its baked `--apply-only` command crash-loops; use `docker compose up -d --force-recreate litellm`.
 
 The `openai/<key>` string in `litellm_params.model` must exactly match the key under `models:` in the active llama-swap config — that's how llama-swap routes and decides which backend to swap in. **Resolve aliases at this gateway layer** (map `qwen3.6-27b` → the real model name): llama-swap v201 drops yaml `aliases:` on `-watch-config` reload, so the LiteLLM `model_list` is the reliable place to pin them.
