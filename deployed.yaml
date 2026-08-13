@@ -1,24 +1,39 @@
 # Deployed LLM stack manifest — source of truth for downstream proxies (LiteLLM, etc.)
 #
-# Updated: 2026-07-22
+# Updated: 2026-08-13  (resident is ds4 0731 on the Entrpi fork; pricing 08-03)
 # Gateway: http://192.168.1.12:8079/v1   (log-proxy → llama-swap, OpenAI-compatible)
 #                                         underlying engine gateway: :8080 (llama-swap)
 #
 # All models share the gateway URL — clients route by `model` field.
 #
-# 2026-07-22 topology: SINGLE RESIDENT — laguna-s-2.1 (coding default; the
-# qwen3.6-27b / qwen3.6-35b-a3b / nemotron-3-puzzle-75b names all resolve here
-# at the GATEWAY). Exclusive occupancy: ~92 GB, KV pool 858k tokens = 3.28
-# concurrent full-256k sessions. VISION LANES ARE DARK in this topology —
-# qwen3.6-35b-a3b-vision has no co-resident headroom; restore
-# config/llama-swap.yaml.bak.20260722-prelaguna for the previous
-# nemotron+vision resident pair (= instant rollback path).
+# 2026-08-01 topology: SINGLE RESIDENT — deepseek-v4-flash-0731 (coding default;
+# laguna-s-2.1 / qwen3.6-27b / qwen3.6-35b-a3b / nemotron-3-puzzle-75b /
+# deepseek-v4-flash-ds4 ALL resolve here at the GATEWAY). Exclusive occupancy
+# ~86 GB. Engine: Entrpi/ds4 fork v0.5.6.2 since 2026-08-10.
+#
+# TWO CONTRACT CHANGES downstream harnesses must honour:
+#   1. context_window is 131072, NOT 262144. Do not send >131k — 262144 caused a
+#      ~35-minute outage on 2026-08-10 and is not coming back without an engine
+#      fix (docs/decisions.md §41).
+#   2. NO CONCURRENCY. This engine serializes prefills: c=4 aggregate measures
+#      0.92x of c=1, and four simultaneous 100k requests queue behind each other.
+#      Anything that fanned out across the laguna-era 3.28x KV pool must be
+#      re-shaped to sequential work.
+# Also: thinking comes back INLINE in `content` on the Entrpi fork (antirez
+# mainline, the rollback engine, splits it into `reasoning_content` instead), and
+# TTFT is prefix-cache-dependent — ~60 s at 100k warm vs ~370 s cold.
+#
+# VISION LANES ARE DARK in this topology — qwen3.6-35b-a3b-vision has no
+# co-resident headroom. Rollback paths, cheapest first: engine rollback = point
+# the llama-swap cmd: at bin/launch-ds4-server.sh (one line, no download);
+# leaving ds4 = config/llama-swap.yaml.bak.20260801-prelaguna-swap PLUS a 67 GiB
+# laguna re-download (weights deleted 2026-08-02, ~1 h).
 #  - DORMANT (swap-exclusive `experiments` group): weights offloaded to codeserver
-#    and copy-back-pulled on demand (bin/copyback-launch.sh). One resident at a time.
-# NOTE: the LIVE llama-swap config is in LOCKED MODE (laguna only). Restore
+#    and copy-back-pulled on demand (bin/copyback-launch.sh). One at a time.
+# NOTE: the LIVE llama-swap config is in LOCKED MODE (the resident only). Restore
 # config/llama-swap.full.bak to make the dormant routes below loadable again.
 # Dormant contexts are tuned c=1/2/3 @ 131k EXCEPT int4-dflash (120k/c=1, DFlash
-# drafter lane) and ds4 (131k planner, decode-bound).
+# drafter lane).
 #
 # CODING-HARNESS CONTRACT: each engine below carries `context_window:` — the
 # per-request token window the downstream coding server must configure. Read
@@ -27,9 +42,10 @@
 #
 # Per-model internal ports (9010–9027) are internal-only while loaded.
 #
-# Cold-start budget: residents answer immediately. A DORMANT model first rsyncs
-# its weights from codeserver (~1–3 min; ~13 min for ds4's 85 GB GGUF) THEN
-# cold-loads the engine (~2–6 min vLLM). Set request_timeout >= 1200s.
+# Cold-start budget: the resident answers immediately (its weights stay local —
+# it is NOT copy-back-managed). A DORMANT model first rsyncs its weights from
+# codeserver (~1–3 min) THEN cold-loads the engine (~2–6 min vLLM). Set
+# request_timeout >= 1200s. If the resident itself is cold it is ~10 min.
 #
 # `model_list` block below is drop-in for LiteLLM proxy config. All routes
 # go through log-proxy on :8079 so each request is captured to
@@ -38,27 +54,42 @@
 gateway:
   url: http://192.168.1.12:8079/v1
   api_key: not-needed   # LAN-only, no auth (authed edge is Cloudflare/LiteLLM on .7)
-  swap_mode: two-tier   # resident pair (persistent) + swap-exclusive `experiments` (dormant, copy-back)
+  swap_mode: two-tier   # single resident (persistent) + swap-exclusive `experiments` (dormant, copy-back)
   request_timeout_min_s: 1200
 
 deployed:
-  # Single resident: laguna-s-2.1 (exclusive). Everything else is the
+  # Single resident: deepseek-v4-flash-0731 (exclusive). Everything else is the
   # swap-exclusive `experiments` pool (one loaded at a time, weights copy-back
   # from codeserver) or parked. config = what the launcher actually serves;
   # verified no-OOM.
 
+  - name: deepseek-v4-flash-0731
+    role: coding DEFAULT (laguna-s-2.1 / qwen3.6-27b / qwen3.6-35b-a3b / nemotron-3-puzzle-75b / deepseek-v4-flash-ds4 all resolve here at the gateway) — set 2026-08-01
+    method: DeepSeek-V4-Flash-0731 (304B MoE, 13B active, MLA/compressed-KV) IQ2_XXS imatrix GGUF on the Entrpi/ds4 fork v0.5.6.2 — native binary, NOT docker, NOT llama.cpp; speculation OFF (--no-spec)
+    aliases: [laguna-s-2.1, qwen3.6-27b, qwen3.6-35b-a3b, nemotron-3-puzzle-75b, deepseek-v4-flash-ds4]   # mapped at GATEWAY, not llama-swap
+    port_internal: 9010
+    added: 2026-08-01   # engine swapped to the Entrpi fork 2026-08-10
+    context_window: 131072   # HARD CAP — 262144 caused a ~35-min outage on 2026-08-10 (decisions §41)
+    config: ctx=131072 no-spec mem-floor-gb=8 kv-disk-dir=~/ds4/kv-cache-entrpi kv-disk-space-mb=32768
+    concurrency: 1   # engine serializes prefills; c=4 aggregate = 0.92x of c=1
+    measured_single_stream_tok_s: 19.6   # @34.6k coding ctx, TTFT 32.7s; ~14.3 t/s @100k (TTFT ~60s warm prefix, ~370s cold)
+    thinking_field: content   # INLINE on this fork; antirez mainline (rollback engine) uses reasoning_content
+    rollback: bin/launch-ds4-server.sh   # antirez mainline b030961, same hard-linked GGUF, one-line cmd: swap
+
   - name: laguna-s-2.1
-    role: coding DEFAULT (qwen3.6-27b / qwen3.6-35b-a3b / nemotron-3-puzzle-75b names resolve here at the gateway) — set 2026-07-22
+    role: RETIRED 2026-08-01 (was coding DEFAULT 2026-07-22 → 08-01; route name now resolves to deepseek-v4-flash-0731). Target weights DELETED 2026-08-02 — reviving costs a 67 GiB download
     method: poolside/Laguna-S-2.1-NVFP4 (117.6B MoE, 8.5B active, 36/48 SWA-512 layers) + DFlash drafter poolside/Laguna-S-2.1-DFlash-NVFP4 n=15
     image: vllm/vllm-openai:v0.25.1-aarch64-ubuntu2404   # upstream has native Laguna + dflash method (PR #46853); AEON image not needed
-    aliases: [qwen3.6-27b, qwen3.6-35b-a3b, nemotron-3-puzzle-75b]   # mapped at GATEWAY, not llama-swap
+    aliases: []   # the qwen3.6-27b / -35b-a3b / nemotron names moved to the resident entry above on 2026-08-01
     port_internal: 9030
     added: 2026-07-22
-    context_window: 262144   # native 256k, no RoPE scaling; KV pool 858,606 tok = 3.28x concurrency at full 256k (fp8 KV + SWA)
+    retired: 2026-08-01
+    context_window: 131072   # WHAT THE ROUTE ACTUALLY SERVES TODAY (ds4). The values below describe laguna as it ran; if you revive it, the window goes back to 262144
+    context_window_if_revived: 262144   # native 256k, no RoPE scaling; KV pool 858,606 tok = 3.28x concurrency at full 256k (fp8 KV + SWA)
     config: max-model-len=262144 max-num-seqs=4 gpu-mem-util=0.85 kv=fp8 spec=dflash:n15 tool-call-parser=poolside_v1 reasoning-parser=poolside_v1 enable_thinking=true
     sampling_defaults: temperature=0.7 top_p=0.95   # poolside recommendation, set in gateway litellm_params
     measured_single_stream_tok_s: 33   # @100k realistic code ctx (26-37 range, fresh-engine variance); 17-18 @13k (drafter wash there); agg peaks c=2 (41.5 @60k); c=4 per-req drops to 9.4 — sweet spot c<=2
-    note: thinking model (interleaved reasoning between tool calls) — reasoning_content split by poolside_v1 parser, streams incrementally (no TTFT buffering); give generous max_tokens or thinking eats the budget. SWE-bench Multilingual 78.5 / Terminal-Bench 2.1 70.2 per poolside card — quality under real-traffic validation now.
+    note: thinking model (interleaved reasoning between tool calls) — reasoning_content split by poolside_v1 parser, streams incrementally (no TTFT buffering); give generous max_tokens or thinking eats the budget. SWE-bench Multilingual 78.5 / Terminal-Bench 2.1 70.2 per poolside card. WHY IT WAS PULLED — real-traffic validation failed on behavior, not speed — it plans without committing to an action (~2000 plans for one task; upstream HF issue #16). See docs/decisions.md §36.
 
   - name: nemotron-3-puzzle-75b
     role: ROLLBACK (was coding default 2026-07-08 → 2026-07-22; restore llama-swap.yaml.bak.20260722-prelaguna to reactivate with vision pair)
@@ -176,12 +207,12 @@ deployed:
     measured_agg_tok_s: 383   # c=8 peak
 
   - name: deepseek-v4-flash-ds4
-    role: planner lane (long-ctx with persistent disk KV cache, decode-bound)
-    method: antirez/ds4 native C/CUDA (mainline-rebased 2026-06-27), IQ2_XXS imatrix + custom Q4 decode
+    role: ALIAS for deepseek-v4-flash-0731 (see the resident entry at the top). Was the standalone planner lane 2026-05-12 → 2026-08-01, when the same engine became the coding default
+    method: antirez/ds4 native C/CUDA — engine history is ngc-shj Q4 fork (05-18) → antirez mainline b030961 (08-06) → Entrpi fork v0.5.6.2 (08-10, current)
     port_internal: 9010
     added: 2026-05-12
     context_window: 131072   # per-request window for the coding harness
-    config: ctx=131072   # decode ~21 t/s (custom Q4 dense decode; MTP off)
+    config: ctx=131072   # see the resident entry for live config; docs/deepseek-v4-flash.md for the engine lineage
 
   # RETIRED 2026-06-27: qwen3.6-27b-{int4-autoround,sakamaki-mtp,aeon-dflash,mtp}
   # (superseded 27B rollback slots, NVFP4 weights evicted) and deepseek-v4-flash
@@ -192,73 +223,106 @@ deployed:
 # transparently forwards to llama-swap and captures req+resp+meta per call.
 # Reverting any api_base to :8080 silently drops observability.
 model_list:
-  - model_name: laguna-s-2.1            # PROD coding default 2026-07-22 (also holds qwen3.6-27b / -35b-a3b / nemotron-3-puzzle-75b names)
-    litellm_params:
-      model: openai/laguna-s-2.1
-      api_base: http://192.168.1.12:8079/v1
-      api_key: not-needed
-      temperature: 0.7                  # poolside recommended defaults; client-specified values override
-      top_p: 0.95
+  # ─── ds4 PRICING, set 2026-08-03 ────────────────────────────────────────
+  # $0.10 / 1M input, $0.40 / 1M output — COST-RECOVERY, not a market rate
+  # (roughly power + Spark amortization; DeepSeek's own flash tier is ~3x
+  # this). All six model_names below resolve to the SAME ds4 engine, so all
+  # six carry the same price — pricing only `deepseek-v4-flash-ds4` would
+  # report $0 because live clients call `deepseek-v4-flash-0731` and
+  # `laguna-s-2.1`. Keep these in sync when the resident engine changes:
+  # a price left behind on a route now backed by a different model bills
+  # the wrong rate silently.
+  # Traffic is ~45:1 prefill-heavy, so input_cost dominates revenue.
+  # NOTE: ds4's disk-KV cache hits are NOT discounted — the engine does not
+  # report cached-token counts in `usage`, so LiteLLM cannot see them.
 
-  - model_name: nemotron-3-puzzle-75b   # DEFAULT → laguna-s-2.1 2026-07-22 (engine parked; gateway-level map keeps old clients working)
+  - model_name: laguna-s-2.1          # PROD coding default 2026-08-01 (name kept so existing clients keep working; now backed by ds4 0731)
     litellm_params:
-      model: openai/laguna-s-2.1
+      model: openai/deepseek-v4-flash-0731
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
-      temperature: 0.7
-      top_p: 0.95
+      input_cost_per_token: 0.0000001
+      output_cost_per_token: 0.0000004
 
-  - model_name: qwen3.6-27b           # DEFAULT → laguna-s-2.1 2026-07-22 (mapped at GATEWAY: llama-swap v201 -watch-config drops aliases, so forward the real name — see memory feedback_llama_swap_alias_reload)
+  - model_name: deepseek-v4-flash-0731  # THE resident engine's real name (llama-swap id). All routes above are aliases onto this.
     litellm_params:
-      model: openai/laguna-s-2.1
+      model: openai/deepseek-v4-flash-0731
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
-      temperature: 0.7
-      top_p: 0.95
+      input_cost_per_token: 0.0000001
+      output_cost_per_token: 0.0000004
 
-  - model_name: qwen3.6-35b-a3b       # DEFAULT → laguna-s-2.1 2026-07-22 (gateway-level map, same reason)
+  - model_name: nemotron-3-puzzle-75b # DEFAULT -> deepseek-v4-flash-0731 2026-08-01
     litellm_params:
-      model: openai/laguna-s-2.1
+      model: openai/deepseek-v4-flash-0731
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
-      temperature: 0.7
-      top_p: 0.95
+      input_cost_per_token: 0.0000001
+      output_cost_per_token: 0.0000004
+
+  - model_name: qwen3.6-27b           # DEFAULT -> deepseek-v4-flash-0731 2026-08-01 (gateway-level map; llama-swap aliases do not route)
+    litellm_params:
+      model: openai/deepseek-v4-flash-0731
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+      input_cost_per_token: 0.0000001
+      output_cost_per_token: 0.0000004
+
+  - model_name: qwen3.6-35b-a3b       # DEFAULT -> deepseek-v4-flash-0731 2026-08-01 (gateway-level map, same reason)
+    litellm_params:
+      model: openai/deepseek-v4-flash-0731
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+      input_cost_per_token: 0.0000001
+      output_cost_per_token: 0.0000004
 
   - model_name: qwen3.6-27b-int4-dflash
     litellm_params:
       model: openai/qwen3.6-27b-int4-dflash
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
 
   - model_name: qwen3.6-35b-a3b-nvfp4   # MoE throughput lane, co-resident with dense
     litellm_params:
       model: openai/qwen3.6-35b-a3b-nvfp4
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
 
   - model_name: qwen3.6-35b-a3b-vision  # DARK 2026-07-22 (engine parked, no headroom beside laguna — requests will fail; kept for when topology changes)
     litellm_params:
       model: openai/qwen3.6-35b-a3b-vision
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
 
   - model_name: qwen3.6-27b-nvfp4       # eval 2026-06-30 (NVIDIA NVFP4, c=4, 256k native ctx as of 2026-07-01)
     litellm_params:
       model: openai/qwen3.6-27b-nvfp4
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
 
   - model_name: qwen3.6-27b-nvfp4-vision  # eval 2026-07-05 (same NVFP4 weights, vision encoder loaded — accepts images)
     litellm_params:
       model: openai/qwen3.6-27b-nvfp4-vision
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
 
   - model_name: qwen3.6-27b-fp8         # rollback (demoted 2026-05-17)
     litellm_params:
       model: openai/qwen3.6-27b-fp8
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
 
   # retired 2026-06-27: qwen3.6-27b-{int4-autoround,sakamaki-mtp,aeon-dflash,mtp}
 
@@ -267,24 +331,32 @@ model_list:
       model: openai/ornith-1.0-35b
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
 
   - model_name: qwopus3.6-27b-int4-dflash  # eval (Opus-distill 27B, INT4+DFlash)
     litellm_params:
       model: openai/qwopus3.6-27b-int4-dflash
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
 
   - model_name: diffusiongemma-26b
     litellm_params:
       model: openai/diffusiongemma-26b
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
 
   - model_name: nemotron-3-nano-omni
     litellm_params:
       model: openai/nemotron-3-nano-omni
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
 
   - model_name: cosmos3-nano-omni       # eval 2026-06-27 (NVIDIA Cosmos3-Nano omni — image/video GENERATION, not chat)
     litellm_params:
@@ -293,14 +365,19 @@ model_list:
       api_key: not-needed
     model_info:
       mode: image_generation            # routes /v1/images/generations; video via /v1/videos passthrough on the gateway
+      # DELIBERATELY UNPRICED — per-token pricing does not apply to a generation
+      # lane. This is the one route the "spend=0 with prompt_tokens>0" check (§38)
+      # should not flag; every chat route must carry a price.
 
   # retired 2026-06-27: deepseek-v4-flash (old llama.cpp fork) — use -ds4
 
-  - model_name: deepseek-v4-flash-ds4
+  - model_name: deepseek-v4-flash-ds4    # priced 2026-08-03, same ds4 engine — see pricing note at top of model_list
     litellm_params:
-      model: openai/deepseek-v4-flash-ds4
+      model: openai/deepseek-v4-flash-0731
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
+      input_cost_per_token: 0.0000001
+      output_cost_per_token: 0.0000004
 
 litellm_settings:
   request_timeout: 1200   # cold-start + copy-back pull headroom; do not lower below 900
