@@ -19,15 +19,28 @@
 #            usable native-FP4 path in vLLM today; Marlin dequant->BF16 is the
 #            community-converged fastest, and output is verified clean (the
 #            3.6-era "Marlin garbage" applied to MODELOPT packing, not this).
-# KV bf16  : flash_attn refuses kv-cache-dtype=auto on this quant
-#            ("kv_cache_dtype not supported"). fp8 KV untested — potential
-#            future win at long ctx, A/B before touching.
+# KV fp8   : per the official vLLM recipe (live 2026-08-16). Halves KV bytes
+#            = long-ctx decode + pool gains. flash_attn refuses fp8 KV, so the
+#            attention-backend pin is DROPPED — vLLM auto-picks an fp8-capable
+#            backend. If startup fails on attention selection, revert BOTH
+#            (kv bfloat16 + --attention-backend flash_attn) together.
 # BATCH 16384, SEQS 4: community-validated; SEQS=2 A/B pending (task #5) —
 #            aggregate is flat past c=2, so SEQS may drop to 2 after the test.
-# NO --reasoning-parser: thinking arrives inline in content (blank-line
-#            separated on this engine; no <think> tag leak on 0.27.2). Parser
-#            ON buffers the think block (feedback_reasoning_parser_ttft).
-#            DECISION PENDING — A/B streaming behavior before cutover.
+# VISION ENABLED 2026-08-16 (was --language-model-only at first cutover):
+#            the model is natively multimodal and the stack had NO vision lane
+#            since laguna went dark 2026-08-01. limit-mm image:4/video:1 is the
+#            community-validated setting for this model on GB10. Encoder costs
+#            ~2-4 GB from the same UTIL budget (KV pool shrinks slightly).
+#            3.6-era caveat to watch: thinking-mode spirals on image inputs
+#            (fix was enable_thinking=false per request) — verify on 3.8.
+# --reasoning-parser qwen3: per the official recipe (both its configs use it).
+#            Separates thinking into reasoning_content. The 3.6-era buffering
+#            concern (feedback_reasoning_parser_ttft) was re-tested on this
+#            engine at deploy — see decisions.md §42 addendum for the verdict.
+#            NO --generation-config flag: the model's generation_config.json
+#            (temp 1.0 / top_p 0.95 / top_k 20 thinking-mode) must be the
+#            default; `--generation-config vllm` silently replaced it with
+#            vLLM generics — that was a copy-through bug from the 3.6 lanes.
 #
 # MEASURED (single-run sweep; matrix medians in logs/q38-matrix-final.log):
 #   ctx      prefill   decode   coldTTFT
@@ -84,14 +97,13 @@ exec docker run --name "$NAME" \
   --max-model-len 262144 \
   --max-num-seqs 4 \
   --max-num-batched-tokens 16384 \
-  --kv-cache-dtype bfloat16 \
+  --kv-cache-dtype fp8 \
   --mamba-cache-dtype float32 \
   --enable-chunked-prefill \
   --enable-prefix-caching \
-  --attention-backend flash_attn \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
-  --generation-config vllm \
+  --reasoning-parser qwen3 \
   --trust-remote-code \
-  --language-model-only \
+  --limit-mm-per-prompt '{"image":4,"video":1}' \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}'

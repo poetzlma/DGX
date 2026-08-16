@@ -395,3 +395,30 @@ TTFT was measured on `content` deltas only — on thinking models that collapsed
 the decode window and inflated tok/s (ds4's own 19.55 was mildly affected;
 re-measured 18.0). Contended-engine runs (two matrix instances) were discarded;
 `bench-qwen38-matrix.sh` now takes an flock and refuses a busy engine.
+
+### §42 addendum — recipe-alignment round (same day)
+
+After the official vLLM recipe went live, three deltas were tested and ALL
+adopted, plus vision:
+- **Vision enabled** (`--limit-mm-per-prompt '{"image":4,"video":1}'`, dropped
+  `--language-model-only`): image canary correct, NO 3.6-style thinking spiral
+  (73 tok on an image answer), text decode unchanged. First vision in the stack
+  since 2026-08-01. Encoder costs ~35k tokens of KV pool.
+- **`--kv-cache-dtype fp8`** (recipe): required dropping the flash_attn pin —
+  vLLM auto-picks FLASHINFER, which also autotunes fp4 GEMMs. KV pool 812k →
+  **1,521,344 tokens** (5.8× full-256k) and long-ctx decode jumped 13.2 →
+  **22.9 t/s @141k** (+73%; halved KV reads). Short ctx +20-25% too.
+- **`--reasoning-parser qwen3`** (recipe): the 3.6-era buffering is gone —
+  reasoning streams incrementally (first delta 0.16 s, 33 chunks before
+  content). NOTE the API contract: thinking arrives in **`reasoning`**, not
+  `reasoning_content` (ds4 used the latter; log-proxy reads both). A first
+  diagnostic misread this as "parser swallows reasoning" by checking only
+  reasoning_content — the exact feedback_reasoning_field_name trap.
+- **Dropped `--generation-config vllm`** (bug): it silently replaced the
+  model's recommended sampling (temp 1.0/top_p 0.95/top_k 20) with vLLM
+  generics. Copy-through from the 3.6 lanes.
+
+Final prod figures (single-run probe; c-sweep medians pending re-run on this
+config): 26.8 @2k / 22.7 @60k / 22.9 @141k decode, prefill ~2,100→790 by ctx,
+cold TTFT 178 s @141k. Recipe flags NOT adopted: none — but note the recipe's
+`--reasoning-parser qwen3` field-name behavior above before writing clients.
