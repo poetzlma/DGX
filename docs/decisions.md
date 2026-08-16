@@ -348,3 +348,50 @@ Three durable lessons:
 1. **`--mem-floor-gb` is enforced at admission, not by shrinking.** It correctly refused to fund work — the 503s *are* the floor working. It protects the box from the §37 host-OOM hard-hang; it does **not** protect the lane from becoming unservable. Both are true. And it does not self-recover: the guard's comment assumes a transient memory dip, but once the slabs have grown `MemAvailable` never climbs back.
 2. **Every health signal was green.** Process alive, `/v1/models` answering, no OOM, no kernel event, `ds4_cont_batch_failures_total` 0, `ds4_requests_inflight` 0 — while `ds4_requests_total{outcome="completed"}` sat frozen at 58 and `{outcome="refused_deep_serial"}` climbed 12 → 33. That signature — **refusals rising while completions stay flat** — is now the trigger for **`bin/ds4-degraded-watchdog.sh`** (cron `*/2`, two curls when healthy). Its action is a **reload, not a kill**: the floor breach is latched, not fatal, and unloading releases the grown slabs (measured 20 s to recover, artifacts already built, disk-KV prefix cache survives). Low `MemAvailable` alone is deliberately *not* a trigger — it dips legitimately under healthy load, and reloading then would destroy live work. `bin/ds4-keepalive.sh` cannot cover this: it only acts when the engine is **gone**.
 3. **Do not retry deep ctx without a cap on backed slab growth** (or a floor breach that *evicts* rather than refuses). Raising ctx alone just moves the cliff — at 131072 the live margin over the 8 GiB floor is only ~1.1–1.8 GiB, thinner than the slab growth observed that day (871 pages ≈ 5.2 GiB), so recurrence is possible; **140 k is not a safe intermediate step.** Concurrency is not a reason to want it either (c=4 measured 0.92× of c=1, §36), and upstream's own data near 248 k is ~146 ms/token (~7 t/s). Upstream ships `-c 262144` as the `ds4-serve` default and documents 524288 as deepest tested — neither on a 119 GiB box holding a 116 GiB resident.
+
+## §42 Qwen3.8-27B NVFP4 is the coding default; ds4 dormant (2026-08-16)
+
+Cut over 2026-08-16 ~14:15 during a zero-traffic window. Resident:
+`unsloth/Qwen3.8-27B-NVFP4` (22.4 GB compressed-tensors mixed quant) on vLLM
+pinned image `vllm-qwen38:prod-20260816` (= nightly-aarch64 @ sha256:677afd5b…),
+port 9030, launcher `bin/launch-vllm-qwen38-prod.sh` — every flag justified in
+its header. All seven gateway route names resolve to it; ds4 stays DORMANT
+(defined in llama-swap but cmd-blocked; weights + disk-KV intact; rollback =
+`bin/rollback-to-ds4.sh`, which stops qwen FIRST — order is load-bearing).
+
+Why (measured, this box, fixed streaming harness in `bin/bench-deep.py`):
+
+| | qwen3.8 NVFP4 (MTP n=3) | ds4 Entrpi (incumbent) |
+|---|---|---|
+| decode @~34k | ~23 t/s (probe interp.) | 18.0 |
+| decode @141k sustained | 10.5–11.1 (median c=1) | n/a — ctx caps at 131k |
+| ctx | 262144 (verified @259,778) | 131072 (§41 forbids raising) |
+| cold TTFT @~100–141k | ~165 s | ~370 s |
+| c=4 @120k | works; 14.1 t/s agg | prefill-serialised |
+| answer discipline | 84–124 tok, stops | ate a full 1024 budget thinking |
+| smoke | 13/14, 0 hard fails | 10/10 (its own gate) |
+
+Key findings that shaped the config, in one place:
+- **MTP n=3 is the single biggest lever** (+25–50% vs n=1; 83–90% draft
+  acceptance). No DFlash/Eagle drafter exists for 3.8; the native head ships in
+  both the BF16 and NVFP4 weights (15 `mtp.*` tensors, separate
+  `model_mtp.safetensors` in the unsloth repo).
+- **NVFP4 wins by bandwidth, not FP4 compute.** sm_121 runs Marlin
+  dequant→BF16; the chip has FP4 silicon but no vLLM path uses it yet. FP8 is
+  −30% (community-measured on this exact pair, vLLM 0.27.1); BF16 is ~2.6× the
+  bytes; AutoRound MixedInt4 ties decode but −30% prefill (kept on disk as the
+  quality fallback, smoke 13/14).
+- **`UTIL=0.70`, not 0.85.** 0.80+ makes NVRM log `NV_ERR_NO_MEMORY` during
+  warmup — the precursor signature of the 2026-08-15 host-OOM hard-hang (power
+  cycle #3). The keepalive greps the kernel journal for it every 5 min.
+  `free`'s "available" is NOT the safety metric; NVRM errors are.
+- Aggregate decode is flat past c=2 (13.8–14.1 t/s @120k) — bandwidth wall,
+  same as §36-era findings. SEQS=4 kept for KV/queueing, not throughput.
+- No `--reasoning-parser`: thinking arrives inline in `content` (clean on
+  0.27.2, no tag leak). Parser buffering vs clean-content A/B still open.
+
+Bench integrity note: every number above postdates fixing a harness bug where
+TTFT was measured on `content` deltas only — on thinking models that collapsed
+the decode window and inflated tok/s (ds4's own 19.55 was mildly affected;
+re-measured 18.0). Contended-engine runs (two matrix instances) were discarded;
+`bench-qwen38-matrix.sh` now takes an flock and refuses a busy engine.

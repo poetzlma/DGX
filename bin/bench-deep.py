@@ -155,6 +155,8 @@ def chat_streaming(model, messages, max_tokens, timeout=WARM_TIMEOUT_S):
 
     ttft = None
     token_chunks = 0
+    think_chunks = 0
+    first_content_ms = None
     usage = {}
 
     while True:
@@ -175,10 +177,23 @@ def chat_streaming(model, messages, max_tokens, timeout=WARM_TIMEOUT_S):
         choices = chunk.get("choices", [])
         if choices:
             delta = choices[0].get("delta", {})
-            if delta.get("content"):
+            # THINKING MODELS: the first tokens off the wire are reasoning
+            # deltas, not content. Qwen3.8 has thinking ON by default. If TTFT
+            # is measured on content alone it lands AFTER the whole <think>
+            # block, decode_time = total_s - ttft collapses toward zero, and
+            # decode_tok_s comes out wildly inflated. Different engines name the
+            # key differently (Laguna emitted `reasoning`, vLLM's qwen3 parser
+            # emits `reasoning_content`), so accept both. Fixed 2026-08-14;
+            # pre-fix copy is bench-deep.py.bak.20260814-prethinking.
+            think_delta = delta.get("reasoning_content") or delta.get("reasoning")
+            if delta.get("content") or think_delta:
                 if ttft is None:
                     ttft = (time.perf_counter() - t0) * 1000
                 token_chunks += 1
+                if think_delta and not delta.get("content"):
+                    think_chunks += 1
+            if delta.get("content") and first_content_ms is None:
+                first_content_ms = (time.perf_counter() - t0) * 1000
 
         if chunk.get("usage"):
             usage = chunk["usage"]
@@ -194,6 +209,10 @@ def chat_streaming(model, messages, max_tokens, timeout=WARM_TIMEOUT_S):
 
     return {
         "ttft_ms": round(ttft_ms, 1),
+        # Time to the first VISIBLE token. On a thinking model this is what the
+        # user actually waits for; ttft_ms above is the first token of any kind.
+        "first_content_ms": round(first_content_ms, 1) if first_content_ms is not None else None,
+        "think_chunks": think_chunks,
         "decode_tok_s": round(decode_tok_s, 1),
         "e2e_tok_s": round(e2e_tok_s, 1),
         "completion_tokens": comp,

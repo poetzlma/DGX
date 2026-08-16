@@ -22,6 +22,18 @@
 # (deprecated upstream, frozen at 2026-04-23) and does NOT have the diffusion
 # runner — do not substitute it.
 #
+# !! 2026-08-14: the image was DELETED locally to free 21 GB for the Qwen 27B
+# refresh. It is NOT re-pullable — upstream never published this tag to a
+# durable registry path. It was archived to codeserver first; restore with:
+#
+#   ssh 192.168.1.16 'cat ~/llm-weights-archive/docker-images/vllm-gemma-aarch64-cu130.tar' | docker load
+#
+# (21,154,744,320 bytes, sha256 a069a172ee0039ba0285d31f6837feacdb9f2d7cca1ad0398bfad691bde9c7e5,
+#  verified OCI layout with index.json/manifest.json/oci-layout before deletion.)
+# The weights are also off-box: ~/llm-weights-archive/hub/models--nvidia--diffusiongemma-26B-A4B-it-NVFP4
+# on the same host (18 G). Budget ~10 min for the image, plus the weights pull,
+# before this lane can run again.
+#
 # MEMORY: this is in the `main` swap-exclusive group. The qwen co-resident pair
 # (~104 GB) leaves only ~15 GB free, so triggering this WILL need the pair
 # freed first (docker rm -f vllm-qwen-27b-int4-dflash vllm-qwen-35b-moe-nvfp4).

@@ -76,6 +76,14 @@ def main():
             "wall_s": round(wall, 1),
             "ttft_ms_mean": round(statistics.mean(r["ttft_ms"] for r in ok), 0) if ok else None,
             "ttft_ms_max": round(max(r["ttft_ms"] for r in ok), 0) if ok else None,
+            # Thinking models: first VISIBLE token, and how much of the stream
+            # was reasoning. ttft_ms above is first-token-of-any-kind.
+            "first_content_ms_mean": round(statistics.mean(
+                r["first_content_ms"] for r in ok
+                if r.get("first_content_ms") is not None), 0)
+                if any(r.get("first_content_ms") is not None for r in ok) else None,
+            "think_chunks_mean": round(statistics.mean(
+                r.get("think_chunks", 0) for r in ok), 0) if ok else None,
             "decode_per_req_mean": round(statistics.mean(r["decode_tok_s"] for r in ok), 1) if ok else None,
             "decode_agg": round(sum(r["decode_tok_s"] for r in ok), 1) if ok else None,
             "out_tokens_total": total_out,

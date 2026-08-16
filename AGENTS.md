@@ -3,7 +3,11 @@
 This repo operates a **live, paid LLM serving stack** on one DGX Spark (GB10,
 119 GB unified memory). Nothing here is a sandbox: `config/llama-swap.yaml` is
 watched, so **editing it deploys**, and the box **hard-hangs on host OOM** with
-no remote recovery (it has, twice — each time needing a physical power cycle).
+no remote recovery (it has, three times — each needing a physical power cycle;
+latest 2026-08-15: engine warmup at 0.85 util beside a 30 GB download. The
+kernel journal logs NVRM `NV_ERR_NO_MEMORY` minutes before the hang — check it
+after every engine launch; `free`'s "available" will look fine right up to the
+end. One big memory consumer at a time.)
 
 Read [README.md](README.md) first for the architecture, then the page below that
 matches your task. Prefer reading the repo over asking, and prefer

@@ -1,61 +1,23 @@
-# DEFAULT CODING LANE = deepseek-v4-flash-0731  (cutover 2026-08-01, user's call
-# after judging laguna-s-2.1 unacceptable in real use).
+# PRODUCTION = qwen3.8-27b (cut over via bin/cutover-qwen38.sh; see that script
+# and bin/launch-vllm-qwen38-prod.sh headers for every measured rationale).
+# Rollback = bin/rollback-to-ds4.sh (order matters: stop qwen FIRST).
 #
-# Laguna is NOT co-resident — it needs ~113 GB of the 121 GB unified pool and
-# ds4 needs ~86 GB, so this is a straight replacement, not a split.
-#
-# ROLLBACK (NO LONGER ONE COMMAND — weights were deleted 2026-08-02):
-#   cp config/llama-swap.yaml.bak.20260801-prelaguna-swap config/llama-swap.yaml
-#   crontab: swap bin/ds4-keepalive.sh back to bin/laguna-keepalive.sh
-#   AND re-download poolside/Laguna-S-2.1-NVFP4 (67 GiB, rev 07614121) — the
-#   HF cache copy was deleted 2026-08-02 to reclaim disk (user's call; laguna
-#   had already been judged unacceptable in real use). Budget ~1 h, not 10 min.
-#   The DFlash drafter (4.2 GiB) is still cached.
-# Gateway backups on .7: *.bak-20260801-ds4.
-#
-# WHAT THIS COSTS, measured on this box today (see logs/ds4-0731-window-*):
-#   decode @100k   33 t/s (laguna+DFlash)  ->  14.3 t/s        2.3x slower
-#   decode @2k     ~45 t/s                 ->  19.4 t/s
-#   TTFT @100k     ~64 s                   ->  370 s COLD / ~60 s on a warm
-#                                             disk-KV prefix (6.3x hit, and
-#                                             this traffic is prefix-heavy)
-#   concurrency    3.28x full-256k KV pool ->  NONE. ds4 serializes prefills;
-#                                             at c=4 every stream's TTFT was
-#                                             67 s on an 8k prompt. Four
-#                                             simultaneous 100k requests will
-#                                             queue behind each other.
-#   ctx            262144                  ->  131072
-# The concurrency one is the operational risk for resale traffic: this lane is
-# single-stream by design (upstream calls it planner-only for that reason).
-# In exchange: no overthinking/runaway-reasoning failure mode, a 304B model
-# instead of 118B-A8.5B, and a persistent disk-KV cache that survives restarts.
-#
-# ds4 emits thinking INLINE in `content` (no reasoning_content split) and
-# silently ignores 0731's new `reasoning_effort` — this fork predates it.
+# The deepseek lane below is deliberately BLOCKED, not removed: its route names
+# still exist at the gateway and a stray request must fail loudly rather than
+# spawn a second ~113 GB engine beside qwen (GB10 hard-hangs on host OOM).
 healthCheckTimeout: 1800
 logLevel: info
 models:
+  qwen3.8-27b:
+    cmd: /home/max/llm-stack/bin/launch-vllm-qwen38-prod.sh
+    proxy: http://127.0.0.1:9030
+    checkEndpoint: /v1/models
+    ttl: 0
   deepseek-v4-flash-0731:
-    # Native binary, not docker. Port 9010. Weights + rationale documented in
-    # the launch script (which is NOT live-watched, so put notes there).
-    #
-    # 2026-08-10 CUTOVER: antirez mainline b030961 -> Entrpi/ds4 fork v0.5.6.2.
-    # 2026-08-10 ctx 131072 -> 262144 was tried and REVERTED the same day: the
-    # 256K bump took the lane hard-down for ~35 min (33 refusals, 0 completions,
-    # every health check green). ctx stays 131072 — do NOT re-raise it, and 140k
-    # is not a safe intermediate step. Full post-mortem in the launch script
-    # header and docs/decisions.md §41.
-    # Measured on this box, same GGUF, same prompts, server harness:
-    #   decode @34.6k coding ctx  14.10 -> 19.55 tok/s  (1.39x)
-    #   TTFT   @34.6k             40.2s -> 32.7s        (1.23x)
-    # Gate: smoke-ds4-0731.py scored 10/10 (prod scored 9/10). Speculation is
-    # OFF (--no-spec): the fork's DSpark is a net LOSS at long context here.
-    # ROLLBACK = restore the cmd line below to launch-ds4-server.sh; that script
-    # and the mainline binary are untouched. Config is live-watched, so the edit
-    # alone bounces the lane (~10 min).
-    cmd: /home/max/llm-stack/bin/launch-ds4-entrpi.sh
+    # PARKED (rollback target). Real launcher: bin/launch-ds4-entrpi.sh —
+    # restored ONLY by rollback-to-ds4.sh after qwen is stopped.
+    cmd: /home/max/llm-stack/bin/eval-window-blocked.sh
     proxy: http://127.0.0.1:9010
-    # ds4 exposes no /health; /v1/models is the readiness signal.
     checkEndpoint: /v1/models
     ttl: 0
 groups:
@@ -64,9 +26,9 @@ groups:
     exclusive: false
     persistent: true
     members:
-    - deepseek-v4-flash-0731
+    - qwen3.8-27b
 
 hooks:
   on_startup:
     preload:
-    - deepseek-v4-flash-0731
+    - qwen3.8-27b

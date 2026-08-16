@@ -1,0 +1,3 @@
+cfg=/home/max/llm-stack/config/llama-swap.yaml.bak.20260814-173318-prepark
+cron=/home/max/llm-stack/etc/crontab.bak.20260814-173318-prepark
+parked_at=2026-08-14T17:33:18+02:00

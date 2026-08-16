@@ -223,10 +223,11 @@ deployed:
 # transparently forwards to llama-swap and captures req+resp+meta per call.
 # Reverting any api_base to :8080 silently drops observability.
 model_list:
-  # ─── ds4 PRICING, set 2026-08-03 ────────────────────────────────────────
+  # ─── PRICING (carried over from the ds4 era, set 2026-08-03) ──────────
   # $0.10 / 1M input, $0.40 / 1M output — COST-RECOVERY, not a market rate
   # (roughly power + Spark amortization; DeepSeek's own flash tier is ~3x
-  # this). All six model_names below resolve to the SAME ds4 engine, so all
+  # this). All default model_names below resolve to the SAME resident engine
+  # (qwen3.8-27b since 2026-08-16; was ds4 0731), so all
   # six carry the same price — pricing only `deepseek-v4-flash-ds4` would
   # report $0 because live clients call `deepseek-v4-flash-0731` and
   # `laguna-s-2.1`. Keep these in sync when the resident engine changes:
@@ -236,41 +237,49 @@ model_list:
   # NOTE: ds4's disk-KV cache hits are NOT discounted — the engine does not
   # report cached-token counts in `usage`, so LiteLLM cannot see them.
 
-  - model_name: laguna-s-2.1          # PROD coding default 2026-08-01 (name kept so existing clients keep working; now backed by ds4 0731)
+  - model_name: qwen3.8-27b           # PROD coding default 2026-08-16 (the resident engine's real llama-swap id)
     litellm_params:
-      model: openai/deepseek-v4-flash-0731
+      model: openai/qwen3.8-27b
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
       input_cost_per_token: 0.0000001
       output_cost_per_token: 0.0000004
 
-  - model_name: deepseek-v4-flash-0731  # THE resident engine's real name (llama-swap id). All routes above are aliases onto this.
+  - model_name: laguna-s-2.1          # alias (name kept so existing clients keep working; backed by qwen3.8-27b since 2026-08-16)
     litellm_params:
-      model: openai/deepseek-v4-flash-0731
+      model: openai/qwen3.8-27b
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
       input_cost_per_token: 0.0000001
       output_cost_per_token: 0.0000004
 
-  - model_name: nemotron-3-puzzle-75b # DEFAULT -> deepseek-v4-flash-0731 2026-08-01
+  - model_name: deepseek-v4-flash-0731  # DORMANT ds4's old name — kept as an alias so clients keep working; backed by qwen3.8-27b since 2026-08-16
     litellm_params:
-      model: openai/deepseek-v4-flash-0731
+      model: openai/qwen3.8-27b
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
       input_cost_per_token: 0.0000001
       output_cost_per_token: 0.0000004
 
-  - model_name: qwen3.6-27b           # DEFAULT -> deepseek-v4-flash-0731 2026-08-01 (gateway-level map; llama-swap aliases do not route)
+  - model_name: nemotron-3-puzzle-75b # DEFAULT -> qwen3.8-27b 2026-08-16
     litellm_params:
-      model: openai/deepseek-v4-flash-0731
+      model: openai/qwen3.8-27b
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
       input_cost_per_token: 0.0000001
       output_cost_per_token: 0.0000004
 
-  - model_name: qwen3.6-35b-a3b       # DEFAULT -> deepseek-v4-flash-0731 2026-08-01 (gateway-level map, same reason)
+  - model_name: qwen3.6-27b           # DEFAULT -> qwen3.8-27b 2026-08-16 (gateway-level map; llama-swap aliases do not route)
     litellm_params:
-      model: openai/deepseek-v4-flash-0731
+      model: openai/qwen3.8-27b
+      api_base: http://192.168.1.12:8079/v1
+      api_key: not-needed
+      input_cost_per_token: 0.0000001
+      output_cost_per_token: 0.0000004
+
+  - model_name: qwen3.6-35b-a3b       # DEFAULT -> qwen3.8-27b 2026-08-16 (gateway-level map, same reason)
+    litellm_params:
+      model: openai/qwen3.8-27b
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
       input_cost_per_token: 0.0000001
@@ -373,7 +382,7 @@ model_list:
 
   - model_name: deepseek-v4-flash-ds4    # priced 2026-08-03, same ds4 engine — see pricing note at top of model_list
     litellm_params:
-      model: openai/deepseek-v4-flash-0731
+      model: openai/qwen3.8-27b
       api_base: http://192.168.1.12:8079/v1
       api_key: not-needed
       input_cost_per_token: 0.0000001

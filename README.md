@@ -11,14 +11,14 @@ flowchart LR
     C[clients] --> L["LiteLLM<br/>(edge · auth · alias map)"]
     L --> P["log-proxy :8079<br/>(per-request logs)"]
     P --> S["llama-swap :8080<br/>(route + hot-swap)"]
-    S --> R["resident engine<br/>deepseek-v4-flash-0731 · ds4 :9010<br/>always loaded"]
+    S --> R["resident engine<br/>qwen3.8-27b · vLLM :9030<br/>always loaded"]
     S -. cold load, one at a time .-> D["dormant engine :90xx<br/>~11 eval/rollback models"]
     W[("codeserver<br/>weight archive · 409 GB")] -. "rsync on demand,<br/>evict after use" .-> D
 ```
 
 Two tiers:
 
-- **Resident** — a single always-loaded coding default (`deepseek-v4-flash-0731`, DeepSeek V4-Flash 304B-A13B on the Entrpi/ds4 C/CUDA engine: IQ2_XXS GGUF, `ctx 131072`, persistent disk-KV prefix cache, ~86 GB). Every legacy route name — `laguna-s-2.1`, `qwen3.6-27b`, `qwen3.6-35b-a3b`, `nemotron-3-puzzle-75b`, `deepseek-v4-flash-ds4` — resolves to it at the gateway. It replaced laguna on 2026-08-01 for a reason no throughput bench could see ([§36](docs/decisions.md#36-ds4-is-the-coding-default-laguna-pulled-2026-08-01)).
+- **Resident** — a single always-loaded coding default (`qwen3.8-27b`, unsloth NVFP4 22.4 GB on pinned vLLM `vllm-qwen38:prod-20260816`, MTP n=3, `ctx 262144`, UTIL 0.70, ~90 GB with KV pool). Every legacy route name — `laguna-s-2.1`, `qwen3.6-27b`, `qwen3.6-35b-a3b`, `nemotron-3-puzzle-75b`, `deepseek-v4-flash-*` — resolves to it at the gateway. It replaced ds4 on 2026-08-16 ([§42](docs/decisions.md#42-qwen38-27b-nvfp4-is-the-coding-default-ds4-dormant-2026-08-16)); ds4 stays dormant on disk as the rollback (`bin/rollback-to-ds4.sh`).
 - **Dormant** — ~11 eval/rollback models whose weights live **off-box** and rsync back on demand (1–3 min for most), serve swap-exclusively, then evict. The Spark's NVMe went 95 % → 48 % used without deleting a single model.
 
 Full topology, groups, and copy-back mechanics: [docs/operations.md](docs/operations.md).
@@ -40,7 +40,8 @@ Compact view — the full matrix with launchers, memory, and per-model footnotes
 
 | Route (`model`) | Tier | Use it for | tok/s | Max ctx | Engine |
 |---|---|---|---:|---:|---|
-| **`deepseek-v4-flash-0731`** | **resident** | **coding — default** | 20 | 131 k | ds4 (C/CUDA) |
+| **`qwen3.8-27b`** | **resident** | **coding — default** | 11–26 by ctx | 262 k | vLLM (pinned) |
+| `deepseek-v4-flash-0731` | dormant (alias→resident) | rollback | 20 | 131 k | ds4 (C/CUDA) |
 | `laguna-s-2.1` | alias → resident | route kept for clients; weights **deleted** 08-02 | — | — | — |
 | `nemotron-3-puzzle-75b` | alias → resident | route kept for clients; weights **deleted** 08-02 | — | — | — |
 | `qwen3.6-35b-a3b-vision` | dark | vision — no headroom beside the resident | 56 | 131 k | vLLM |
@@ -62,7 +63,7 @@ Two caveats the table can't carry. **The live config is in locked mode** — `co
 
 ```sh
 curl http://192.168.1.12:8079/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "deepseek-v4-flash-0731",
+  "model": "qwen3.8-27b",
   "messages": [{"role": "user", "content": "hi"}]
 }'
 # Resident models answer immediately. A copy-back model first rsyncs its weights
@@ -111,4 +112,4 @@ logs/       gateway logs, per-request proxy triples, timestamped bench JSON
 
 ---
 
-*Current production (2026-08-13): `deepseek-v4-flash-0731` solo resident — DeepSeek V4-Flash IQ2_XXS on the **Entrpi/ds4 fork v0.5.6.2**, `--no-spec`, `ctx 131072`, `--mem-floor-gb 8`, persistent disk-KV prefix cache, ~86 GB. 19.6 tok/s decode @34.6 k, TTFT 32.7 s (≈60 s at 100 k on a warm prefix, ~6× worse cold). Single-stream by design. Two watchdogs on cron — engine-gone (`*/5`) and up-but-refusing (`*/2`); rollback to antirez mainline is one line in `llama-swap.yaml`, which is live-watched, so yaml edits are production deployments.*
+*Current production (2026-08-16): `qwen3.8-27b` solo resident — unsloth NVFP4 on pinned vLLM (`vllm-qwen38:prod-20260816`), MTP n=3 native speculation, `ctx 262144`, `gpu-util 0.70`, port 9030. Decode 26 t/s @19k → 11 t/s sustained @141k → 9.6 @260k; cold TTFT ~165 s @141k; c=4 works (14 t/s aggregate, bandwidth-flat past c=2). Keepalive cron `*/5` includes an NVRM `NV_ERR_NO_MEMORY` early-warning grep (the host-OOM precursor, §42). ds4 dormant: weights + disk-KV intact, rollback = `bin/rollback-to-ds4.sh` (stops qwen FIRST — order matters). `llama-swap.yaml` is live-watched, so yaml edits are production deployments.*
