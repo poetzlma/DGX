@@ -635,3 +635,59 @@ processes, never the vLLM container. Now: blocks every `launch-*` cmd, verifies
 no launcher line survives, clears whatever preload names, and removes `vllm-*`
 containers. Dry-tested against a config copy before use. Three windows opened
 and closed on it since, each restoring config+crontab byte-identical.
+
+### §44 addendum — max-num-seqs 4 -> 8 (2026-08-17, KEPT)
+
+Raised in `bin/launch-vllm-qwen38-prod.sh` and kept after a live coding-agent
+test. Code prompt, non-thinking, `bin/bench-concurrent-fresh.py`:
+
+| c | aggregate tok/s | per-request tok/s |
+|---|---:|---:|
+| 1 | 26.69 | 26.69 |
+| 4 | 93.67 | 25.13 |
+| 8 | **167.25** | 22.09 |
+
+**6.3x aggregate for a 17 % per-request cost, and still climbing at c=8** — so 8
+is not demonstrably the ceiling either. `request_success_total` advanced and
+`num_requests_waiting` stayed 0, i.e. all eight streams genuinely completed.
+
+**Raising seqs is nearly free on this model**, which is why the memory risk was
+low: the KV pool is allocated ONCE at startup and, on this hybrid-GDN model, the
+SSM state is paged *inside* it (vLLM forces attention block size to 1664 tokens
+so the attention page >= the mamba page). Measured cost of 4 -> 8: pool
+1,528,920 -> 1,527,405 tokens (-1,515) and peak activation 4.53 -> 4.88 GiB.
+vLLM also re-profiles at startup and shrinks the pool to fit, so it self-limits
+rather than growing into the host.
+
+**The laguna SEQS=8 deadlock did NOT reproduce.** That failure (token counter
+frozen while `/health` returned 200, twice, on laguna+DFlash) was the main reason
+to fear this change. Different model and drafter; c=8 completed cleanly here. The
+precedent is still worth knowing because it is invisible to health checks —
+if completions stall while the process looks healthy, roll back first
+(`~/rollback-seqs4.sh`, one line + engine recycle) and diagnose after.
+
+**Bounds on the result:** measured at short/moderate context. The pool fits 5.83
+requests at the FULL 262144, so c=8 crosses that and eight near-max prompts will
+preempt/recompute; at ~100 k prompts it fits ~15, and real traffic is ~100 k.
+`num_preemptions_total` was 0 throughout — that is the metric to watch.
+
+Corrected in the client contract as a result: `deployed.yaml`
+`max_concurrent_requests` 4 -> 8, and `docs/gateway-setup.md` no longer tells
+clients to cap at 1-2. That guidance came from the "flat past c=2" figure, which
+was measured at 120 k and was never a general law.
+
+### §44 addendum 2 — RETRACTED: the page-cache explanation for NVRM at UTIL 0.70
+
+§44 hypothesised that the NVRM `NV_ERR_NO_MEMORY` bursts during prod warmup at
+UTIL 0.70 came from ~62 GB of eval artifacts sitting in page cache. **That is
+wrong.** The artifacts were deleted (109 -> 169 GB free) and the very next prod
+warmup still logged **43 events**. Tally for the day: 6 / 8 / 2 on eval engines,
+then 108+21, 66, and 43 on prod warmups.
+
+So prod warmup at 0.70 does produce NVRM bursts on this box, which contradicts
+§42's claim that 0.70 yields "0 hits" and only 0.80+ is dangerous. The box has
+not hung and steady state is clean, but **the safe-util figure the whole stack is
+pinned to rests on a claim that is not holding.** Still open. Worth deriving
+properly: what distinguishes the eval-launcher warmups (2-8 events) from the prod
+warmups (43-108) when both run UTIL 0.70 on the same image and weights? The
+launchers differ only in port, container name, and served-model-name.

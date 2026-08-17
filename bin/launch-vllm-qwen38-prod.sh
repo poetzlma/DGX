@@ -33,8 +33,29 @@
 #            attention-backend pin is DROPPED — vLLM auto-picks an fp8-capable
 #            backend. If startup fails on attention selection, revert BOTH
 #            (kv bfloat16 + --attention-backend flash_attn) together.
-# BATCH 16384, SEQS 4: community-validated; SEQS=2 A/B pending (task #5) —
-#            aggregate is flat past c=2, so SEQS may drop to 2 after the test.
+# BATCH 16384, SEQS 8: raised from 4 on 2026-08-17 for a live coding-agent test.
+#            Measured at SEQS=4 on a code prompt: c=4 aggregate 93.67 tok/s vs
+#            c=1 26.69 (3.5x scaling) with per-request barely down (25.13), so
+#            c=4 was clearly not the ceiling at short/moderate context. The
+#            §42-era "aggregate flat past c=2" was measured at 120k, NOT
+#            universally — see §44.
+#            WHY THIS IS SAFE-ISH: the KV pool is allocated ONCE at startup and
+#            does not grow with SEQS; on this hybrid model the SSM state is paged
+#            INSIDE that pool (vLLM forces attention block size to 1664 tokens so
+#            the attention page >= mamba page). Raising SEQS divides a fixed pool
+#            among more sequences, and vLLM re-profiles at startup and shrinks the
+#            pool to fit the larger activation. So this is not the memory-growth
+#            shape that hard-hangs the box.
+#            TWO REAL RISKS, both invisible to health checks:
+#            1. SEQS=8 DEADLOCKED the laguna lane twice (token counter frozen
+#               while /health returned 200). Different model+drafter, so it may
+#               not reproduce — but if completions stall while the process looks
+#               healthy, this is why. Roll back FIRST, diagnose after.
+#            2. The pool holds 5.83 full-256k requests. c=8 CROSSES that, so
+#               eight genuinely long requests will preempt/recompute. Watch
+#               vllm:num_preemptions_total (0 at SEQS=4). At ~100k prompts the
+#               pool holds ~15, so this only bites the long tail.
+#            ROLLBACK: set this back to 4 and restart the engine. One line.
 # VISION ENABLED 2026-08-16 (was --language-model-only at first cutover):
 #            the model is natively multimodal and the stack had NO vision lane
 #            since laguna went dark 2026-08-01. limit-mm image:4/video:1 is the
@@ -105,7 +126,7 @@ exec docker run --name "$NAME" \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.70 \
   --max-model-len 262144 \
-  --max-num-seqs 4 \
+  --max-num-seqs 8 \
   --max-num-batched-tokens 16384 \
   --kv-cache-dtype fp8 \
   --mamba-cache-dtype float32 \

@@ -30,9 +30,16 @@ live:
                                    # this budget and can consume it entirely.
   request_timeout_s: 1200          # cold TTFT is 178 s @141k, ~390 s @260k.
                                    # Do not lower below 900.
-  max_concurrent_requests: 4       # engine serves 4; aggregate throughput is
-                                   # FLAT past 2 (bandwidth wall). 1-2 in flight
-                                   # is the efficient shape; 4 will not error.
+  max_concurrent_requests: 8       # raised 4 -> 8 on 2026-08-17 after measuring
+                                   # (§44 addendum). Aggregate still climbing at
+                                   # c=8: 26.7 (c1) -> 93.7 (c4) -> 167.3 (c8)
+                                   # tok/s on code, i.e. 6.3x, for a 17% cost in
+                                   # per-request rate (26.7 -> 22.1). Request 9
+                                   # queues, it does not error.
+                                   # CAVEAT: measured at short/moderate context.
+                                   # The KV pool holds 5.83 requests at the FULL
+                                   # 262144, so 8 simultaneous very long prompts
+                                   # will preempt. At ~100k it holds ~15.
 
   # ── Capabilities ──────────────────────────────────────────────────────
   vision: true                     # image:4, video:1 per prompt. Enabled
@@ -71,7 +78,7 @@ live:
     runtime: vLLM, pinned image vllm-qwen38:prod-20260816 (sha256:677afd5b…)
     launcher: bin/launch-vllm-qwen38-prod.sh   # every flag justified in header
     port_internal: 9030
-    config: max-model-len=262144 max-num-seqs=4 gpu-mem-util=0.70
+    config: max-model-len=262144 max-num-seqs=8 gpu-mem-util=0.70
             max-num-batched-tokens=16384 kv=fp8 mamba-cache=fp32
             speculative=mtp:n3 tool-call-parser=qwen3_coder
             reasoning-parser=qwen3 limit-mm-per-prompt=image:4,video:1

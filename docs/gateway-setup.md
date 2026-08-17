@@ -58,7 +58,7 @@ configuration errors. Set these explicitly.
 | **Request timeout** | **≥ 1200 s** | Time-to-first-token is tens of seconds on a large prompt and ~3 minutes on a long, previously-unseen one. A 60–120 s timeout aborts *after* the expensive work is done, and the retry repeats it. |
 | **Reasoning field** | read **both** `reasoning` and `reasoning_content` | This model puts thinking in **`reasoning`**. The previous one used `reasoning_content`, and it can change again at the next model swap. A client reading only one field silently shows empty responses. |
 | **`max_tokens`** | ≥ 2000 for real work | Thinking is charged against the same budget. Too small a budget can be spent entirely on reasoning, returning empty content with `finish_reason: length`. |
-| **Concurrent requests** | **1–2** | Up to 4 are accepted, but aggregate throughput is flat past 2 — beyond that you add latency to every in-flight request without finishing any more work. Sequential steps still beat wide parallel fan-out here. |
+| **Concurrent requests** | **up to 8** | 8 are accepted and parallelism genuinely pays: aggregate goes 26.7 → 93.7 → 167.3 tok/s at c=1/4/8, so 6.3× more work for 17 % slower individual responses. Request 9 queues rather than failing. The exception is very long prompts — the cache holds ~5.8 requests at the full 262 k, so eight simultaneous near-max prompts will thrash. Fan out freely at ordinary sizes; stay near 4 if every request is enormous. |
 
 Leave sampling alone unless you have a reason: the model ships its own
 recommended defaults (`temperature 1.0`, `top_p 0.95`, `top_k 20`) and the
