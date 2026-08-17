@@ -17,8 +17,8 @@ is current.
 | Task | Read |
 |---|---|
 | Configure a **client**, pick a model id, debug a client-side failure | **[docs/gateway-setup.md](docs/gateway-setup.md)** — self-contained and safe to hand to an outside agent |
-| What the machine-readable contract says (routes, ctx, pricing, concurrency) | **[deployed.yaml](deployed.yaml)** |
-| Why anything is configured the way it is | [docs/decisions.md](docs/decisions.md) (§1–§41, numbering is stable and cross-referenced from launchers) |
+| What the machine-readable contract says (routes, ctx, pricing, concurrency) | **[deployed.yaml](deployed.yaml)** — the `live:` block at the top is the whole client contract; everything under `not_serving:` is history and answers nothing today |
+| Why anything is configured the way it is | [docs/decisions.md](docs/decisions.md) (§1–§43, numbering is stable and cross-referenced from launchers) |
 | Change/inspect the running stack, roll back, troubleshoot | [docs/operations.md](docs/operations.md) |
 | Per-model and per-launcher detail | [docs/models.md](docs/models.md) |
 | Benchmark something | [docs/benchmarks.md](docs/benchmarks.md) — includes the traps that make numbers lie |
@@ -37,13 +37,17 @@ header in the same edit.
 - **Do not edit `config/llama-swap.yaml` casually.** It is live-watched: any
   write bounces the resident (~10 min). That includes a `git checkout`, `merge`,
   or `stash` that touches the file.
-- **Do not load a second large engine beside the resident.** It holds ~86 GB of
+- **Do not load a second large engine beside the resident.** It holds ~90 GB of
   121 GB. Park production first (`bin/park-prod-ds4.sh`), which also clears the
   startup preload so a stray request cannot spawn one. Host OOM is unrecoverable
   remotely.
-- **Do not raise the resident's `--ctx`.** 262144 caused a 35-minute outage; the
-  live margin over the memory floor is ~1–2 GiB, so 140 k is not a safe middle
-  step either ([§41](docs/decisions.md#41-the-256-k-context-outage-a-memory-floor-that-refuses-instead-of-shrinking-2026-08-10)).
+- **Do not raise the resident's `--gpu-memory-utilization` above 0.70.** 0.80+
+  logged 60× NVRM `NV_ERR_NO_MEMORY` during warmup — the precursor to power
+  cycle #3 ([§42](docs/decisions.md#42-qwen38-27b-nvfp4-is-the-coding-default-ds4-dormant-2026-08-16)).
+  (The old "never exceed 131 k context" rule was a *ds4* memory-floor
+  constraint, [§41](docs/decisions.md#41-the-256-k-context-outage-a-memory-floor-that-refuses-instead-of-shrinking-2026-08-10).
+  It binds again only after a rollback — the current resident serves the full
+  262 144 by design.)
 - **Do not conclude a route is missing from `GET /v1/models`.** That endpoint is
   filtered by the calling key's allowlist. Check `deployed.yaml` instead.
 - **Do not trust a single benchmark run.** GB10 decode swings ~44× on allocator

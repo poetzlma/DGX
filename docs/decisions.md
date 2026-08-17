@@ -422,3 +422,58 @@ Final prod figures (single-run probe; c-sweep medians pending re-run on this
 config): 26.8 @2k / 22.7 @60k / 22.9 @141k decode, prefill ~2,100→790 by ctx,
 cold TTFT 178 s @141k. Recipe flags NOT adopted: none — but note the recipe's
 `--reasoning-parser qwen3` field-name behavior above before writing clients.
+
+## §43 One model, one route: aliases retired and keys re-scoped (2026-08-17)
+
+The docs, the gateway catalog, and the loaded engine had drifted into three
+different answers, and an agent configuring a client could pick any of them.
+
+**What was wrong.** `deployed.yaml` still described ds4 as the resident in its
+header (`context_window: 131072`, "vision DARK", thinking in `content`) while
+its own `model_list` 200 lines below routed everything to `qwen3.8-27b`.
+`docs/gateway-setup.md` — the page AGENTS.md marks safe to hand to an outside
+agent — was wrong on model id, context window, vision, and concurrency.
+`AGENTS.md` carried a hard rule forbidding the 262144 context that production
+was running. The gateway advertised **18 routes of which 7 worked**; the other
+11 returned `could not find suitable inference handler`. And no API key was
+scoped to `qwen3.8-27b` at all, so the canonical id the docs recommended worked
+for nobody.
+
+**What changed.**
+- `deployed.yaml` restructured: a `live:` block that is the complete client
+  contract, and a `not_serving:` block that answers nothing. No route's
+  behaviour can be inferred from history any more.
+- `model_list` pruned 18 → **1**. Aliases `deepseek-v4-flash-0731`,
+  `deepseek-v4-flash-ds4`, `laguna-s-2.1`, `nemotron-3-puzzle-75b`,
+  `qwen3.6-27b`, `qwen3.6-35b-a3b` are gone.
+- All **12 API keys** re-scoped to `models: ["qwen3.8-27b"]`. Four had been on
+  `all-team-models` with no team, which resolves *permissively* — they could
+  call anything, including the dead routes.
+
+**Why not keep the aliases.** They were the reason the catalog lied. `/v1/models`
+is filtered per key, so scoping every key to one model makes the catalog, the
+allowlist, and the engine agree by construction — there is no second place for
+the truth to drift to. The cost is real and was accepted: four clients that
+still sent legacy names broke at cutover and needed a one-line config change.
+
+**Verified after the change:** `/v1/models` returns exactly `qwen3.8-27b`; a
+call on it succeeds; `deepseek-v4-flash-0731` returns 400; billing reconciles
+exactly (59 pt + 27 ct = $0.0000167 at $0.10/$0.40 per 1M).
+
+**Contract gotcha re-confirmed here:** thinking arrives in `reasoning`. The live
+response has no `reasoning_content` key at all — a client reading only that
+field gets silence, not an error.
+
+**Rollback:** key state is backed up as JSON (token hash + models per alias) at
+`~/private-backups/litellm-keys-20260817-pre-single-route.json` — deliberately
+OUTSIDE this repo, which is being prepped to go public;
+`deployed.yaml` and `litellm-config.yaml` have `.bak-20260817-*-pre-single-route`
+copies on .7. Re-adding a route now takes three edits — `model_list`,
+`llama-swap.yaml`, and the key allowlist. Miss the third and the failure looks
+like an auth error, not a routing one.
+
+**Noted, not fixed:** ds4-era spend rows were under-priced (08-13: $0.0277 on
+4.19 M prompt tokens, ~15× low against the documented $0.10/1M). qwen3.8 rows
+are correct. Also, the repo disagrees with itself on traffic shape — §38/`deployed.yaml`
+say ~45:1 prompt-to-output, §39/README say ~25:1. Neither is measurable from the
+current logs: proxy meta carries bytes, not tokens.

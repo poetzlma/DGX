@@ -6,27 +6,33 @@ nothing about the serving infrastructure behind it, deliberately. If you are
 operating the stack rather than calling it, see
 [operations.md](operations.md) instead.
 
+*Current as of 2026-08-17. The served model changes every few weeks; the
+machine-readable version of this page is [`deployed.yaml`](../deployed.yaml)
+(`live:` block), and it is the tiebreaker if the two ever disagree.*
+
 ## Connection
 
 ```
 Base URL   https://<gateway-host>/v1          — host supplied with your key
 API        OpenAI-compatible (chat completions, streaming, tool calls)
 Auth       Authorization: Bearer <your key>   — issued per client by the operator
-Model      deepseek-v4-flash-0731
+Model      qwen3.8-27b
 ```
 
 `<gateway-host>` is not published here; you receive it together with your key.
 Everything below is independent of it.
 
-That model id is the one to put in new configs. Several older ids
-(`deepseek-v4-flash-ds4`, `laguna-s-2.1`, `nemotron-3-puzzle-75b`,
-`qwen3.6-27b`, `qwen3.6-35b-a3b`) still resolve to the same model so existing
-clients keep working — don't add them to anything new, and don't assume a
-different id means a different model.
+**That is the only model id the gateway serves.** As of 2026-08-17 the six
+legacy aliases (`deepseek-v4-flash-0731`, `deepseek-v4-flash-ds4`,
+`laguna-s-2.1`, `nemotron-3-puzzle-75b`, `qwen3.6-27b`, `qwen3.6-35b-a3b`) are
+**retired** — they now return HTTP 400, and every key is scoped to
+`qwen3.8-27b` alone. If your client still sends one of those names, change the
+model id; there is no alias to fall back on.
 
-**What you're talking to:** DeepSeek V4-Flash (304 B total / 13 B active MoE),
-a reasoning model with a 131 072-token context window. Text only — there is no
-working image/vision route at present.
+**What you're talking to:** Qwen3.8-27B (dense, NVFP4), a reasoning model with a
+**262 144-token** context window. It accepts **images** (up to 4 per prompt) and
+does tool calling. Served since 2026-08-16; it replaced DeepSeek V4-Flash, and
+every setting below changed at that cutover.
 
 ```sh
 GATEWAY=https://<gateway-host>   # as supplied with your key
@@ -34,9 +40,9 @@ KEY=<your key>
 
 curl "$GATEWAY/v1/chat/completions" \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d '{
-    "model": "deepseek-v4-flash-0731",
+    "model": "qwen3.8-27b",
     "messages": [{"role": "user", "content": "hi"}],
-    "max_tokens": 2000,
+    "max_tokens": 4000,
     "stream": true
   }'
 ```
@@ -48,24 +54,31 @@ configuration errors. Set these explicitly.
 
 | Setting | Value | What goes wrong otherwise |
 |---|---|---|
-| **Context window** | `131072` | A client that declares 256 k builds prompts the model will refuse. Nothing warns you at config time. |
-| **Request timeout** | **≥ 1200 s** | Time-to-first-token is tens of seconds on a large prompt and can reach several minutes on a long, previously-unseen one. A 60–120 s timeout aborts *after* the expensive work is done, and the retry repeats it. |
-| **Concurrent requests** | **1–2** | This model processes prompts one at a time. Parallel fan-out does not run faster — it queues, and every request's latency grows together. Sequential steps beat parallel sub-agents here. |
-| **Reasoning field** | read **both** `content` and `reasoning_content` | Where thinking appears depends on the serving engine and can change without notice. A client reading only one field can silently show empty responses. |
+| **Context window** | `262144` | A client that declares less silently wastes most of the window; one that declares more builds prompts the model will refuse, with no warning at config time. |
+| **Request timeout** | **≥ 1200 s** | Time-to-first-token is tens of seconds on a large prompt and ~3 minutes on a long, previously-unseen one. A 60–120 s timeout aborts *after* the expensive work is done, and the retry repeats it. |
+| **Reasoning field** | read **both** `reasoning` and `reasoning_content` | This model puts thinking in **`reasoning`**. The previous one used `reasoning_content`, and it can change again at the next model swap. A client reading only one field silently shows empty responses. |
 | **`max_tokens`** | ≥ 2000 for real work | Thinking is charged against the same budget. Too small a budget can be spent entirely on reasoning, returning empty content with `finish_reason: length`. |
+| **Concurrent requests** | **1–2** | Up to 4 are accepted, but aggregate throughput is flat past 2 — beyond that you add latency to every in-flight request without finishing any more work. Sequential steps still beat wide parallel fan-out here. |
+
+Leave sampling alone unless you have a reason: the model ships its own
+recommended defaults (`temperature 1.0`, `top_p 0.95`, `top_k 20`) and the
+gateway does not override them. Sending hosted-API generics (e.g. `temperature
+0.0`) measurably degrades this model.
 
 Streaming is supported and recommended: on a long prompt it's the difference
-between watching progress and guessing whether you're hung.
+between watching progress and guessing whether you're hung. Reasoning streams
+incrementally — you see thinking tokens within a second, not buffered to the end.
 
 ## Symptom → cause
 
 | What you see | What it is | What to do |
 |---|---|---|
-| `200` with empty `content` | Thinking consumed the whole budget, or you're reading the wrong field | Raise `max_tokens`; read `reasoning_content` too |
+| `200` with empty `content` | Thinking consumed the whole budget, or you're reading the wrong field | Raise `max_tokens`; read `reasoning` **and** `reasoning_content` |
 | First request slow, later ones fast | Cold start, plus prompt-prefix caching that makes repeated prefixes far cheaper | Keep prompt prefixes stable across turns; don't reshuffle system context |
-| All parallel requests slow together | Expected — prompts are processed serially | Reduce in-flight requests to 1–2 |
+| Throughput stops improving as you add parallelism | Expected — the box is bandwidth-bound, flat past ~2 in flight | Reduce in-flight requests to 1–2 |
 | Brief `503`s that clear on their own | A transient server-side condition with automatic recovery | Retry with backoff; it self-heals within a couple of minutes |
-| `404` or an error naming an unknown model | That model id isn't served | Use `deepseek-v4-flash-0731` |
+| `404` or an error naming an unknown model | That model id isn't served | Use `qwen3.8-27b` |
+| An error on a model id you found in the docs | Every other id in the repo is **historical** — `qwen3.8-27b` is the only one served | Use `qwen3.8-27b` |
 | An authorization-style error on a model that exists | Your key isn't scoped to that model | Ask the operator to add it |
 | `GET /v1/models` seems to be missing models | **This endpoint returns only what *your key* is allowed to use — not the full roster.** | Don't infer availability from it; ask the operator |
 
