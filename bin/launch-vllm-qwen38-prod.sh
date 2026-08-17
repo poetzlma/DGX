@@ -19,6 +19,15 @@
 #            usable native-FP4 path in vLLM today; Marlin dequant->BF16 is the
 #            community-converged fastest, and output is verified clean (the
 #            3.6-era "Marlin garbage" applied to MODELOPT packing, not this).
+# VLLM_MARLIN_USE_ATOMIC_ADD=1 — added 2026-08-17 (decisions.md §44). There is a
+#            race in the Marlin kernel on SM121 that yields INCORRECT OUTPUT
+#            rather than an error. Our 4-bit weights dequantize through Marlin,
+#            so it sits directly in the decode path. A race is intermittent, so
+#            the "output verified clean" note above does NOT clear it — a clean
+#            smoke run is not evidence of absence. Measured cost: none. On the
+#            code prompt, with vs without was 26.73 vs 26.69 tok/s, i.e. inside
+#            noise; an earlier apparent +16% was engine warmup, not this flag.
+#            Treat as a correctness fix with no performance component.
 # KV fp8   : per the official vLLM recipe (live 2026-08-16). Halves KV bytes
 #            = long-ctx decode + pool gains. flash_attn refuses fp8 KV, so the
 #            attention-backend pin is DROPPED — vLLM auto-picks an fp8-capable
@@ -87,6 +96,7 @@ exec docker run --name "$NAME" \
   -e NVIDIA_DISABLE_REQUIRE=1 \
   -e VLLM_USE_FLASHINFER_SAMPLER=1 \
   -e VLLM_ENGINE_READY_TIMEOUT_S=1800 \
+  -e VLLM_MARLIN_USE_ATOMIC_ADD=1 \
   --entrypoint vllm \
   vllm-qwen38:prod-20260816 \
   serve /home/max/models/qwen3.8-27b-nvfp4 \

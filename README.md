@@ -2,7 +2,7 @@
 
 Production LLM serving on a single **NVIDIA DGX Spark (GB10, 119 GB unified memory)**: an OpenAI-compatible gateway serving real, paid coding traffic since April 2026. One box, **one model, one route** — call `http://192.168.1.12:8079/v1` with `"model": "qwen3.8-27b"`. That is the entire public surface as of 2026-08-17: the gateway serves exactly the model that is loaded, and every API key is scoped to it alone. The ~11 other lanes in this repo are dormant eval/rollback configs, **not loadable** in the current setup — by design, since the resident holds ~90 GB of 121 GB and a second engine would OOM-hang the box.
 
-The defining constraint: weights, KV cache, speculative drafter, and the host OS all share one 119 GB unified-memory budget on a bandwidth-bound SoC — and a host OOM **hard-hangs the machine** with no remote recovery (it has, three times — latest 2026-08-15). Most of what's in this repo is measured answers to *what fits, what it costs, and whether it's worth it* — including the experiments that failed. The [decision log](docs/decisions.md) (43 entries) records both.
+The defining constraint: weights, KV cache, speculative drafter, and the host OS all share one 119 GB unified-memory budget on a bandwidth-bound SoC — and a host OOM **hard-hangs the machine** with no remote recovery (it has, three times — latest 2026-08-15). Most of what's in this repo is measured answers to *what fits, what it costs, and whether it's worth it* — including the experiments that failed. The [decision log](docs/decisions.md) (44 entries) records both.
 
 ## Architecture
 
@@ -108,7 +108,7 @@ logs/       gateway logs, per-request proxy triples, timestamped bench JSON
 | [docs/gateway-setup.md](docs/gateway-setup.md) | **Point clients here** — connection, model id, the five settings that matter, symptom → cause. Consumer-facing: no infrastructure detail |
 | [docs/models.md](docs/models.md) | Full model matrix, what each model is for, per-launcher configuration + why |
 | [docs/operations.md](docs/operations.md) | Gateway, two-tier groups, weight offload/copy-back, runbook, rollback, troubleshooting |
-| [docs/decisions.md](docs/decisions.md) | Decision log §1–§43 — every non-obvious choice, with the measurements behind it |
+| [docs/decisions.md](docs/decisions.md) | Decision log §1–§44 — every non-obvious choice, with the measurements behind it |
 | [docs/benchmarks.md](docs/benchmarks.md) | Bench tooling + the historical archive of each production era |
 | [docs/qwen3.6-27b-dflash.md](docs/qwen3.6-27b-dflash.md) | Deep dive: DFlash speculative decoding on the dense 27B |
 | [docs/deepseek-v4-flash.md](docs/deepseek-v4-flash.md) | Deep dive: DeepSeek V4-Flash on the ds4 C/CUDA engine |

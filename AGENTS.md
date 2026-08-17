@@ -18,7 +18,7 @@ is current.
 |---|---|
 | Configure a **client**, pick a model id, debug a client-side failure | **[docs/gateway-setup.md](docs/gateway-setup.md)** — self-contained and safe to hand to an outside agent |
 | What the machine-readable contract says (routes, ctx, pricing, concurrency) | **[deployed.yaml](deployed.yaml)** — the `live:` block at the top is the whole client contract; everything under `not_serving:` is history and answers nothing today |
-| Why anything is configured the way it is | [docs/decisions.md](docs/decisions.md) (§1–§43, numbering is stable and cross-referenced from launchers) |
+| Why anything is configured the way it is | [docs/decisions.md](docs/decisions.md) (§1–§44, numbering is stable and cross-referenced from launchers) |
 | Change/inspect the running stack, roll back, troubleshoot | [docs/operations.md](docs/operations.md) |
 | Per-model and per-launcher detail | [docs/models.md](docs/models.md) |
 | Benchmark something | [docs/benchmarks.md](docs/benchmarks.md) — includes the traps that make numbers lie |

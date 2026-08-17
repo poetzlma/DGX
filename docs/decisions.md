@@ -477,3 +477,161 @@ like an auth error, not a routing one.
 are correct. Also, the repo disagrees with itself on traffic shape — §38/`deployed.yaml`
 say ~45:1 prompt-to-output, §39/README say ~25:1. Neither is measurable from the
 current logs: proxy meta carries bytes, not tokens.
+
+### §42 addendum 2 — the prod decode figures re-measured as medians (2026-08-17)
+
+§42's addendum recorded `26.8 @2k / 22.7 @60k / 22.9 @141k` and flagged itself
+as a "single-run probe; c-sweep medians pending re-run on this config". This is
+that re-run, and **26.8 did not reproduce**.
+
+Harness `bin/bench-fresh-gen.py` (new): single stream, 400 output tokens, short
+prompt, 3 runs, median, 150 s idle between runs, unique prefix per run so
+prefill is never a prefix-cache replay. Decode window is
+`completion_tokens / (last_token − first_token)` where a token-bearing delta
+counts if it carries **either** `reasoning` or `content` — the §42 harness bug
+was counting `content` only, which collapses the window on a thinking model and
+inflates tok/s. That is the most likely source of the 26.8.
+
+```
+thinking      18.01  (17.89, 18.01, 18.60)   <- tight, real
+non-thinking  16.62  (14.34, 16.62, 16.73)   <- run 1 cold-ish outlier
+```
+
+Treat **18.0 tok/s** as the honest single-stream fresh-generation number for
+prod, not 26.8. The 60 k/141 k points have not been re-measured as medians yet
+and should be assumed similarly optimistic.
+
+Two external recipes measured on the same chip, for calibration:
+
+| recipe | fresh gen 400 tok | notes |
+|---|---:|---|
+| ours: unsloth NVFP4 + MTP n=3 | **18.01** | this measurement |
+| MiaAI-Lab SGLang, MTP | 16.9 / 21.0 | thinking / non-thinking, their bench |
+| 0xBakeer vLLM, NVFP4 + DSpark k=7 | 29.23 | **same weights, same engine family** |
+| 0xBakeer vLLM, NVFP4 + DSpark k=14 | 29.55 | edit-heavy 72.6–75.0 |
+
+So SGLang is roughly a wash (we win on thinking, lose on non-thinking), while
+DSpark on our own engine claims ~1.6× on fresh generation and far more on
+edit-heavy work — the shape our ~100k:4k coding traffic actually has. Eval
+launcher staged at `bin/eval-qwen38-dspark.sh`; runbook `~/sglang-eval/RUNBOOK.md`.
+
+**Open, and worth fixing regardless of the benchmark:** that recipe calls
+`VLLM_MARLIN_USE_ATOMIC_ADD=1` non-optional on SM121 — a Marlin race that
+produces *incorrect output rather than an error*. Our 4-bit weights dequantize
+through Marlin, and prod sets the flag nowhere. A race is intermittent, so the
+launcher header's "output verified clean" does not clear it.
+
+## §44 Speculative-decoding bake-off: DSpark k=4 is the best draft depth, SGLang's DGX Spark config will not run here (2026-08-17)
+
+Two community recipes for this exact model+chip were evaluated against prod
+across three eval windows. Net outcome: **one correctness fix adopted, no
+performance change adopted, both external recipes rejected.**
+
+### The harness, and the confound that nearly invalidated everything
+
+`bin/bench-fresh-gen.py` (new): single stream, 400 output tokens, 3 runs,
+median, 150 s idle, unique prefix per run. `bin/bench-concurrent-fresh.py` (new)
+reports aggregate AND per-request at c=N, because a draft-depth knob trades one
+for the other.
+
+**Prompt content is part of the measurement, not decoration.** The same engine
+and config measured 14.05 tok/s on a prose prompt and 28.23 on a code prompt —
+a 2x swing — because speculative acceptance tracks output predictability. The
+first half of this investigation used prose and concluded DSpark was a large
+loss; on code it is a small win. Both external repos benchmark *code*
+generation. Always state the prompt class next to a spec-decode number.
+
+### Draft depth: shallow wins, and the acceptance *rate* is a trap
+
+Code prompt, c=1, median, all with the two env vars set:
+
+| config | thinking | non-thinking | accept rate | accepted/draft |
+|---|---:|---:|---:|---:|
+| prod: MTP n=3 | 21.58 | 26.69 | — | — |
+| MTP n=3 + env vars | 20.23 | 26.73 | 62.8 % | 1.89 |
+| DSpark k=2 | 19.85 | 22.20 | 68.0 % | 1.36 |
+| **DSpark k=4** | 25.13 | **28.72** | 49.9 % | **2.00** |
+| DSpark k=7 | — | — | 13.2 %(prose) | 0.92 (prose) |
+| DSpark k=14 | 20.79 | 28.23 | 15.3 % | 2.14 |
+
+c=4, code, non-thinking: k=4 **97.92** agg / 25.52 per-req; prod 93.67 / 25.13;
+MTP+env 91.50 / 24.71; k=2 78.60 / 20.19.
+
+**Read accepted-per-draft, not accept rate.** On prose, k=7 and k=14 both
+yielded ~0.92 tokens per draft — doubling depth bought nothing and doubled draft
+compute, which is why k=14 was the slowest config tested. k=2 is too shallow
+(1.36). The optimum is k=4, consistent with MTP n=3 working well. Upstream's
+default block size of 7 is NOT optimal here.
+
+**Verdict: DSpark k=4 is +7.5 % at c=1 and +4.5 % agg at c=4 over prod — NOT
+adopted.** That margin is close to the run-to-run spread this box shows, it adds
+a 2.6 GB drafter to keep revision-pinned, and the drafter logs
+`does not support external multimodal embeddings`, so image requests would draft
+text-only — a real cost now that vision is on. Revisit only with a confirmation
+run. Drafter kept cached at `Doopeworld/Qwen3.8-27B-DSpark-vLLM`.
+
+### RETRACTED: the "+16 % from env vars" claim
+
+An earlier prose comparison showed prod 18.01 vs MTP+env-vars 21.06 and was
+reported as a 16 % win. It is not real. On the code prompt the same pair
+measures 26.69 vs 26.73, and at c=4 the env-var build is *slower* (91.50 vs
+93.67). The 21.06 came from a freshly started engine whose three runs trended
+upward (17.75, 21.06, 23.78) — warmup, not the flag. Lesson repeated from §42:
+never compare across engine instances of different age on this box.
+
+### VLLM_MARLIN_USE_ATOMIC_ADD=1 — ADOPTED, as correctness only
+
+Added to `bin/launch-vllm-qwen38-prod.sh`, live 2026-08-17. There is a race in
+the Marlin kernel on SM121 that yields **incorrect output rather than an error**,
+and our 4-bit weights dequantize through Marlin, so it sat in prod's decode path
+unset. Measured performance impact: none (see retraction above). Adopted purely
+because a race is intermittent — the launcher's prior "output verified clean"
+note was never evidence of absence. `VLLM_USE_FLASHINFER_MOE_FP4=0` was NOT
+adopted: vLLM logs it as an unknown env var on this build, and the model is dense.
+
+### SGLang's official cookbook config does not run on this box
+
+`docs.sglang.io` cookbook, hw=dgx-spark quant=nvfp4 tier=low-latency
+ssmDtype=float32, both spec variants. It hardcodes `--mem-fraction-static 0.95`.
+Both loads died ~5 min in, each preceded by NVRM `NV_ERR_NO_MEMORY` bursts; a
+watchdog in `~/sglang-eval/launch-cookbook.sh` killed the container on the first
+warning, so the box did not hang. Consistent with the fact that **no `dgx-spark`
+cell in that cookbook is marked `verified:true`** while h200/rtx6000/rtx5090/
+gb300 all are.
+
+Retesting at a lower mem-fraction was declined: it would no longer be their
+config, and SGLang's best published figure (21.0 tok/s) is well under our
+measured 28.72, so shrinking its KV pool cannot close the gap.
+
+One SGLang flag has no vLLM equivalent and is the only mechanism by which it
+could win on this hybrid-GDN model: `--enable-linear-replayssm-spec` (replays
+linear-attention state during speculation instead of allocating per-draft
+slots). Confirmed absent from vLLM: `SpeculativeConfig` mentions no
+replay/linear/ssm/mamba, and `MambaConfig` exposes only backend,
+enable_stochastic_rounding, stochastic_rounding_philox_rounds, ssu_algorithm.
+Also note `MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark` deviates from the cookbook on
+three axes (extra_buffer_lazy instead of extra_buffer, bf16 instead of float32
+SSM, and no replayssm flag), so its 16.9/21.0 figures likely understate SGLang.
+
+### OPEN: NVRM warnings at UTIL 0.70, which §42 says should be clean
+
+§42 states 0.70 gives "0 hits" and only 0.80+ logs NVRM. Not true today. Prod
+warmup at 0.70 logged **108+21 events at 15:24 and 66 at 15:44**, while eval
+engines at the same 0.70 earlier logged only 8 and 2. The bursts appear only
+*after* ~62 GB of artifacts (a 38.6 GB image + 24 GB of weights) had been pulled
+into page cache — the hang-#3 shape, but from the download's residue rather than
+an active download. The artifacts were deleted (109 -> 169 GB free). **Unverified
+hypothesis; confirm on the next natural prod restart before trusting 0.70 as a
+clean baseline again.** If bursts persist with a cold page cache, the safe-util
+figure in §42 is wrong and needs re-deriving.
+
+### Fixed in passing: park-prod-ds4.sh could not park the current resident
+
+It matched only `launch-ds4-*.sh`, so after the 2026-08-16 cutover it silently
+matched nothing — and its verify grep still PASSED, because the dormant ds4
+entry already read `eval-window-blocked.sh`. It also cleared a preload hardcoded
+to `deepseek-v4-flash-0731` (live: `qwen3.8-27b`) and killed only `ds4-server`
+processes, never the vLLM container. Now: blocks every `launch-*` cmd, verifies
+no launcher line survives, clears whatever preload names, and removes `vllm-*`
+containers. Dry-tested against a config copy before use. Three windows opened
+and closed on it since, each restoring config+crontab byte-identical.

@@ -43,26 +43,42 @@ log "parking model cmd + clearing preload"
 # launch-ds4-entrpi.sh on 2026-08-10, and a sed that silently matches nothing
 # would leave the lane loadable during an eval window — the exact thing this
 # script exists to prevent. Hence the verify-or-abort below.
-sed -i 's#^\( *cmd: \)/home/max/llm-stack/bin/launch-ds4-[A-Za-z0-9._-]*\.sh#\1/home/max/llm-stack/bin/eval-window-blocked.sh#' "$CFG"
-grep -q 'cmd: /home/max/llm-stack/bin/eval-window-blocked.sh' "$CFG" || {
-  log "ABORT: cmd: line did not get parked — restoring $CFG and doing nothing"
+# 2026-08-17: generalised. The old sed matched ONLY launch-ds4-*.sh, so after
+# the qwen3.8 cutover (prod = launch-vllm-qwen38-prod.sh) it matched nothing —
+# and the old verify still PASSED, because the dormant ds4 entry already read
+# eval-window-blocked.sh. Silent non-park. Now: block every launcher cmd:, and
+# verify no launcher line survives.
+sed -i 's#^\( *cmd: \)/home/max/llm-stack/bin/launch-[A-Za-z0-9._-]*\.sh#\1/home/max/llm-stack/bin/eval-window-blocked.sh#' "$CFG"
+if grep -q '^ *cmd: /home/max/llm-stack/bin/launch-' "$CFG"; then
+  log "ABORT: a launcher cmd: line survived parking — restoring $CFG and doing nothing"
+  grep -n '^ *cmd: /home/max/llm-stack/bin/launch-' "$CFG" >&2
   cp "$BAK_CFG" "$CFG"
   exit 1
-}
+fi
 python3 - "$CFG" <<'EOF'
 import re,sys
 p=sys.argv[1]; s=open(p).read()
-s=re.sub(r"(hooks:\s*\n\s*on_startup:\s*\n\s*preload:)\s*\n\s*- *deepseek-v4-flash-0731",
-         r"\1 []", s)
-open(p,'w').write(s)
+# 2026-08-17: was hardcoded to deepseek-v4-flash-0731 and so silently did
+# nothing once preload became qwen3.8-27b. Clear whatever it lists.
+s2=re.sub(r"(hooks:\s*\n\s*on_startup:\s*\n\s*preload:)(?:[ \t]*\n[ \t]*-[^\n]*)+",
+          r"\1 []", s)
+open(p,'w').write(s2)
+print("[park] preload cleared" if s2 != s else "[park] preload already empty")
 EOF
 
 log "removing keepalive + watchdog cron"
 crontab -l 2>/dev/null | grep -v 'ds4-keepalive\|ds4-degraded-watchdog' | crontab - || true
 
-log "stopping ds4-server"
+log "stopping the resident engine (native ds4 process AND/OR vLLM container)"
 for p in $(ps -eo pid,cmd | awk '/[d]s4-server --cuda/ {print $1}'); do kill "$p" 2>/dev/null || true; done
 for _ in $(seq 1 30); do ps -eo pid,cmd | grep -q "[d]s4-server --cuda" || break; sleep 2; done
+# 2026-08-17: the qwen3.8 resident is a docker container, not a bare process.
+# Killing only ds4-server left it holding ~90 GB while this script went on to
+# report a parked window — the exact setup for a two-engine host OOM.
+for c in $(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^vllm-' || true); do
+  log "  removing container $c"
+  docker rm -f "$c" >/dev/null 2>&1 || true
+done
 
 # Do not claim success until the pool is actually back.
 for _ in $(seq 1 60); do

@@ -257,7 +257,7 @@ The `openai/<key>` string in `litellm_params.model` must exactly match the key u
 │   ├── gateway-setup.md                 # CONSUMER-FACING client setup (no infra detail — safe to share)
 │   ├── models.md                        # full model matrix + per-launcher details
 │   ├── operations.md                    # this file
-│   ├── decisions.md                     # decision log (§1–§43)
+│   ├── decisions.md                     # decision log (§1–§44)
 │   ├── benchmarks.md                    # bench tooling + historical archive
 │   ├── qwen3.6-27b-dflash.md            # deep DFlash writeup
 │   └── deepseek-v4-flash.md             # ds4 deep writeup
